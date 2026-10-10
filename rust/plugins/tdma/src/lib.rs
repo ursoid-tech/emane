@@ -1,3 +1,4 @@
+use emane_plugin_api::random::LegacyRandom;
 mod pcr;
 
 use emane_plugin_api::{
@@ -227,6 +228,7 @@ struct Reassembly {
     message_type: TdmaMessageType,
     total_len: Option<usize>,
     pieces: BTreeMap<usize, Vec<u8>>,
+    fragment_indices: HashSet<u32>,
     last_update_us: i64,
 }
 
@@ -314,7 +316,7 @@ struct State {
     reassembly: HashMap<(u16, u8, u64), Reassembly>,
     pending_rx: BTreeMap<u64, PendingReception>,
     timers: HashMap<u64, u32>,
-    random_state: u64,
+    random_state: LegacyRandom,
     started: bool,
 }
 
@@ -336,22 +338,22 @@ impl TdmaMac {
             "scheduler.scheduleRejectOther",
             "scheduler.scheduleAcceptFull",
             "scheduler.scheduleAcceptUpdate",
-            "TxSlotValid",
-            "TxSlotErrorMissed",
-            "TxSlotErrorTooBig",
+            "numTxSlotValid",
+            "numTxSlotErrorMissed",
+            "numTxSlotErrorTooBig",
             "TxFrameSent",
             "TxComponentBytes",
             "TxWireBytes",
             "TxAirtimeMicroseconds",
             "TxQueueOverflowPackets",
             "TxQueueOverflowBytes",
-            "RxSlotValid",
-            "RxSlotErrorMissed",
-            "RxSlotErrorRxDuringIdle",
-            "RxSlotErrorRxDuringTx",
-            "RxSlotErrorRxTooLong",
-            "RxSlotErrorRxWrongFrequency",
-            "RxSlotErrorRxLock",
+            "numRxSlotValid",
+            "numRxSlotErrorMissed",
+            "numRxSlotErrorRxDuringIdle",
+            "numRxSlotErrorRxDuringTx",
+            "numRxSlotErrorRxTooLong",
+            "numRxSlotErrorRxWrongFrequency",
+            "numRxSlotErrorRxLock",
             "highWaterMarkQueue0",
             "highWaterMarkQueue1",
             "highWaterMarkQueue2",
@@ -362,7 +364,7 @@ impl TdmaMac {
                 framework.framework_ctx,
                 std::ffi::CString::new(name).unwrap().as_ptr(),
                 c"TDMA model statistic".as_ptr(),
-                true,
+                !name.starts_with("numTxSlot") && !name.starts_with("numRxSlot"),
             );
             model_counters.insert(name.to_string(), handle);
         }
@@ -532,7 +534,7 @@ impl TdmaMac {
                 reassembly: HashMap::new(),
                 pending_rx: BTreeMap::new(),
                 timers: HashMap::new(),
-                random_state: 0xD1B5_4A32_D192_ED03 ^ u64::from(id),
+                random_state: LegacyRandom::from_clock(),
                 started: false,
             }),
         };
@@ -703,11 +705,8 @@ fn now_us() -> i64 {
     i64::try_from(now.as_micros()).unwrap_or(i64::MAX)
 }
 
-fn random_unit(state: &mut u64) -> f64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    (*state as f64) / (u64::MAX as f64)
+fn random_unit(state: &mut LegacyRandom) -> f64 {
+    f64::from(state.unit())
 }
 
 fn parse_schedule(data: &[u8], current: Option<&Schedule>) -> Result<(Schedule, bool), String> {
@@ -1085,11 +1084,11 @@ fn update_tx_slot_status(mac: &TdmaMac, absolute_slot: u64, now: i64, status: Tx
     let counter = match status {
         TxSlotStatus::Valid => {
             info.valid = info.valid.saturating_add(1);
-            "TxSlotValid"
+            "numTxSlotValid"
         }
         TxSlotStatus::Missed => {
             info.missed = info.missed.saturating_add(1);
-            "TxSlotErrorMissed"
+            "numTxSlotErrorMissed"
         }
     };
     info.quantiles[q] = info.quantiles[q].saturating_add(1);
@@ -1134,13 +1133,13 @@ fn update_rx_slot_status(
     info.status[status as usize] = info.status[status as usize].saturating_add(1);
     info.quantiles[q] = info.quantiles[q].saturating_add(1);
     let counter = match status {
-        RxSlotStatus::Valid => "RxSlotValid",
-        RxSlotStatus::Missed => "RxSlotErrorMissed",
-        RxSlotStatus::Idle => "RxSlotErrorRxDuringIdle",
-        RxSlotStatus::Tx => "RxSlotErrorRxDuringTx",
-        RxSlotStatus::TooLong => "RxSlotErrorRxTooLong",
-        RxSlotStatus::WrongFrequency => "RxSlotErrorRxWrongFrequency",
-        RxSlotStatus::Lock => "RxSlotErrorRxLock",
+        RxSlotStatus::Valid => "numRxSlotValid",
+        RxSlotStatus::Missed => "numRxSlotErrorMissed",
+        RxSlotStatus::Idle => "numRxSlotErrorRxDuringIdle",
+        RxSlotStatus::Tx => "numRxSlotErrorRxDuringTx",
+        RxSlotStatus::TooLong => "numRxSlotErrorRxTooLong",
+        RxSlotStatus::WrongFrequency => "numRxSlotErrorRxWrongFrequency",
+        RxSlotStatus::Lock => "numRxSlotErrorRxLock",
     };
     let mut row = vec![
         stat_u64(u64::from(relative)),
@@ -1733,6 +1732,7 @@ fn transmit_slot(mac: &TdmaMac, absolute_slot: u64) {
     ];
     let packet = FfiPacket {
         info: FfiPacketInfo {
+            uuid: [0; 16],
             source: mac.id,
             destination,
             priority: first.info.priority,
@@ -1977,15 +1977,8 @@ extern "C" fn upstream(
     let start_of_reception = spectrum_query.start_time_microseconds;
     let end_of_reception = start_of_reception
         .saturating_add(i64::try_from(rx.duration_microseconds).unwrap_or(i64::MAX));
-    // Reception occupies [start, end).  When a frame ends exactly at the slot
-    // boundary, `end` belongs to the following slot but no part of the frame
-    // does.  Test the final occupied microsecond instead.
-    let last_reception_microsecond = if rx.duration_microseconds == 0 {
-        start_of_reception
-    } else {
-        end_of_reception.saturating_sub(1)
-    };
-    if schedule.absolute_slot(last_reception_microsecond) != wire.absolute_slot_index {
+    // Legacy TDMA checks the exact EOR slot, including equality at a boundary.
+    if schedule.absolute_slot(end_of_reception) != wire.absolute_slot_index {
         let current_slot = schedule.absolute_slot(now);
         update_rx_slot_status(
             mac,
@@ -2215,8 +2208,13 @@ fn complete_receive(mac: &TdmaMac, absolute_slot: u64) {
                 message_type,
                 total_len: None,
                 pieces: BTreeMap::new(),
+                fragment_indices: HashSet::new(),
                 last_update_us: now,
             });
+            // A retransmitted fragment is not new reassembly progress.
+            if !entry.fragment_indices.insert(fragment.index) {
+                continue;
+            }
             entry.last_update_us = now;
             entry.pieces.entry(offset).or_insert(message.data);
             if !fragment.more {
@@ -2279,6 +2277,7 @@ fn complete_receive(mac: &TdmaMac, absolute_slot: u64) {
         mac.framework.framework_ctx,
         info.source,
         pending.model_sequence,
+        info.uuid.as_ptr(),
         sinr,
         noise_floor_dbm,
         now.max(0) as u64,
@@ -2472,6 +2471,7 @@ mod tests {
     fn transmit_properties_defer_sub_id_to_phy_configuration() {
         let transmission = Transmission {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: 1,
                 destination: 2,
                 priority: 0,

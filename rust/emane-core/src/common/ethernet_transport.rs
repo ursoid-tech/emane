@@ -167,7 +167,10 @@ pub extern "C" fn emane_rs_ethernet_transport_parse_frame(
     let eth_protocol = u16::from_be_bytes([buf_slice[12], buf_slice[13]]);
 
     let resolve_nem = || -> u16 {
-        if broadcast_mode {
+        if broadcast_mode
+            || (eth_protocol == ETH_P_IPV4 && dest_mac[..3] == [0x01, 0x00, 0x5e])
+            || (eth_protocol == ETH_P_IPV6 && dest_mac[..2] == [0x33, 0x33])
+        {
             NEM_BROADCAST_MAC_ADDRESS
         } else if arp_cache_mode {
             if let Ok(cache) = state.mac_cache.lock() {
@@ -297,5 +300,43 @@ pub extern "C" fn emane_rs_ethernet_transport_update_arp_cache(
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod multicast_regressions {
+    use super::*;
+    extern "C" fn unknown(_: *const c_void, _: u16, _: *mut u8) -> bool {
+        false
+    }
+    #[test]
+    fn no_arp_cache_multicast_uses_broadcast_nem() {
+        let state = EthernetTransportState::new();
+        for (mac, proto, expected) in [
+            ([1, 0, 0x5e, 0, 0, 1], ETH_P_IPV4, u16::MAX),
+            ([0x33, 0x33, 0, 0, 0, 1], ETH_P_IPV6, u16::MAX),
+            ([2, 2, 0, 0, 0, 7], ETH_P_IPV4, 7),
+        ] {
+            let mut frame = [0; 64];
+            frame[..6].copy_from_slice(&mac);
+            frame[12..14].copy_from_slice(&proto.to_be_bytes());
+            let (mut destination, mut priority) = (0, 0);
+            assert_eq!(
+                emane_rs_ethernet_transport_parse_frame(
+                    &state,
+                    frame.as_ptr().cast(),
+                    frame.len(),
+                    false,
+                    false,
+                    0,
+                    std::ptr::null(),
+                    unknown,
+                    &mut destination,
+                    &mut priority
+                ),
+                0
+            );
+            assert_eq!(destination, expected);
+        }
     }
 }

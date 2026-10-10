@@ -78,8 +78,14 @@ impl QueueMetricManager {
         let mut metrics = Vec::with_capacity(self.queue_data_map.len());
 
         for (&queue_id, data) in self.queue_data_map.iter_mut() {
-            let avg_delay_microseconds = if data.num_samples > 0 {
-                data.sum_delay_microseconds / data.num_samples as u64
+            let avg_delay_microseconds = if data.num_samples > 1 {
+                // C++ uses USEC_PER_SEC_F (float), then converts DoubleSeconds
+                // back to integral microseconds. Preserve both rounding stages.
+                let seconds =
+                    data.sum_delay_microseconds as f32 / (1_000_000.0f32 * data.num_samples as f32);
+                (f64::from(seconds) * 1_000_000.0) as u64
+            } else if data.num_samples == 1 {
+                data.sum_delay_microseconds
             } else {
                 0
             };
@@ -219,5 +225,23 @@ pub extern "C" fn emane_rs_queue_metric_manager_remove(
         m.remove_queue_metric(queue_id)
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    #[test]
+    fn legacy_report_rounding_and_interval_reset() {
+        let mut queue = QueueMetricManager::new(1);
+        for delay in [545, 1308, 2071] {
+            queue.update_queue_metric(5, 100, 19, 12, delay);
+        }
+        let report = queue.get_queue_metrics();
+        assert_eq!(report[0].avg_delay_microseconds, 1307);
+        assert_eq!(report[0].queue_current_depth_high_water, 19);
+        assert_eq!(queue.get_queue_metrics()[0].avg_delay_microseconds, 0);
+        queue.update_queue_metric(5, 100, 1, 0, 2001);
+        assert_eq!(queue.get_queue_metrics()[0].avg_delay_microseconds, 2001);
     }
 }

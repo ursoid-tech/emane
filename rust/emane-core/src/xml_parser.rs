@@ -1,5 +1,6 @@
 use roxmltree::{Document, Node};
 use std::collections::HashMap;
+#[cfg(test)]
 use std::fs;
 use std::path::Path;
 
@@ -125,12 +126,22 @@ pub fn parse_layer(
 
     if let Some(def) = definition {
         let def_path = file_path.parent().unwrap_or(Path::new("")).join(def);
-        let content = fs::read_to_string(&def_path).map_err(|e| {
+        let content = emane_plugin_api::xml_document::read(&def_path).map_err(|e| {
             ConfigurationError::FileError(format!("Failed to read {}: {}", def_path.display(), e))
         })?;
-        let doc =
-            Document::parse(&content).map_err(|e| ConfigurationError::ParseError(e.to_string()))?;
+        let doc = Document::parse_with_options(
+            &content,
+            roxmltree::ParsingOptions {
+                allow_dtd: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| ConfigurationError::ParseError(e.to_string()))?;
         let root = doc.root_element();
+        if !emane_plugin_api::xml_document::has_doctype(&content) {
+            crate::xml_contract::validate(root, false)
+                .map_err(ConfigurationError::ValidationError)?;
+        }
 
         if root.tag_name().name() != expected_type {
             return Err(ConfigurationError::ParseError(format!(
@@ -187,12 +198,22 @@ pub fn parse_nem(file_path: &Path, node: Node<'_, '_>) -> Result<NemConfig, Conf
 
     if let Some(def) = definition {
         let def_path = file_path.parent().unwrap_or(Path::new("")).join(def);
-        let content = fs::read_to_string(&def_path).map_err(|e| {
+        let content = emane_plugin_api::xml_document::read(&def_path).map_err(|e| {
             ConfigurationError::FileError(format!("Failed to read {}: {}", def_path.display(), e))
         })?;
-        let doc =
-            Document::parse(&content).map_err(|e| ConfigurationError::ParseError(e.to_string()))?;
+        let doc = Document::parse_with_options(
+            &content,
+            roxmltree::ParsingOptions {
+                allow_dtd: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| ConfigurationError::ParseError(e.to_string()))?;
         let root = doc.root_element();
+        if !emane_plugin_api::xml_document::has_doctype(&content) {
+            crate::xml_contract::validate(root, false)
+                .map_err(ConfigurationError::ValidationError)?;
+        }
 
         if root.tag_name().name() != "nem" {
             return Err(ConfigurationError::ParseError(
@@ -265,27 +286,17 @@ pub fn parse_nem(file_path: &Path, node: Node<'_, '_>) -> Result<NemConfig, Conf
         let macs = positions("mac");
         let phys = positions("phy");
 
-        let expected_transports = usize::from(!config.external_transport);
+        let expected_transports = 1;
         if transports.len() != expected_transports || macs.len() != 1 || phys.len() != 1 {
             return Err(ConfigurationError::ValidationError(format!(
                 "NEM id {} must contain exactly {} transport, one mac, and one phy layer",
                 id, expected_transports
             )));
         }
-        let valid_order = if config.external_transport {
-            macs[0] < phys[0]
-        } else {
-            transports[0] < macs[0] && macs[0] < phys[0]
-        };
-        if !valid_order {
+        if !(transports[0] < macs[0] && macs[0] < phys[0]) {
             return Err(ConfigurationError::ValidationError(format!(
-                "NEM id {} layer order must be {}mac -> phy (with optional shims)",
-                id,
-                if config.external_transport {
-                    ""
-                } else {
-                    "transport -> "
-                }
+                "NEM id {} layer order must be transport -> mac -> phy (with optional shims)",
+                id
             )));
         }
         if let Some(layer) = config.layers.iter().find(|layer| {
@@ -305,12 +316,21 @@ pub fn parse_nem(file_path: &Path, node: Node<'_, '_>) -> Result<NemConfig, Conf
 }
 
 pub fn parse_platform(file_path: &Path) -> Result<PlatformConfig, ConfigurationError> {
-    let content = fs::read_to_string(file_path).map_err(|e| {
+    let content = emane_plugin_api::xml_document::read(file_path).map_err(|e| {
         ConfigurationError::FileError(format!("Failed to read {}: {}", file_path.display(), e))
     })?;
-    let doc =
-        Document::parse(&content).map_err(|e| ConfigurationError::ParseError(e.to_string()))?;
+    let doc = Document::parse_with_options(
+        &content,
+        roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| ConfigurationError::ParseError(e.to_string()))?;
     let root = doc.root_element();
+    if !emane_plugin_api::xml_document::has_doctype(&content) {
+        crate::xml_contract::validate(root, false).map_err(ConfigurationError::ValidationError)?;
+    }
 
     if root.tag_name().name() != "platform" {
         return Err(ConfigurationError::ParseError(
@@ -340,4 +360,25 @@ pub fn parse_platform(file_path: &Path) -> Result<PlatformConfig, ConfigurationE
     }
 
     Ok(config)
+}
+
+#[cfg(test)]
+mod legacy_regressions {
+    use super::*;
+    #[test]
+    fn platform_accepts_legacy_doctype() {
+        let path = std::env::temp_dir().join(format!("emane-doctype-{}.xml", std::process::id()));
+        fs::write(&path,"<!DOCTYPE platform SYSTEM 'file:///usr/share/emane/dtd/platform.dtd'><platform name='legacy'><param name='otamanagergroup' value='224.1.2.8:45702'/><nem id='1' definition='unused.xml'/></platform>").unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let doc = Document::parse_with_options(
+            &content,
+            roxmltree::ParsingOptions {
+                allow_dtd: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::xml_contract::validate(doc.root_element(), true).unwrap();
+        fs::remove_file(path).unwrap();
+    }
 }

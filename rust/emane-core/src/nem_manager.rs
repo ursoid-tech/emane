@@ -10,8 +10,8 @@ use crate::event_service::{
 };
 use crate::file_descriptor_service;
 use crate::native_configuration::{
-    register_with_defaults as register_native_configuration,
-    unregister as unregister_native_configuration, ConfigurationUpdate, ConfigurationValue,
+    register_with_schema as register_native_configuration,
+    unregister as unregister_native_configuration, ConfigurationValue,
 };
 use crate::neighbor_metric_manager::NeighborMetricManager;
 use crate::nem_queued_layer::{NemQueuedLayer, QueueTaskKind};
@@ -42,8 +42,8 @@ use crate::queue_metric_manager::QueueMetricManager;
 use crate::spectrum_monitor::{FfiFrequencySegment, NoiseMode, SpectrumMonitor};
 use crate::statistics::{
     clear_native_table, configure_native_rf_signal_table, increment_native_counter,
-    maximize_native_counter, native_table_generation, register_native_average,
-    register_native_counter, register_native_double, register_native_rf_signal_table,
+    maximize_native_counter, native_table_generation, register_native_counter,
+    register_native_double, register_native_float_average, register_native_rf_signal_table,
     register_native_table, remove_native_table_row, sample_native_average, set_native_double,
     set_native_table_row, unregister_native_statistics, update_native_rf_signal_table,
     NativeTableValue,
@@ -76,7 +76,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use emane_plugin_api::{FfiSpectrumQuery, FfiSpectrumResult};
+use emane_plugin_api::{
+    FfiFilterQuery, FfiFilterResult, FfiSpectrumQuery, FfiSpectrumResult, SelfInterference,
+    SpectrumFilterAdd, CONTROL_SELF_INTERFERENCE, CONTROL_SPECTRUM_FILTER_ADD,
+    CONTROL_SPECTRUM_FILTER_DATA, CONTROL_SPECTRUM_FILTER_REMOVE,
+};
 
 const BROADCAST_NEM: u16 = u16::MAX;
 
@@ -344,6 +348,7 @@ fn next_event_build_id() -> u16 {
 }
 
 struct Runtime {
+    uuid: [u8; 16],
     invocations: RwLock<HashMap<u16, Vec<Invocation>>>,
     boundaries: RwLock<HashMap<u16, BoundaryRoute>>,
     phy_tx_sequences: Mutex<HashMap<u16, u16>>,
@@ -408,13 +413,20 @@ impl Runtime {
             return;
         }
 
+        let mut local_packet = unsafe { *packet };
+        if local_packet.info.uuid == [0; 16] {
+            local_packet.info.uuid = self.uuid;
+        }
+        let packet = &local_packet as *const FfiPacket;
         if let Some(route) = self.boundary(nem_id, BoundaryRole::Transport) {
             let messages = match ffi_control_messages(messages, message_count) {
                 Some(messages) => messages,
                 None => return,
             };
             if let Ok(endpoint) = route.endpoint.lock() {
-                let _ = endpoint.send_packet(unsafe { &*packet }, messages);
+                if let Err(error) = endpoint.send_packet(unsafe { &*packet }, messages) {
+                    eprintln!("NEM {nem_id}: boundary send failed: {error}");
+                }
             }
             return;
         }
@@ -509,7 +521,9 @@ impl Runtime {
             };
             if let Some(packet) = unsafe { packet.as_ref() } {
                 if let Ok(endpoint) = route.endpoint.lock() {
-                    let _ = endpoint.send_packet(packet, messages);
+                    if let Err(error) = endpoint.send_packet(packet, messages) {
+                        eprintln!("NEM {nem_id}: boundary send failed: {error}");
+                    }
                 }
             }
         }
@@ -543,7 +557,9 @@ impl Runtime {
                     return;
                 };
                 if let Ok(endpoint) = route.endpoint.lock() {
-                    let _ = endpoint.send_control(messages);
+                    if let Err(error) = endpoint.send_control(messages) {
+                        eprintln!("NEM {nem_id}: boundary control send failed: {error}");
+                    }
                 }
             }
         }
@@ -603,7 +619,7 @@ extern "C" fn ota_packet(
     source: u16,
     destination: u16,
     priority: u8,
-    _uuid: *const u8,
+    uuid: *const u8,
     data: *const u8,
     data_len: usize,
     controls: *const u8,
@@ -655,8 +671,15 @@ extern "C" fn ota_packet(
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
+    if uuid.is_null() {
+        return;
+    }
+    let sender_uuid: [u8; 16] = unsafe { std::slice::from_raw_parts(uuid, 16) }
+        .try_into()
+        .unwrap();
     let packet = FfiPacket {
         info: FfiPacketInfo {
+            uuid: sender_uuid,
             source,
             destination,
             priority,
@@ -741,6 +764,7 @@ extern "C" fn unregister_file_descriptor(context_ptr: *mut c_void, handle: u64) 
 }
 
 const MAX_CONTROL_WIRE_SIZE: usize = 16 * 1024 * 1024;
+const PHY_BYPASS_REGISTRATION: u32 = 1;
 const PHY_FRAMEWORK_REGISTRATION: u32 = 0x0007;
 const PHY_COMM_EFFECT_REGISTRATION: u32 = 0x0005;
 
@@ -752,6 +776,53 @@ fn encode_legacy_ota_payload(
 ) -> Option<Vec<u8>> {
     let messages = ffi_control_messages(messages, count)?;
     let model = control_payload(messages, CONTROL_MODEL_HEADER).and_then(ModelHeader::decode);
+    if messages
+        .iter()
+        .any(|m| m.msg_type == emane_plugin_api::CONTROL_BYPASS_PHY)
+    {
+        let phy = CommonPhyHeader {
+            registration_id: PHY_BYPASS_REGISTRATION,
+            sub_id: 0,
+            sequence_number: u32::from(phy_sequence),
+            tx_time_microseconds: unix_time_microseconds().max(0) as u64,
+            transmitters: vec![common_phy_header::Transmitter {
+                nem_id: u32::from(packet.info.source),
+                powerd_bm: 0.0,
+            }],
+            frequency_groups: vec![common_phy_header::FrequencyGroup {
+                frequency_segments: vec![common_phy_header::frequency_group::FrequencySegment {
+                    frequency_hz: 0,
+                    offset_microseconds: 0,
+                    duration_microseconds: 0,
+                    powerd_bm: None,
+                }],
+            }],
+            transmit_antennas: vec![],
+            filter_data: filter_data(messages),
+        }
+        .encode_to_vec();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&(phy.len() as u16).to_be_bytes());
+        wire.extend_from_slice(&phy);
+        if let Some(model) = model {
+            let mac = CommonMacHeader {
+                registration_id: u32::from(model.registration_id),
+                sequence_number: model.sequence,
+            }
+            .encode_to_vec();
+            wire.extend_from_slice(&(mac.len() as u16).to_be_bytes());
+            wire.extend_from_slice(&mac);
+        }
+        if packet.payload.len != 0 {
+            if packet.payload.data.is_null() {
+                return None;
+            }
+            wire.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(packet.payload.data, packet.payload.len)
+            });
+        }
+        return Some(wire);
+    }
     if model.is_none() {
         return encode_legacy_commeffect_payload(packet, messages);
     }
@@ -768,7 +839,7 @@ fn encode_legacy_ota_payload(
             || {
                 vec![MimoTxFrequencySegment {
                     frequency_hz: tx.frequency_hz,
-                    tx_power_dbm: tx.tx_power_dbm,
+                    tx_power_dbm: None,
                     duration_microseconds: tx.duration_microseconds,
                     offset_microseconds: tx.offset_microseconds,
                 }]
@@ -779,7 +850,7 @@ fn encode_legacy_ota_payload(
                     .into_iter()
                     .map(|segment| MimoTxFrequencySegment {
                         frequency_hz: segment.frequency_hz,
-                        tx_power_dbm: tx.tx_power_dbm,
+                        tx_power_dbm: None,
                         duration_microseconds: segment.duration_microseconds,
                         offset_microseconds: segment.offset_microseconds,
                     })
@@ -808,7 +879,7 @@ fn encode_legacy_ota_payload(
                         frequency_hz: segment.frequency_hz,
                         offset_microseconds: segment.offset_microseconds,
                         duration_microseconds: segment.duration_microseconds,
-                        powerd_bm: Some(segment.tx_power_dbm),
+                        powerd_bm: segment.tx_power_dbm,
                     },
                 )
                 .collect(),
@@ -860,7 +931,7 @@ fn encode_legacy_ota_payload(
             .collect(),
         frequency_groups,
         transmit_antennas,
-        filter_data: None,
+        filter_data: filter_data(messages),
     }
     .encode_to_vec();
     let mac = CommonMacHeader {
@@ -934,7 +1005,7 @@ fn encode_legacy_commeffect_payload(
             }],
         }],
         transmit_antennas: Vec::new(),
-        filter_data: None,
+        filter_data: filter_data(messages),
     }
     .encode_to_vec();
     let shim = CommEffectShimHeader {
@@ -1002,7 +1073,9 @@ fn decode_legacy_ota_payload(data: &[u8], source: u16) -> Option<DecodedLegacyOt
             messages,
         });
     }
-    if phy.registration_id != PHY_FRAMEWORK_REGISTRATION {
+    if phy.registration_id != PHY_FRAMEWORK_REGISTRATION
+        && phy.registration_id != PHY_BYPASS_REGISTRATION
+    {
         return None;
     }
     let (mac, mac_end) = if let Some(length_bytes) = data.get(phy_end..phy_end.checked_add(2)?) {
@@ -1016,6 +1089,35 @@ fn decode_legacy_ota_payload(data: &[u8], source: u16) -> Option<DecodedLegacyOt
     } else {
         (None, phy_end)
     };
+    if phy.registration_id == PHY_BYPASS_REGISTRATION {
+        let mut payloads = Vec::new();
+        let mut messages = Vec::new();
+        if let Some(mac) = mac {
+            let header = ModelHeader {
+                registration_id: mac.registration_id.try_into().ok()?,
+                sequence: mac.sequence_number,
+                data_rate_bps: 0,
+                category: 0,
+                message_type: 0,
+                flags: 0,
+            }
+            .encode()
+            .to_vec();
+            messages.push(FfiControlMessage {
+                msg_type: CONTROL_MODEL_HEADER,
+                payload: FfiSlice {
+                    data: header.as_ptr(),
+                    len: header.len(),
+                },
+            });
+            payloads.push(header);
+        }
+        return Some(DecodedLegacyOta {
+            payload: data.get(mac_end..)?.to_vec(),
+            _control_payloads: payloads,
+            messages,
+        });
+    }
     let tx_power_dbm = phy
         .transmitters
         .iter()
@@ -1090,7 +1192,7 @@ fn decode_legacy_ota_payload(data: &[u8], source: u16) -> Option<DecodedLegacyOt
                     .iter()
                     .map(|segment| MimoTxFrequencySegment {
                         frequency_hz: segment.frequency_hz,
-                        tx_power_dbm: segment.powerd_bm.unwrap_or(tx_power_dbm),
+                        tx_power_dbm: segment.powerd_bm,
                         duration_microseconds: segment.duration_microseconds,
                         offset_microseconds: segment.offset_microseconds,
                     })
@@ -1126,6 +1228,10 @@ fn decode_legacy_ota_payload(data: &[u8], source: u16) -> Option<DecodedLegacyOt
     .encode()?;
     let mut control_payloads = Vec::new();
     let mut kinds = Vec::new();
+    if let Some(data) = phy.filter_data {
+        control_payloads.push(data);
+        kinds.push(CONTROL_SPECTRUM_FILTER_DATA);
+    }
     if let Some(mac) = mac {
         control_payloads.push(
             ModelHeader {
@@ -1398,6 +1504,25 @@ extern "C" fn register_counter(
     };
     register_native_counter(ctx.build_id, name, description, clearable).unwrap_or(0)
 }
+extern "C" fn register_counter32(
+    ctx: *mut c_void,
+    name: *const std::os::raw::c_char,
+    description: *const std::os::raw::c_char,
+    clearable: bool,
+) -> u64 {
+    let (Some(ctx), Some(name), Some(description)) = (
+        context(ctx),
+        (!name.is_null()).then(|| unsafe { CStr::from_ptr(name) }),
+        (!description.is_null()).then(|| unsafe { CStr::from_ptr(description) }),
+    ) else {
+        return 0;
+    };
+    let (Ok(name), Ok(description)) = (name.to_str(), description.to_str()) else {
+        return 0;
+    };
+    crate::statistics::register_native_counter32(ctx.build_id, name, description, clearable)
+        .unwrap_or(0)
+}
 
 extern "C" fn increment_counter(ctx: *mut c_void, handle: u64, amount: u64) -> bool {
     context(ctx).is_some() && handle != 0 && increment_native_counter(handle, amount)
@@ -1446,7 +1571,7 @@ extern "C" fn register_average(
     let (Ok(name), Ok(description)) = (name.to_str(), description.to_str()) else {
         return 0;
     };
-    register_native_average(ctx.build_id, name, description, clearable).unwrap_or(0)
+    register_native_float_average(ctx.build_id, name, description, clearable).unwrap_or(0)
 }
 
 extern "C" fn sample_average(ctx: *mut c_void, handle: u64, sample: f64) -> bool {
@@ -1643,6 +1768,7 @@ extern "C" fn update_neighbor_rx(
     ctx: *mut c_void,
     source: u16,
     sequence: u64,
+    uuid: *const u8,
     sinr_db: f64,
     noise_floor_dbm: f64,
     rx_time_microseconds: u64,
@@ -1652,11 +1778,15 @@ extern "C" fn update_neighbor_rx(
     let Some(context) = context(ctx) else {
         return;
     };
+    if uuid.is_null() {
+        return;
+    }
+    let uuid: &[u8; 16] = unsafe { &*(uuid.cast()) };
     if let Ok(mut metrics) = context.neighbor_metrics.lock() {
         metrics.handle_rx_activity(
             source,
             sequence,
-            &[0; 16],
+            uuid,
             sinr_db,
             noise_floor_dbm,
             Duration::from_micros(rx_time_microseconds),
@@ -1784,6 +1914,70 @@ extern "C" fn query_spectrum(
     };
     *result = value;
     true
+}
+
+extern "C" fn query_spectrum_filter(
+    ctx: *mut c_void,
+    query: *const FfiFilterQuery,
+    result: *mut FfiFilterResult,
+) -> bool {
+    let (Some(ctx), Some(query), Some(result)) =
+        (context(ctx), unsafe { query.as_ref() }, unsafe {
+            result.as_mut()
+        })
+    else {
+        return false;
+    };
+    let Some(runtime) = ctx.runtime.upgrade() else {
+        return false;
+    };
+    let monitor = runtime.spectrum_monitors.read().ok().and_then(|m| {
+        m.get(&(ctx.nem_id, query.antenna_index))
+            .and_then(Weak::upgrade)
+    });
+    let Some(monitor) = monitor else {
+        return false;
+    };
+    let Some((data, start, bin, sensitivity, subbands)) = monitor.lock().ok().and_then(|m| {
+        m.try_filter_window(
+            unix_time_microseconds(),
+            query.filter_index,
+            i64::try_from(query.duration_microseconds).ok()?,
+            query.start_time_microseconds,
+        )
+    }) else {
+        return false;
+    };
+    result.length = data.len();
+    result.start_time_microseconds = start;
+    result.bin_size_microseconds = bin;
+    result.sensitivity_mw = sensitivity;
+    result.sub_band_count = subbands;
+    if result.capacity == 0 {
+        return true;
+    }
+    if result.capacity < data.len() || result.data.is_null() {
+        return false;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), result.data, data.len());
+    }
+    true
+}
+
+fn filter_data(messages: &[FfiControlMessage]) -> Option<Vec<u8>> {
+    messages
+        .iter()
+        .find(|m| m.msg_type == CONTROL_SPECTRUM_FILTER_DATA)
+        .and_then(|m| {
+            if m.payload.len == 0 {
+                Some(Vec::new())
+            } else if m.payload.data.is_null() {
+                None
+            } else {
+                Some(unsafe { std::slice::from_raw_parts(m.payload.data, m.payload.len) }.to_vec())
+            }
+        })
 }
 
 extern "C" fn update_queue_metric(
@@ -1916,285 +2110,22 @@ pub fn canonical_plugin_name(name: &str) -> &str {
     }
 }
 
-pub fn component_configuration_defaults(plugin: &str) -> ConfigurationUpdate {
-    use ConfigurationValue::{
-        Boolean, Double, Float, String as Text, UInt16, UInt32, UInt64, UInt8,
-    };
-
-    let one = |name: &str, value| (name.to_string(), vec![value]);
-    let empty = |name: &str| (name.to_string(), Vec::new());
-    match canonical_plugin_name(plugin) {
-        "emanephy" => vec![
-            one("fixedantennagain", Double(0.0)),
-            one("fixedantennagainenable", Boolean(true)),
-            one("bandwidth", UInt64(1_000_000)),
-            one("frequency", UInt64(2_347_000_000)),
-            one("frequencyofinterest", UInt64(2_347_000_000)),
-            one("noisemode", Text("all".to_string())),
-            one("noisebinsize", UInt64(20)),
-            one("noisemaxclampenable", Boolean(false)),
-            one("noisemaxsegmentoffset", UInt64(300_000)),
-            one("noisemaxmessagepropagation", UInt64(200_000)),
-            one("noisemaxsegmentduration", UInt64(1_000_000)),
-            one("timesyncthreshold", UInt64(10_000)),
-            one("propagationmodel", Text("precomputed".to_string())),
-            one("systemnoisefigure", Double(4.0)),
-            empty("subid"),
-            one("txpower", Double(0.0)),
-            one("excludesamesubidfromfilterenable", Boolean(true)),
-            one("compatibilitymode", UInt16(1)),
-            one("processingpoolsize", UInt16(0)),
-            one("stats.receivepowertableenable", Boolean(true)),
-            one("stats.observedpowertableenable", Boolean(true)),
-            one("rxsensitivitypromiscuousmodeenable", Boolean(false)),
-            one("dopplershiftenable", Boolean(true)),
-            one("spectralmaskindex", UInt16(0)),
-            one("radiosilenceenable", Boolean(false)),
-            one("fading.model", Text("none".to_string())),
-            one("fading.nakagami.distance0", Double(100.0)),
-            one("fading.nakagami.distance1", Double(250.0)),
-            one("fading.nakagami.m0", Double(0.75)),
-            one("fading.nakagami.m1", Double(1.0)),
-            one("fading.nakagami.m2", Double(200.0)),
-            one("fading.lognormal.dmu", Double(5.0)),
-            one("fading.lognormal.dsigma", Double(1.0)),
-            one("fading.lognormal.dlthresh", Double(0.25)),
-            one("fading.lognormal.duthresh", Double(0.75)),
-            one("fading.lognormal.maxpathloss", Double(100.0)),
-            one("fading.lognormal.minpathloss", Double(0.0)),
-            one("fading.lognormal.lmean", Double(0.005)),
-            one("fading.lognormal.lstddev", Double(0.001)),
-        ],
-        "virtualtransport" => vec![
-            one("device", Text("emane0".to_string())),
-            one("devicepath", Text("/dev/net/tun".to_string())),
-            one("bitrate", UInt64(0)),
-            one("broadcastmodeenable", Boolean(false)),
-            one("arpcacheenable", Boolean(true)),
-            one("arpmodeenable", Boolean(true)),
-            one("flowcontrolenable", Boolean(false)),
-            one("ethernet.type.arp.priority", UInt8(0)),
-            empty("address"),
-            empty("mask"),
-            empty("ethernet.type.unknown.priority"),
-        ],
-        "rawtransport" => vec![
-            empty("device"),
-            one("bitrate", UInt64(0)),
-            one("broadcastmodeenable", Boolean(false)),
-            one("arpcacheenable", Boolean(true)),
-            one("ethernet.type.arp.priority", UInt8(0)),
-            empty("ethernet.type.unknown.priority"),
-        ],
-        "rfpipe" => vec![
-            one("enablepromiscuousmode", Boolean(false)),
-            one("datarate", UInt64(1_000_000)),
-            one("jitter", Float(0.0)),
-            one("delay", Float(0.0)),
-            one("flowcontrolenable", Boolean(false)),
-            one("flowcontroltokens", UInt16(10)),
-            empty("pcrcurveuri"),
-            one("radiometricenable", Boolean(false)),
-            one("radiometricreportinterval", Float(1.0)),
-            one("neighbormetricdeletetime", Float(60.0)),
-            one("rfsignaltable.averageallantennas", Boolean(false)),
-            one("rfsignaltable.averageallfrequencies", Boolean(false)),
-        ],
-        "ieee80211abg" => {
-            let mut values = vec![
-                one("enablepromiscuousmode", Boolean(false)),
-                one("wmmenable", Boolean(false)),
-                one("mode", UInt8(0)),
-                one("unicastrate", UInt8(4)),
-                one("multicastrate", UInt8(1)),
-                one("rtsthreshold", UInt16(255)),
-                one("flowcontrolenable", Boolean(false)),
-                one("flowcontroltokens", UInt16(10)),
-                one("distance", UInt32(1_000)),
-                empty("pcrcurveuri"),
-                one("channelactivityestimationtimer", Float(0.1)),
-                one("neighbortimeout", Float(30.0)),
-                one("radiometricenable", Boolean(false)),
-                one("radiometricreportinterval", Float(1.0)),
-                one("neighbormetricdeletetime", Float(60.0)),
-            ];
-            for index in 0..4 {
-                values.push(one(&format!("queuesize{index}"), UInt8(255)));
-                values.push(one(&format!("msdu{index}"), UInt16(u16::MAX)));
-                values.push(one(
-                    &format!("cwmin{index}"),
-                    UInt16([32, 32, 16, 8][index]),
-                ));
-                values.push(one(
-                    &format!("cwmax{index}"),
-                    UInt16([1024, 1024, 64, 16][index]),
-                ));
-                values.push(one(
-                    &format!("aifs{index}"),
-                    Float([0.000_002, 0.000_002, 0.000_002, 0.000_001][index]),
-                ));
-                values.push(one(&format!("txop{index}"), Float(0.0)));
-                values.push(one(&format!("retrylimit{index}"), UInt8(2)));
-            }
-            values
-        }
-        "tdma" => vec![
-            one("enablepromiscuousmode", Boolean(false)),
-            one("flowcontrolenable", Boolean(false)),
-            one("flowcontroltokens", UInt16(10)),
-            empty("pcrcurveuri"),
-            one("fragmentcheckthreshold", UInt16(2)),
-            one("fragmenttimeoutthreshold", UInt16(5)),
-            one("neighbormetricdeletetime", Float(60.0)),
-            one("neighbormetricupdateinterval", Float(1.0)),
-            one("queue.depth", UInt16(256)),
-            one("queue.aggregationenable", Boolean(true)),
-            one("queue.fragmentationenable", Boolean(true)),
-            one("queue.strictdequeueenable", Boolean(false)),
-            one("queue.aggregationslotthreshold", Double(90.0)),
-        ],
-        "bentpipe" => vec![
-            one("queue.depth", UInt16(256)),
-            one("queue.aggregationenable", Boolean(true)),
-            one("queue.fragmentationenable", Boolean(true)),
-            one("reassembly.fragmentcheckthreshold", UInt16(2)),
-            one("reassembly.fragmenttimeoutthreshold", UInt16(5)),
-            empty("pcrcurveuri"),
-            empty("antenna.defines"),
-            empty("transponder.receive.frequency"),
-            empty("transponder.receive.bandwidth"),
-            empty("transponder.receive.antenna"),
-            empty("transponder.receive.action"),
-            empty("transponder.receive.enable"),
-            empty("transponder.transmit.pcrcurveindex"),
-            empty("transponder.transmit.frequency"),
-            empty("transponder.transmit.bandwidth"),
-            empty("transponder.transmit.antenna"),
-            empty("transponder.transmit.ubend.delay"),
-            empty("transponder.transmit.datarate"),
-            empty("transponder.transmit.power"),
-            empty("transponder.transmit.tosmap"),
-            empty("transponder.transmit.slotperframe"),
-            empty("transponder.transmit.slotsize"),
-            empty("transponder.transmit.txslots"),
-            empty("transponder.transmit.mtu"),
-            empty("transponder.transmit.enable"),
-        ],
-        "commeffectshim" => vec![
-            one("defaultconnectivitymode", Boolean(true)),
-            empty("filterfile"),
-            one("groupid", UInt32(0)),
-            one("enablepromiscuousmode", Boolean(false)),
-            one("receivebufferperiod", Double(1.0)),
-        ],
-        "phyapitestshim" => vec![
-            one("packetsize", UInt16(128)),
-            one("packetrate", Float(1.0)),
-            one("destination", UInt16(u16::MAX)),
-            empty("bandwidth"),
-            empty("antennaprofileid"),
-            empty("antennaazimuth"),
-            empty("antennaelevation"),
-            empty("frequency"),
-            one("txpower", Float(0.0)),
-            empty("transmitter"),
-        ],
-        "timinganalysisshim" => vec![one("maxqueuesize", UInt32(0))],
-        _ => Vec::new(),
-    }
+pub fn component_configuration_defaults(plugin: &str) -> Vec<(String, Vec<ConfigurationValue>)> {
+    component_configuration_schema(plugin)
+        .into_iter()
+        .map(|(name, spec)| (name, spec.defaults))
+        .collect()
 }
-
+pub fn component_configuration_schema(
+    plugin: &str,
+) -> crate::native_configuration::ConfigurationSchema {
+    crate::configuration_schema::get(canonical_plugin_name(plugin))
+}
 pub fn component_modifiable_parameters(plugin: &str) -> Vec<String> {
-    let names: &[&str] = match canonical_plugin_name(plugin) {
-        "emanephy" => &[
-            "fixedantennagain",
-            "txpower",
-            "radiosilenceenable",
-            "fading.model",
-            "fading.nakagami.distance0",
-            "fading.nakagami.distance1",
-            "fading.nakagami.m0",
-            "fading.nakagami.m1",
-            "fading.nakagami.m2",
-            "fading.lognormal.dmu",
-            "fading.lognormal.dsigma",
-            "fading.lognormal.dlthresh",
-            "fading.lognormal.duthresh",
-            "fading.lognormal.maxpathloss",
-            "fading.lognormal.minpathloss",
-            "fading.lognormal.lmean",
-            "fading.lognormal.lstddev",
-        ],
-        "rfpipe" => &[
-            "enablepromiscuousmode",
-            "datarate",
-            "jitter",
-            "delay",
-            "neighbormetricdeletetime",
-        ],
-        "ieee80211abg" => &[
-            "enablepromiscuousmode",
-            "unicastrate",
-            "multicastrate",
-            "cwmin0",
-            "cwmin1",
-            "cwmin2",
-            "cwmin3",
-            "cwmax0",
-            "cwmax1",
-            "cwmax2",
-            "cwmax3",
-        ],
-        "tdma" => &["enablepromiscuousmode", "neighbormetricdeletetime"],
-        "bentpipe" => &[
-            "transponder.receive.frequency",
-            "transponder.receive.enable",
-            "transponder.transmit.pcrcurveindex",
-            "transponder.transmit.frequency",
-            "transponder.transmit.ubend.delay",
-            "transponder.transmit.datarate",
-            "transponder.transmit.power",
-            "transponder.transmit.slotperframe",
-            "transponder.transmit.slotsize",
-            "transponder.transmit.txslots",
-            "transponder.transmit.mtu",
-            "transponder.transmit.enable",
-            "antenna.defines",
-        ],
-        _ => &[],
-    };
-    names.iter().map(|name| (*name).to_string()).collect()
-}
-
-fn component_required_parameters(plugin: &str) -> &'static [&'static str] {
-    match canonical_plugin_name(plugin) {
-        "emanephy" => &["subid"],
-        "rfpipe" | "ieee80211abg" | "tdma" => &["pcrcurveuri"],
-        "phyapitestshim" => &["bandwidth"],
-        "bentpipe" => &[
-            "pcrcurveuri",
-            "antenna.defines",
-            "transponder.receive.frequency",
-            "transponder.receive.bandwidth",
-            "transponder.receive.antenna",
-            "transponder.receive.action",
-            "transponder.receive.enable",
-            "transponder.transmit.pcrcurveindex",
-            "transponder.transmit.frequency",
-            "transponder.transmit.bandwidth",
-            "transponder.transmit.antenna",
-            "transponder.transmit.ubend.delay",
-            "transponder.transmit.datarate",
-            "transponder.transmit.power",
-            "transponder.transmit.tosmap",
-            "transponder.transmit.slotperframe",
-            "transponder.transmit.slotsize",
-            "transponder.transmit.txslots",
-            "transponder.transmit.mtu",
-            "transponder.transmit.enable",
-        ],
-        _ => &[],
-    }
+    component_configuration_schema(plugin)
+        .into_iter()
+        .filter_map(|(name, spec)| spec.modifiable.then_some(name))
+        .collect()
 }
 
 fn component_event_ids(plugin: &str) -> &'static [u16] {
@@ -2210,7 +2141,16 @@ fn component_event_ids(plugin: &str) -> &'static [u16] {
 fn register_model_compatibility_statistics(build_id: u16, plugin: &str) -> HashMap<String, u64> {
     let mut handles = HashMap::new();
     let counter = |name: &str| {
-        let _ = register_native_counter(build_id, name, "", true);
+        if canonical_plugin_name(plugin) == "ieee80211abg" {
+            let _ = crate::statistics::register_native_counter32(build_id, name, "", true);
+        } else {
+            let _ = register_native_counter(
+                build_id,
+                name,
+                "",
+                !name.starts_with("numTxSlot") && !name.starts_with("numRxSlot"),
+            );
+        }
     };
     let mut table = |name: &str, labels: &[&str], description: &str, clearable: bool| {
         if let Some(handle) = register_native_table(build_id, name, labels, description, clearable)
@@ -2312,16 +2252,16 @@ fn register_model_compatibility_statistics(build_id: u16, plugin: &str) -> HashM
                 "scheduler.scheduleRejectOther",
                 "scheduler.scheduleAcceptFull",
                 "scheduler.scheduleAcceptUpdate",
-                "TxSlotValid",
-                "TxSlotErrorMissed",
-                "TxSlotErrorTooBig",
-                "RxSlotValid",
-                "RxSlotErrorMissed",
-                "RxSlotErrorRxDuringIdle",
-                "RxSlotErrorRxDuringTx",
-                "RxSlotErrorRxTooLong",
-                "RxSlotErrorRxWrongFrequency",
-                "RxSlotErrorRxLock",
+                "numTxSlotValid",
+                "numTxSlotErrorMissed",
+                "numTxSlotErrorTooBig",
+                "numRxSlotValid",
+                "numRxSlotErrorMissed",
+                "numRxSlotErrorRxDuringIdle",
+                "numRxSlotErrorRxDuringTx",
+                "numRxSlotErrorRxTooLong",
+                "numRxSlotErrorRxWrongFrequency",
+                "numRxSlotErrorRxLock",
                 "highWaterMarkQueue0",
                 "highWaterMarkQueue1",
                 "highWaterMarkQueue2",
@@ -2686,9 +2626,13 @@ struct PendingTransportFrame {
     received_at: Instant,
 }
 
+#[path = "mimo_receive.rs"]
+mod mimo_receive;
+
 struct PhyState {
     compatibility_mode: u8,
     processing_pool_size: u16,
+    processing_pool: Option<crate::processing_pool::ProcessingPool>,
     receive_power_table_enabled: bool,
     observed_power_table_enabled: bool,
     rx_sensitivity_promiscuous_mode_enabled: bool,
@@ -2716,7 +2660,7 @@ struct PhyState {
     antenna_profiles: HashMap<u16, AntennaProfileSelection>,
     fading_selections: HashMap<u16, FadingMode>,
     fading_mode: FadingMode,
-    nakagami: crate::nakagami_fading_algorithm::NakagamiFadingAlgorithm,
+    nakagami: HashMap<u16, crate::nakagami_fading_algorithm::NakagamiFadingAlgorithm>,
     nakagami_parameters: NakagamiParameters,
     lognormal_states: HashMap<u16, LognormalFadingState>,
     lognormal_parameters: LognormalFadingParameters,
@@ -2739,7 +2683,6 @@ struct PhyState {
 
 struct ReceiveAntennaState {
     antenna: MimoTxAntenna,
-    frequencies_hz: Vec<u64>,
     monitor: Arc<Mutex<SpectrumMonitor>>,
 }
 
@@ -2826,6 +2769,7 @@ impl PhyState {
         Self {
             compatibility_mode: 1,
             processing_pool_size: 0,
+            processing_pool: None,
             receive_power_table_enabled: true,
             observed_power_table_enabled: true,
             rx_sensitivity_promiscuous_mode_enabled: false,
@@ -2853,7 +2797,7 @@ impl PhyState {
             antenna_profiles: HashMap::new(),
             fading_selections: HashMap::new(),
             fading_mode: FadingMode::None,
-            nakagami: crate::nakagami_fading_algorithm::NakagamiFadingAlgorithm::new(),
+            nakagami: HashMap::new(),
             nakagami_parameters: NakagamiParameters {
                 distance0_meters: 100.0,
                 distance1_meters: 250.0,
@@ -3069,6 +3013,7 @@ impl PhyState {
             .map(|(receive_gain, transmit_gain, _)| receive_gain + transmit_gain)
     }
 
+    #[cfg(test)]
     fn antenna_pair_gains(
         &mut self,
         local_id: u16,
@@ -3080,10 +3025,23 @@ impl PhyState {
             .ok()
     }
 
+    #[cfg(test)]
     fn antenna_pair_gains_detailed(
         &mut self,
         local_id: u16,
         source: u16,
+        local_pattern: AntennaPattern,
+        remote_pattern: AntennaPattern,
+    ) -> Result<(f64, f64, bool), PhyPathError> {
+        self.antenna_pair_gains_for(local_id, source, 0, 0, local_pattern, remote_pattern)
+    }
+
+    fn antenna_pair_gains_for(
+        &mut self,
+        local_id: u16,
+        source: u16,
+        receive_index: u16,
+        transmit_index: u16,
         local_pattern: AntennaPattern,
         remote_pattern: AntennaPattern,
     ) -> Result<(f64, f64, bool), PhyPathError> {
@@ -3099,6 +3057,12 @@ impl PhyState {
                 .ok_or(PhyPathError::GainProfile)?,
             pattern => pattern,
         };
+        if (matches!(local_pattern, AntennaPattern::Profile(_))
+            || matches!(remote_pattern, AntennaPattern::Profile(_)))
+            && self.distance(local_id, source).is_none()
+        {
+            return Err(PhyPathError::GainLocation);
+        }
         let profile_placement = |pattern: AntennaPattern| match pattern {
             AntennaPattern::Profile(profile) => crate::antenna::get_manager()
                 .get_profile_info(profile.profile_id)
@@ -3108,7 +3072,12 @@ impl PhyState {
         let local_placement = profile_placement(local_pattern).ok_or(PhyPathError::GainProfile)?;
         let remote_placement =
             profile_placement(remote_pattern).ok_or(PhyPathError::GainProfile)?;
-        let mut key = vec![u64::from(local_id), u64::from(source)];
+        let mut key = vec![
+            u64::from(local_id),
+            u64::from(source),
+            u64::from(receive_index),
+            u64::from(transmit_index),
+        ];
         let mut append_pattern = |pattern: AntennaPattern| match pattern {
             AntennaPattern::Default => key.extend([0, 0, 0, 0]),
             AntennaPattern::IdealOmni { gain_db } => key.extend([1, gain_db.to_bits(), 0, 0]),
@@ -3320,6 +3289,7 @@ impl PhyState {
         ))
     }
 
+    #[cfg(test)]
     fn propagation(&self, local_id: u16, source: u16, frequency_hz: u64) -> Option<(f64, i64)> {
         self.propagation_detailed(local_id, source, frequency_hz)
             .ok()
@@ -3342,7 +3312,10 @@ impl PhyState {
                     .or_else(|| values.get(&0))
                     .copied()
                     .ok_or(PhyPathError::Propagation)?;
-                Ok((pathloss, 0))
+                let delay = self
+                    .distance(local_id, source)
+                    .map_or(0, |d| (d / 299_792_458.0 * 1_000_000.0).round() as i64);
+                Ok((pathloss, delay))
             }
             PropagationModel::FreeSpace | PropagationModel::TwoRay => {
                 let local = self
@@ -3376,30 +3349,6 @@ impl PhyState {
             *self.locations.get(&local_id)?,
             *self.locations.get(&source)?,
         ))
-    }
-
-    fn profile_gains_with_remote_detailed(
-        &mut self,
-        local_id: u16,
-        source: u16,
-        remote_override: Option<TxAntennaProfile>,
-    ) -> Result<(f64, f64, bool), PhyPathError> {
-        if self.fixed_antenna_gain_enabled {
-            return self.antenna_pair_gains_detailed(
-                local_id,
-                source,
-                AntennaPattern::IdealOmni {
-                    gain_db: self.fixed_antenna_gain_db,
-                },
-                AntennaPattern::IdealOmni { gain_db: 0.0 },
-            );
-        }
-        self.antenna_pair_gains_detailed(
-            local_id,
-            source,
-            AntennaPattern::Default,
-            remote_override.map_or(AntennaPattern::Default, AntennaPattern::Profile),
-        )
     }
 
     fn doppler_fraction(&self, local_id: u16, source: u16) -> f64 {
@@ -3450,6 +3399,7 @@ impl PhyState {
         }
     }
 
+    #[cfg(test)]
     fn apply_fading(
         &mut self,
         local_id: u16,
@@ -3461,8 +3411,20 @@ impl PhyState {
             .ok()
     }
 
+    #[cfg(test)]
     fn apply_fading_detailed(
         &mut self,
+        local_id: u16,
+        source: u16,
+        power_dbm: f64,
+        now_microseconds: u64,
+    ) -> Result<f64, PhyPathError> {
+        self.apply_fading_on_antenna(0, local_id, source, power_dbm, now_microseconds)
+    }
+
+    fn apply_fading_on_antenna(
+        &mut self,
+        antenna: u16,
         local_id: u16,
         source: u16,
         power_dbm: f64,
@@ -3482,7 +3444,7 @@ impl PhyState {
                 let distance = self
                     .distance(local_id, source)
                     .ok_or(PhyPathError::FadeLocation)?;
-                self.nakagami.compute(
+                self.nakagami.entry(antenna).or_default().compute(
                     power_dbm,
                     distance,
                     self.nakagami_parameters.distance0_meters,
@@ -3492,12 +3454,15 @@ impl PhyState {
                     self.nakagami_parameters.m2,
                 )
             }
-            FadingMode::Lognormal => self
-                .lognormal_states
-                .entry(source)
-                .or_default()
-                .process(power_dbm, &self.lognormal_parameters, now_microseconds)
-                .ok_or(PhyPathError::FadeAlgorithm)?,
+            FadingMode::Lognormal => {
+                self.distance(local_id, source)
+                    .ok_or(PhyPathError::FadeLocation)?;
+                self.lognormal_states
+                    .entry(antenna)
+                    .or_default()
+                    .process(power_dbm, &self.lognormal_parameters, now_microseconds)
+                    .ok_or(PhyPathError::FadeAlgorithm)?
+            }
         };
         (power_mw.is_finite() && power_mw > 0.0)
             .then_some(10.0 * power_mw.log10())
@@ -3508,7 +3473,8 @@ impl PhyState {
 fn distance_meters(a: Location, b: Location) -> f64 {
     let a = position_ecef(a);
     let b = position_ecef(b);
-    (b.0 - a.0).hypot(b.1 - a.1).hypot(b.2 - a.2)
+    let (x, y, z) = (b.0 - a.0, b.1 - a.1, b.2 - a.2);
+    (x * x + y * y + z * z).sqrt()
 }
 
 #[cfg(test)]
@@ -3683,7 +3649,7 @@ fn builtin_init(id: u16, framework: *const FfiFrameworkService, kind: BuiltinKin
         counters: match kind {
             BuiltinKind::Phy => CommonLayerCounters::register_with_drop_labels(
                 framework,
-                "",
+                "0",
                 &[
                     "Out-of-Band",
                     "Rx Sensitivity",
@@ -3951,6 +3917,24 @@ extern "C" fn builtin_configure(state: *mut c_void, request: *const c_void) -> b
     let Some(items) = (unsafe { config_items(request) }) else {
         return false;
     };
+    // Runtime power/gain/fading changes must not destroy pending noise windows.
+    let reset_monitor = items.iter().any(|(name, _)| {
+        matches!(
+            name.as_str(),
+            "subid"
+                | "frequencyofinterest"
+                | "bandwidth"
+                | "noisemode"
+                | "noisebinsize"
+                | "noisemaxclampenable"
+                | "noisemaxsegmentoffset"
+                | "noisemaxmessagepropagation"
+                | "noisemaxsegmentduration"
+                | "timesyncthreshold"
+                | "systemnoisefigure"
+                | "excludesamesubidfromfilterenable"
+        )
+    });
     for (name, values) in items {
         let Some(value) = values.first() else {
             return false;
@@ -4080,9 +4064,6 @@ extern "C" fn builtin_configure(state: *mut c_void, request: *const c_void) -> b
                     let Some(value) = parse_scaled_u64(&value) else {
                         return false;
                     };
-                    if value == 0 {
-                        return false;
-                    }
                     frequencies.push(value);
                 }
                 if frequencies.is_empty() {
@@ -4364,8 +4345,10 @@ extern "C" fn builtin_configure(state: *mut c_void, request: *const c_void) -> b
         {
             return false;
         }
-        state.phy.initialize_monitor();
-        register_spectrum_monitors(state);
+        if reset_monitor {
+            state.phy.initialize_monitor();
+            register_spectrum_monitors(state);
+        }
     }
     true
 }
@@ -4378,7 +4361,15 @@ extern "C" fn builtin_start(state: *mut c_void) -> bool {
         return false;
     };
     match state.kind {
-        BuiltinKind::Phy => true,
+        BuiltinKind::Phy => {
+            if state.phy.processing_pool_size > 0 {
+                match crate::processing_pool::ProcessingPool::new(state.phy.processing_pool_size) {
+                    Ok(pool) => state.phy.processing_pool = Some(pool),
+                    Err(_) => return false,
+                }
+            }
+            true
+        }
         BuiltinKind::VirtualTransport => {
             let Ok(path) = CString::new(state.device_path.as_str()) else {
                 return false;
@@ -4407,7 +4398,9 @@ extern "C" fn builtin_stop(state: *mut c_void) {
                 emane_rs_virtual_transport_stop(state.virtual_transport)
             }
             BuiltinKind::RawTransport => emane_rs_raw_transport_stop(state.raw_transport),
-            BuiltinKind::Phy => {}
+            BuiltinKind::Phy => {
+                state.phy.processing_pool.take();
+            }
         }
     }
 }
@@ -4472,6 +4465,7 @@ fn send_transport_frame(
 ) {
     let packet = FfiPacket {
         info: FfiPacketInfo {
+            uuid: [0; 16],
             source: id,
             destination: frame.destination,
             priority: frame.priority,
@@ -4664,10 +4658,6 @@ extern "C" fn builtin_upstream(
             };
 
             let now = unix_time_microseconds();
-            let wire_mimo = find_mimo_tx_properties(incoming);
-            let mimo_tx = (state.phy.compatibility_mode == 2)
-                .then(|| wire_mimo.clone())
-                .flatten();
             if state.phy.compatibility_mode == 2 && state.phy.receive_antennas.is_empty() {
                 state.counters.upstream_drop_packet(
                     state.framework,
@@ -4677,39 +4667,7 @@ extern "C" fn builtin_upstream(
                 );
                 return;
             }
-            if mimo_tx.as_ref().is_some_and(|mimo| {
-                mimo.transmit_antennas.iter().any(|antenna| {
-                    usize::from(antenna.frequency_group_index) >= mimo.frequency_groups.len()
-                })
-            }) {
-                state.counters.upstream_drop_packet(
-                    state.framework,
-                    packet.info.source,
-                    packet.info.destination,
-                    12,
-                );
-                return;
-            }
-            let (frequency_segments, segment_tx_powers, mimo_ranges) = if let Some(mimo) = &mimo_tx
-            {
-                let mut segments = Vec::new();
-                let mut powers = Vec::new();
-                let mut ranges = Vec::new();
-                for antenna in &mimo.transmit_antennas {
-                    let start = segments.len();
-                    let group = &mimo.frequency_groups[usize::from(antenna.frequency_group_index)];
-                    for segment in group {
-                        segments.push(TxFrequencySegment {
-                            frequency_hz: segment.frequency_hz,
-                            duration_microseconds: segment.duration_microseconds,
-                            offset_microseconds: segment.offset_microseconds,
-                        });
-                        powers.push(Some(segment.tx_power_dbm));
-                    }
-                    ranges.push((*antenna, start, segments.len()));
-                }
-                (TxFrequencySegments { segments }, powers, ranges)
-            } else {
+            let mimo = find_mimo_tx_properties(incoming).unwrap_or_else(|| {
                 let segments =
                     find_tx_frequency_segments(incoming).unwrap_or(TxFrequencySegments {
                         segments: vec![TxFrequencySegment {
@@ -4718,569 +4676,115 @@ extern "C" fn builtin_upstream(
                             offset_microseconds: tx.offset_microseconds,
                         }],
                     });
-                let powers = vec![None; segments.segments.len()];
-                (segments, powers, Vec::new())
-            };
-            let transmitters = find_tx_transmitters(incoming).unwrap_or(TxTransmitters {
-                transmitters: vec![TxTransmitter {
-                    nem_id: packet.info.source,
-                    tx_power_dbm: tx.tx_power_dbm,
-                }],
-            });
-            let antenna_profile = find_tx_antenna_profile(incoming);
-            let doppler_fraction = state.phy.doppler_fraction(state.id, packet.info.source);
-            let mut propagation_microseconds = i64::MAX;
-            let mut rx_powers_mw = vec![0.0; frequency_segments.segments.len()];
-            let mut valid_path = false;
-            for transmitter in &transmitters.transmitters {
-                for (index, frequency_segment) in frequency_segments.segments.iter().enumerate() {
-                    let transmit_antenna = mimo_ranges
+                MimoTxProperties {
+                    frequency_groups: vec![segments
+                        .segments
                         .iter()
-                        .find(|(_, start, end)| *start <= index && index < *end)
-                        .map(|(antenna, _, _)| *antenna);
-                    let wire_transmit_antenna = transmit_antenna.or_else(|| {
-                        wire_mimo
-                            .as_ref()
-                            .and_then(|mimo| mimo.transmit_antennas.first())
-                            .copied()
-                    });
-                    let antenna_gains = if let Some(transmit_antenna) = wire_transmit_antenna {
-                        let local_patterns = if state.phy.receive_antennas.is_empty() {
-                            vec![state
-                                .phy
-                                .default_antenna_pattern(state.id)
-                                .unwrap_or(AntennaPattern::Default)]
+                        .map(|s| MimoTxFrequencySegment {
+                            frequency_hz: s.frequency_hz,
+                            tx_power_dbm: None,
+                            duration_microseconds: s.duration_microseconds,
+                            offset_microseconds: s.offset_microseconds,
+                        })
+                        .collect()],
+                    transmit_antennas: vec![MimoTxAntenna {
+                        antenna_index: tx.antenna_index,
+                        frequency_group_index: 0,
+                        bandwidth_hz: tx.bandwidth_hz,
+                        spectral_mask_index: tx.spectral_mask_index,
+                        pattern: if state.phy.fixed_antenna_gain_enabled {
+                            AntennaPattern::IdealOmni { gain_db: 0.0 }
                         } else {
-                            state
-                                .phy
-                                .receive_antennas
-                                .values()
-                                .map(|entry| entry.antenna.pattern)
-                                .collect()
-                        };
-                        local_patterns
-                            .into_iter()
-                            .try_fold(None, |best: Option<(f64, f64, bool)>, local_pattern| {
-                                let candidate = state.phy.antenna_pair_gains_detailed(
-                                    state.id,
-                                    transmitter.nem_id,
-                                    local_pattern,
-                                    transmit_antenna.pattern,
-                                )?;
-                                Ok::<_, PhyPathError>(Some(match best {
-                                    Some(current)
-                                        if current.0 + current.1 >= candidate.0 + candidate.1 =>
-                                    {
-                                        current
-                                    }
-                                    _ => candidate,
-                                }))
-                            })
-                            .and_then(|value| value.ok_or(PhyPathError::GainProfile))
-                    } else {
-                        state.phy.profile_gains_with_remote_detailed(
-                            state.id,
-                            transmitter.nem_id,
-                            antenna_profile,
-                        )
-                    };
-                    let (receive_gain_db, transmit_gain_db, cache_hit) = match antenna_gains {
-                        Ok(value) => value,
-                        Err(error) => {
-                            state.counters.upstream_drop_packet(
-                                state.framework,
-                                packet.info.source,
-                                packet.info.destination,
-                                error.drop_code(),
-                            );
-                            return;
-                        }
-                    };
-                    (state.framework.increment_counter)(
-                        state.framework.framework_ctx,
-                        if cache_hit {
-                            state.phy.gain_cache_hit_counter
-                        } else {
-                            state.phy.gain_cache_miss_counter
+                            find_tx_antenna_profile(incoming)
+                                .map_or(AntennaPattern::Default, AntennaPattern::Profile)
                         },
-                        1,
-                    );
-                    let antenna_gain_db = receive_gain_db + transmit_gain_db;
-                    let (pathloss_db, propagation) = match state.phy.propagation_detailed(
-                        state.id,
-                        transmitter.nem_id,
-                        frequency_segment.frequency_hz,
-                    ) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            state.counters.upstream_drop_packet(
-                                state.framework,
-                                packet.info.source,
-                                packet.info.destination,
-                                error.drop_code(),
-                            );
-                            return;
-                        }
-                    };
-                    let transmit_power_dbm =
-                        segment_tx_powers[index].unwrap_or(transmitter.tx_power_dbm);
-                    let unfaded_power_dbm = transmit_power_dbm - pathloss_db + antenna_gain_db;
-                    let rx_power_dbm = match state.phy.apply_fading_detailed(
-                        state.id,
-                        transmitter.nem_id,
-                        unfaded_power_dbm,
-                        now.max(0) as u64,
-                    ) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            state.counters.upstream_drop_packet(
-                                state.framework,
-                                packet.info.source,
-                                packet.info.destination,
-                                error.drop_code(),
-                            );
-                            return;
-                        }
-                    };
-                    let transmit_antenna_index = transmit_antenna
-                        .map(|antenna| antenna.antenna_index)
-                        .unwrap_or(tx.antenna_index);
-                    state.phy.publish_receive_power(
-                        transmitter.nem_id,
-                        tx.antenna_index,
-                        transmit_antenna_index,
-                        frequency_segment.frequency_hz,
-                        rx_power_dbm,
-                        transmit_gain_db,
-                        receive_gain_db,
-                        transmit_power_dbm,
-                        pathloss_db,
-                        frequency_segment.frequency_hz as f64 * doppler_fraction,
-                        tx.tx_time_microseconds as f64 / 1_000_000.0,
-                    );
-                    state.phy.publish_observed_power(
-                        transmitter.nem_id,
-                        tx.antenna_index,
-                        transmit_antenna_index,
-                        frequency_segment.frequency_hz,
-                        tx.spectral_mask_index,
-                        rx_power_dbm,
-                        tx.tx_time_microseconds as f64 / 1_000_000.0,
-                    );
-                    rx_powers_mw[index] += 10.0f64.powf(rx_power_dbm / 10.0);
-                    propagation_microseconds = propagation_microseconds.min(propagation);
-                    valid_path = true;
+                    }],
                 }
-            }
-            if !valid_path || rx_powers_mw.iter().any(|power| *power <= 0.0) {
-                state.counters.upstream_drop_packet(
-                    state.framework,
-                    packet.info.source,
-                    packet.info.destination,
-                    3,
-                );
-                return;
-            }
-            let segments: Vec<_> = frequency_segments
-                .segments
-                .iter()
-                .zip(&rx_powers_mw)
-                .map(|(segment, rx_power_mw)| FfiFrequencySegment {
-                    frequency_hz: segment.frequency_hz,
-                    rx_power_dbm: 10.0 * rx_power_mw.log10(),
-                    duration_microsec: i64::try_from(segment.duration_microseconds)
-                        .unwrap_or(i64::MAX),
-                    offset_microsec: i64::try_from(segment.offset_microseconds).unwrap_or(i64::MAX),
+            });
+            let properties = match mimo_receive::receive(state, packet, tx, &mimo, incoming, now) {
+                Ok(value) => value,
+                Err(code) => {
+                    if code == 2
+                        && state.phy.compatibility_mode == 2
+                        && state.phy.rx_sensitivity_promiscuous_mode_enabled
+                    {
+                        (state.framework.send_upstream_packet)(
+                            state.framework.framework_ctx,
+                            state.id,
+                            packet,
+                            std::ptr::null(),
+                            0,
+                        );
+                    }
+                    state.counters.upstream_drop_packet(
+                        state.framework,
+                        packet.info.source,
+                        packet.info.destination,
+                        code,
+                    );
+                    return;
+                }
+            };
+            let mut controls = Vec::new();
+            if state.phy.compatibility_mode == 2 {
+                let Some(bytes) = properties.encode() else {
+                    return;
+                };
+                controls.push((CONTROL_MIMO_RX_PROPERTIES, bytes));
+            } else {
+                let info = &properties.antenna_infos[0];
+                let first = info.segments[0];
+                let bandwidth_hz = mimo
+                    .transmit_antennas
+                    .iter()
+                    .find(|a| a.antenna_index == info.transmit_antenna_index)
+                    .map_or(tx.bandwidth_hz, |a| a.bandwidth_hz);
+                let rx = RxProperties {
+                    frequency_hz: first.frequency_hz,
+                    bandwidth_hz,
+                    rx_power_dbm: first.rx_power_dbm,
+                    noise_floor_dbm: info.noise_floor_dbm,
+                    tx_time_microseconds: properties.tx_time_microseconds,
+                    propagation_microseconds: properties.propagation_microseconds,
+                    duration_microseconds: info.span_microseconds,
+                    antenna_index: info.receive_antenna_index,
+                    sub_id: tx.sub_id,
+                    signal_in_noise: state.phy.noise_mode == NoiseMode::All,
+                };
+                controls.push((CONTROL_RX_PROPERTIES, rx.encode().to_vec()));
+                let Some(bytes) = (RxFrequencySegments {
+                    segments: info.segments.clone(),
                 })
-                .collect();
-            let is_in_band = tx.sub_id == state.phy.sub_id
-                && segments.iter().any(|segment| {
-                    state
-                        .phy
-                        .frequencies_of_interest
-                        .contains(&segment.frequency_hz)
-                });
-            let transmitter_ids: Vec<_> = transmitters
-                .transmitters
-                .iter()
-                .map(|transmitter| transmitter.nem_id)
-                .collect();
-            let (tx_time, propagation, duration, report, report_in_band, sensitivity_mw) =
-                state.phy.monitor.lock().unwrap().update(
-                    now,
-                    tx.tx_time_microseconds,
-                    propagation_microseconds,
-                    doppler_fraction,
-                    &segments,
-                    tx.bandwidth_hz,
-                    &rx_powers_mw,
-                    is_in_band,
-                    &transmitter_ids,
-                    tx.sub_id,
-                    tx.antenna_index,
-                    tx.spectral_mask_index,
-                    std::ptr::null(),
-                    0,
-                );
-            if state
-                .phy
-                .monitor
-                .lock()
-                .unwrap()
-                .last_update_had_clamp_error()
-            {
-                state.counters.upstream_drop_packet(
-                    state.framework,
-                    packet.info.source,
-                    packet.info.destination,
-                    8,
-                );
-                return;
+                .encode() else {
+                    return;
+                };
+                controls.push((CONTROL_RX_FREQUENCY_SEGMENTS, bytes));
             }
-            if tx_time != tx.tx_time_microseconds {
+            let mut outgoing = incoming
+                .iter()
+                .copied()
+                .filter(|m| {
+                    !matches!(
+                        m.msg_type,
+                        CONTROL_RX_PROPERTIES
+                            | CONTROL_RX_FREQUENCY_SEGMENTS
+                            | CONTROL_MIMO_RX_PROPERTIES
+                    )
+                })
+                .collect::<Vec<_>>();
+            outgoing.extend(controls.iter().map(|(msg_type, bytes)| FfiControlMessage {
+                msg_type: *msg_type,
+                payload: FfiSlice {
+                    data: bytes.as_ptr(),
+                    len: bytes.len(),
+                },
+            }));
+            if properties.tx_time_microseconds != tx.tx_time_microseconds {
                 (state.framework.increment_counter)(
                     state.framework.framework_ctx,
                     state.phy.time_sync_rewrite_counter,
                     1,
                 );
-            }
-            if report.is_empty() || !report_in_band {
-                if report.is_empty()
-                    && report_in_band
-                    && state.phy.compatibility_mode == 2
-                    && state.phy.rx_sensitivity_promiscuous_mode_enabled
-                {
-                    (state.framework.send_upstream_packet)(
-                        state.framework.framework_ctx,
-                        state.id,
-                        packet,
-                        std::ptr::null(),
-                        0,
-                    );
-                }
-                state.counters.upstream_drop_packet(
-                    state.framework,
-                    packet.info.source,
-                    packet.info.destination,
-                    if report_in_band {
-                        2
-                    } else if tx.sub_id == state.phy.sub_id {
-                        7
-                    } else {
-                        1
-                    },
-                );
-                return;
-            }
-            let noise_floor_dbm = reception_noise_floor_dbm(
-                &state.phy.monitor.lock().unwrap(),
-                now,
-                tx_time,
-                propagation,
-                duration,
-                &report[0],
-            );
-
-            let rx = RxProperties {
-                frequency_hz: report[0].frequency_hz,
-                bandwidth_hz: tx.bandwidth_hz,
-                rx_power_dbm: report[0].rx_power_dbm,
-                noise_floor_dbm,
-                tx_time_microseconds: tx_time,
-                propagation_microseconds: propagation.max(0) as u64,
-                duration_microseconds: duration.max(0) as u64,
-                antenna_index: tx.antenna_index,
-                sub_id: tx.sub_id,
-                signal_in_noise: state.phy.noise_mode == NoiseMode::All,
-            };
-            let rx_bytes = rx.encode();
-            let rx_segment_bytes = RxFrequencySegments {
-                segments: report
-                    .iter()
-                    .map(|segment| RxFrequencySegment {
-                        frequency_hz: segment.frequency_hz,
-                        rx_power_dbm: segment.rx_power_dbm,
-                        duration_microseconds: segment.duration_microsec.max(0) as u64,
-                        offset_microseconds: segment.offset_microsec.max(0) as u64,
-                    })
-                    .collect(),
-            }
-            .encode();
-            let mimo_rx_bytes = (!mimo_ranges.is_empty())
-                .then(|| {
-                    let receive_antennas = if state.phy.receive_antennas.is_empty() {
-                        vec![(
-                            0,
-                            MimoTxAntenna {
-                                frequency_group_index: 0,
-                                antenna_index: 0,
-                                bandwidth_hz: tx.bandwidth_hz,
-                                spectral_mask_index: 0,
-                                pattern: state
-                                    .phy
-                                    .default_antenna_pattern(state.id)
-                                    .unwrap_or(AntennaPattern::Default),
-                            },
-                            state.phy.frequencies_of_interest.clone(),
-                        )]
-                    } else {
-                        let mut antennas = state
-                            .phy
-                            .receive_antennas
-                            .iter()
-                            .map(|(index, entry)| {
-                                (*index, entry.antenna, entry.frequencies_hz.clone())
-                            })
-                            .collect::<Vec<_>>();
-                        antennas.sort_by_key(|entry| entry.0);
-                        antennas
-                    };
-                    let mut antenna_infos = Vec::new();
-                    for (receive_index, receive_antenna, receive_frequencies) in receive_antennas {
-                        for (transmit_antenna, start, end) in &mimo_ranges {
-                            let source_segments = &frequency_segments.segments[*start..*end];
-                            let mut powers_mw = vec![0.0; source_segments.len()];
-                            let mut combination_propagation = i64::MAX;
-                            for transmitter in &transmitters.transmitters {
-                                let Some((receive_gain_db, transmit_gain_db, cache_hit)) =
-                                    state.phy.antenna_pair_gains(
-                                        state.id,
-                                        transmitter.nem_id,
-                                        receive_antenna.pattern,
-                                        transmit_antenna.pattern,
-                                    )
-                                else {
-                                    continue;
-                                };
-                                (state.framework.increment_counter)(
-                                    state.framework.framework_ctx,
-                                    if cache_hit {
-                                        state.phy.gain_cache_hit_counter
-                                    } else {
-                                        state.phy.gain_cache_miss_counter
-                                    },
-                                    1,
-                                );
-                                let gain_db = receive_gain_db + transmit_gain_db;
-                                for (segment_index, segment) in source_segments.iter().enumerate() {
-                                    let Some((pathloss_db, propagation)) = state.phy.propagation(
-                                        state.id,
-                                        transmitter.nem_id,
-                                        segment.frequency_hz,
-                                    ) else {
-                                        continue;
-                                    };
-                                    let tx_power_dbm = mimo_tx.as_ref().unwrap().frequency_groups
-                                        [usize::from(transmit_antenna.frequency_group_index)]
-                                        [segment_index]
-                                        .tx_power_dbm;
-                                    let Some(power_dbm) = state.phy.apply_fading(
-                                        state.id,
-                                        transmitter.nem_id,
-                                        tx_power_dbm - pathloss_db + gain_db,
-                                        now.max(0) as u64,
-                                    ) else {
-                                        continue;
-                                    };
-                                    state.phy.publish_receive_power(
-                                        transmitter.nem_id,
-                                        receive_index,
-                                        transmit_antenna.antenna_index,
-                                        segment.frequency_hz,
-                                        power_dbm,
-                                        transmit_gain_db,
-                                        receive_gain_db,
-                                        tx_power_dbm,
-                                        pathloss_db,
-                                        segment.frequency_hz as f64 * doppler_fraction,
-                                        tx.tx_time_microseconds as f64 / 1_000_000.0,
-                                    );
-                                    state.phy.publish_observed_power(
-                                        transmitter.nem_id,
-                                        receive_index,
-                                        transmit_antenna.antenna_index,
-                                        segment.frequency_hz,
-                                        transmit_antenna.spectral_mask_index,
-                                        power_dbm,
-                                        tx.tx_time_microseconds as f64 / 1_000_000.0,
-                                    );
-                                    powers_mw[segment_index] += 10.0f64.powf(power_dbm / 10.0);
-                                    combination_propagation =
-                                        combination_propagation.min(propagation);
-                                }
-                            }
-                            if powers_mw.iter().any(|power| *power <= 0.0) {
-                                continue;
-                            }
-                            let ffi_segments = source_segments
-                                .iter()
-                                .zip(&powers_mw)
-                                .map(|(segment, power)| FfiFrequencySegment {
-                                    frequency_hz: segment.frequency_hz,
-                                    rx_power_dbm: 10.0 * power.log10(),
-                                    duration_microsec: i64::try_from(segment.duration_microseconds)
-                                        .unwrap_or(i64::MAX),
-                                    offset_microsec: i64::try_from(segment.offset_microseconds)
-                                        .unwrap_or(i64::MAX),
-                                })
-                                .collect::<Vec<_>>();
-                            let in_band = tx.sub_id == state.phy.sub_id
-                                && source_segments.iter().any(|segment| {
-                                    receive_frequencies.contains(&segment.frequency_hz)
-                                });
-                            let (info_report, info_sensitivity_mw, info_noise_floor_dbm) =
-                                if receive_index == 0
-                                    && !state.phy.receive_antennas.contains_key(&receive_index)
-                                {
-                                    (ffi_segments, sensitivity_mw, noise_floor_dbm)
-                                } else {
-                                    let entry =
-                                        state.phy.receive_antennas.get_mut(&receive_index)?;
-                                    let (
-                                        info_tx_time,
-                                        info_propagation,
-                                        info_span,
-                                        report,
-                                        report_in_band,
-                                        sensitivity,
-                                    ) = entry.monitor.lock().unwrap().update(
-                                        now,
-                                        tx.tx_time_microseconds,
-                                        combination_propagation,
-                                        doppler_fraction,
-                                        &ffi_segments,
-                                        transmit_antenna.bandwidth_hz,
-                                        &powers_mw,
-                                        in_band,
-                                        &transmitter_ids,
-                                        tx.sub_id,
-                                        transmit_antenna.antenna_index,
-                                        transmit_antenna.spectral_mask_index,
-                                        std::ptr::null(),
-                                        0,
-                                    );
-                                    if !report_in_band || report.is_empty() {
-                                        continue;
-                                    }
-                                    let noise_floor = reception_noise_floor_dbm(
-                                        &entry.monitor.lock().unwrap(),
-                                        now,
-                                        info_tx_time,
-                                        info_propagation,
-                                        info_span,
-                                        &report[0],
-                                    );
-                                    (report, sensitivity, noise_floor)
-                                };
-                            let first_offset = source_segments
-                                .iter()
-                                .map(|segment| segment.offset_microseconds)
-                                .min()
-                                .unwrap_or(0);
-                            let span_microseconds = source_segments
-                                .iter()
-                                .map(|segment| {
-                                    segment
-                                        .offset_microseconds
-                                        .saturating_add(segment.duration_microseconds)
-                                })
-                                .max()
-                                .unwrap_or(first_offset)
-                                .saturating_sub(first_offset);
-                            antenna_infos.push(MimoRxAntennaInfo {
-                                receive_antenna_index: receive_index,
-                                transmit_antenna_index: transmit_antenna.antenna_index,
-                                span_microseconds,
-                                receiver_sensitivity_dbm: 10.0 * info_sensitivity_mw.log10(),
-                                noise_floor_dbm: info_noise_floor_dbm,
-                                segments: info_report
-                                    .iter()
-                                    .map(|segment| RxFrequencySegment {
-                                        frequency_hz: segment.frequency_hz,
-                                        rx_power_dbm: segment.rx_power_dbm,
-                                        duration_microseconds: segment.duration_microsec.max(0)
-                                            as u64,
-                                        offset_microseconds: segment.offset_microsec.max(0) as u64,
-                                    })
-                                    .collect(),
-                            });
-                        }
-                    }
-                    if antenna_infos.is_empty() {
-                        return None;
-                    }
-                    let mut doppler_shifts_hz = frequency_segments
-                        .segments
-                        .iter()
-                        .map(|segment| {
-                            (
-                                segment.frequency_hz,
-                                (segment.frequency_hz as f64 * doppler_fraction).round() as i64,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    doppler_shifts_hz.sort_unstable_by_key(|entry| entry.0);
-                    doppler_shifts_hz.dedup_by_key(|entry| entry.0);
-                    Some(MimoRxProperties {
-                        tx_time_microseconds: tx_time,
-                        propagation_microseconds: propagation.max(0) as u64,
-                        antenna_infos,
-                        doppler_shifts_hz,
-                    })
-                })
-                .flatten()
-                .and_then(|properties| properties.encode());
-            let mut outgoing: Vec<_> = incoming
-                .iter()
-                .copied()
-                .filter(|message| {
-                    message.msg_type != CONTROL_RX_PROPERTIES
-                        && message.msg_type != CONTROL_RX_FREQUENCY_SEGMENTS
-                        && message.msg_type != CONTROL_MIMO_RX_PROPERTIES
-                })
-                .collect();
-            if state.phy.compatibility_mode == 1 {
-                outgoing.push(FfiControlMessage {
-                    msg_type: CONTROL_RX_PROPERTIES,
-                    payload: FfiSlice {
-                        data: rx_bytes.as_ptr(),
-                        len: rx_bytes.len(),
-                    },
-                });
-                if let Some(bytes) = &rx_segment_bytes {
-                    outgoing.push(FfiControlMessage {
-                        msg_type: CONTROL_RX_FREQUENCY_SEGMENTS,
-                        payload: FfiSlice {
-                            data: bytes.as_ptr(),
-                            len: bytes.len(),
-                        },
-                    });
-                }
-            } else if let Some(bytes) = &mimo_rx_bytes {
-                outgoing.push(FfiControlMessage {
-                    msg_type: CONTROL_MIMO_RX_PROPERTIES,
-                    payload: FfiSlice {
-                        data: bytes.as_ptr(),
-                        len: bytes.len(),
-                    },
-                });
-            } else {
-                if state.phy.rx_sensitivity_promiscuous_mode_enabled {
-                    (state.framework.send_upstream_packet)(
-                        state.framework.framework_ctx,
-                        state.id,
-                        packet,
-                        std::ptr::null(),
-                        0,
-                    );
-                }
-                state.counters.upstream_drop_packet(
-                    state.framework,
-                    packet.info.source,
-                    packet.info.destination,
-                    2,
-                );
-                return;
             }
             state.counters.upstream_tx_packet(
                 state.framework,
@@ -5392,10 +4896,80 @@ extern "C" fn builtin_downstream(
                 unsafe { std::slice::from_raw_parts(message.payload.data, message.payload.len) }
             };
             match message.msg_type {
+                CONTROL_SPECTRUM_FILTER_ADD => {
+                    if let Some(spec) = SpectrumFilterAdd::decode(payload) {
+                        let monitor =
+                            if state.phy.compatibility_mode == 1 && spec.antenna_index == 0 {
+                                Some(state.phy.monitor.clone())
+                            } else {
+                                state
+                                    .phy
+                                    .receive_antennas
+                                    .get(&spec.antenna_index)
+                                    .map(|a| a.monitor.clone())
+                            };
+                        if let Some(m) = monitor {
+                            m.lock().unwrap().add_owned_filter(spec);
+                        }
+                    }
+                }
+                CONTROL_SPECTRUM_FILTER_REMOVE if payload.len() == 4 => {
+                    let antenna = u16::from_be_bytes([payload[0], payload[1]]);
+                    let filter = u16::from_be_bytes([payload[2], payload[3]]);
+                    let monitor = if state.phy.compatibility_mode == 1 && antenna == 0 {
+                        Some(state.phy.monitor.clone())
+                    } else {
+                        state
+                            .phy
+                            .receive_antennas
+                            .get(&antenna)
+                            .map(|a| a.monitor.clone())
+                    };
+                    if let Some(m) = monitor {
+                        m.lock().unwrap().remove_filter(filter);
+                    }
+                }
                 CONTROL_RX_ANTENNA_ADD | CONTROL_RX_ANTENNA_UPDATE => {
-                    let Some(add) = RxAntennaAdd::decode(payload) else {
+                    if state.phy.compatibility_mode != 2 {
+                        continue;
+                    }
+                    let Some(mut add) = RxAntennaAdd::decode(payload) else {
                         continue;
                     };
+                    if add.antenna.pattern == AntennaPattern::Default {
+                        add.antenna.pattern = state
+                            .phy
+                            .default_antenna_pattern(state.id)
+                            .unwrap_or(AntennaPattern::Default);
+                    }
+                    if message.msg_type == CONTROL_RX_ANTENNA_UPDATE {
+                        // Pointing/gain changes leave the antenna's spectrum history,
+                        // filters, configured bandwidth and FOI intact.
+                        if let Some(entry) = state
+                            .phy
+                            .receive_antennas
+                            .get_mut(&add.antenna.antenna_index)
+                        {
+                            entry.antenna = add.antenna;
+                        }
+                        continue;
+                    }
+                    if state
+                        .phy
+                        .receive_antennas
+                        .contains_key(&add.antenna.antenna_index)
+                    {
+                        continue;
+                    }
+                    if add.antenna.bandwidth_hz == 0 {
+                        add.antenna.bandwidth_hz = state.phy.bandwidth_hz;
+                    }
+                    if add.frequencies_hz.is_empty() {
+                        add.frequencies_hz = state.phy.frequencies_of_interest.clone();
+                    } else {
+                        // Original ADD updates the fallback FOI for subsequent adds.
+                        state.phy.frequencies_of_interest = add.frequencies_hz.clone();
+                    }
                     let monitor = state
                         .phy
                         .make_monitor(&add.frequencies_hz, add.antenna.bandwidth_hz);
@@ -5403,24 +4977,15 @@ extern "C" fn builtin_downstream(
                         add.antenna.antenna_index,
                         ReceiveAntennaState {
                             antenna: add.antenna,
-                            frequencies_hz: add.frequencies_hz,
                             monitor: Arc::new(Mutex::new(monitor)),
                         },
                     );
-                    state.phy.frequencies_of_interest = state
-                        .phy
-                        .receive_antennas
-                        .values()
-                        .flat_map(|entry| entry.frequencies_hz.iter().copied())
-                        .collect();
-                    state.phy.frequencies_of_interest.sort_unstable();
-                    state.phy.frequencies_of_interest.dedup();
-                    state.phy.bandwidth_hz = add.antenna.bandwidth_hz;
-                    state.phy.initialize_monitor();
                 }
                 CONTROL_RX_ANTENNA_REMOVE => {
                     if let Some(remove) = RxAntennaRemove::decode(payload) {
                         state.phy.receive_antennas.remove(&remove.antenna_index);
+                        state.phy.nakagami.remove(&remove.antenna_index);
+                        state.phy.lognormal_states.remove(&remove.antenna_index);
                     }
                 }
                 _ => {}
@@ -5521,7 +5086,7 @@ extern "C" fn builtin_downstream(
                 || {
                     vec![MimoTxFrequencySegment {
                         frequency_hz: tx.frequency_hz,
-                        tx_power_dbm: tx.tx_power_dbm,
+                        tx_power_dbm: None,
                         duration_microseconds: tx.duration_microseconds,
                         offset_microseconds: tx.offset_microseconds,
                     }]
@@ -5532,7 +5097,7 @@ extern "C" fn builtin_downstream(
                         .iter()
                         .map(|segment| MimoTxFrequencySegment {
                             frequency_hz: segment.frequency_hz,
-                            tx_power_dbm: tx.tx_power_dbm,
+                            tx_power_dbm: None,
                             duration_microseconds: segment.duration_microseconds,
                             offset_microseconds: segment.offset_microseconds,
                         })
@@ -5591,7 +5156,7 @@ extern "C" fn builtin_downstream(
             {
                 let first = group[0];
                 tx.frequency_hz = first.frequency_hz;
-                tx.tx_power_dbm = first.tx_power_dbm;
+                tx.tx_power_dbm = first.tx_power_dbm.unwrap_or(tx.tx_power_dbm);
                 tx.antenna_index = antenna.antenna_index;
                 tx.bandwidth_hz = antenna.bandwidth_hz;
                 tx.spectral_mask_index = antenna.spectral_mask_index;
@@ -5695,6 +5260,91 @@ extern "C" fn builtin_downstream(
             outgoing.as_ptr(),
             outgoing.len(),
         );
+        if let Some(interference) = incoming
+            .iter()
+            .find(|m| m.msg_type == CONTROL_SELF_INTERFERENCE)
+            .and_then(|m| {
+                if m.payload.data.is_null() {
+                    None
+                } else {
+                    SelfInterference::decode(unsafe {
+                        std::slice::from_raw_parts(m.payload.data, m.payload.len)
+                    })
+                }
+            })
+        {
+            if let Some(mimo) = &normalized_mimo {
+                let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+                for antenna in interference.antennas {
+                    let monitor = if state.phy.compatibility_mode == 1 && antenna.antenna_index == 0
+                    {
+                        Some(state.phy.monitor.clone())
+                    } else {
+                        state
+                            .phy
+                            .receive_antennas
+                            .get(&antenna.antenna_index)
+                            .map(|a| a.monitor.clone())
+                    };
+                    let Some(monitor) = monitor else {
+                        continue;
+                    };
+                    let groups = mimo.frequency_groups.clone();
+                    let filter = filter_data(incoming).unwrap_or_default();
+                    let id = state.id;
+                    jobs.push(Box::new(move || {
+                        let mut monitor = monitor.lock().unwrap();
+                        for (index, (group, powers)) in antenna.groups.into_iter().enumerate() {
+                            let Some(group) = groups.get(usize::from(group)) else {
+                                return;
+                            };
+                            let powers = if powers.len() == 1 {
+                                vec![powers[0]; group.len()]
+                            } else if powers.len() == group.len() {
+                                powers
+                            } else {
+                                return;
+                            };
+                            let segments = group
+                                .iter()
+                                .zip(&powers)
+                                .map(|(s, p)| FfiFrequencySegment {
+                                    frequency_hz: s.frequency_hz,
+                                    rx_power_dbm: 10.0 * p.log10(),
+                                    duration_microsec: s.duration_microseconds.min(i64::MAX as u64)
+                                        as i64,
+                                    offset_microsec: s.offset_microseconds.min(i64::MAX as u64)
+                                        as i64,
+                                })
+                                .collect::<Vec<_>>();
+                            monitor.update(
+                                now,
+                                tx.tx_time_microseconds,
+                                0,
+                                0.0,
+                                &segments,
+                                tx.bandwidth_hz,
+                                &powers,
+                                false,
+                                &[id],
+                                tx.sub_id,
+                                index as u16,
+                                0,
+                                filter.as_ptr(),
+                                filter.len(),
+                            );
+                        }
+                    }));
+                }
+                if let Some(pool) = &state.phy.processing_pool {
+                    let _ = pool.run(jobs);
+                } else {
+                    for job in jobs {
+                        job();
+                    }
+                }
+            }
+        }
         return;
     }
     if let Some(packet) = unsafe { packet.as_ref() } {
@@ -6019,7 +5669,7 @@ extern "C" fn builtin_event(state: *mut c_void, event_id: u16, data: *const u8, 
                     Err(_) => continue,
                 };
                 state.phy.fading_selections.insert(nem_id, mode);
-                state.phy.lognormal_states.remove(&nem_id);
+
                 if let Some(handle) = state.phy.fading_selection_event_table {
                     let _ = set_native_table_row(
                         handle,
@@ -6144,6 +5794,7 @@ impl NemManager {
         Self {
             uuid,
             runtime: Arc::new(Runtime {
+                uuid,
                 invocations: RwLock::new(HashMap::new()),
                 boundaries: RwLock::new(HashMap::new()),
                 phy_tx_sequences: Mutex::new(HashMap::new()),
@@ -6242,16 +5893,6 @@ impl NemManager {
         expected_type: u32,
         config: &[(String, Vec<String>)],
     ) -> Result<(), String> {
-        if expected_type == 2
-            && matches!(plugin, "" | "emanephy")
-            && !config.iter().any(|(name, values)| {
-                name == "subid"
-                    && values.len() == 1
-                    && values[0].parse::<u16>().is_ok_and(|value| value != 0)
-            })
-        {
-            return Err("emanephy requires exactly one nonzero subid parameter".to_string());
-        }
         let layer_index = self.layers.get(&nem_id).map_or(0, Vec::len);
         let (library, api): (Option<Library>, *const PluginApi) = if plugin.is_empty()
             || plugin == "emanephy"
@@ -6296,19 +5937,17 @@ impl NemManager {
         let registered_plugin_name = unsafe { CStr::from_ptr(api_name) }
             .to_string_lossy()
             .into_owned();
-        for required in component_required_parameters(&registered_plugin_name) {
-            if !config.iter().any(|(name, values)| {
-                name == required
-                    && !values.is_empty()
-                    && values.iter().all(|value| !value.is_empty())
-            }) {
-                return Err(format!(
-                    "{} requires configuration parameter {required}",
-                    canonical_plugin_name(&registered_plugin_name)
-                ));
-            }
-        }
-
+        let configuration_schema = component_configuration_schema(&registered_plugin_name);
+        let normalized = crate::native_configuration::parse_initial(&configuration_schema, config)?
+            .into_iter()
+            .map(|(name, values)| {
+                (
+                    name,
+                    values.into_iter().map(|v| v.text()).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let config = &normalized;
         let event_build_id = next_event_build_id();
         if event_build_id == 0 {
             return Err("component build-id space is exhausted".to_string());
@@ -6335,6 +5974,7 @@ impl NemManager {
             cancel_timed_event,
             log,
             register_counter,
+            register_counter32,
             increment_counter,
             maximize_counter,
             register_double,
@@ -6357,6 +5997,7 @@ impl NemManager {
             publish_event,
             register_file_descriptor,
             unregister_file_descriptor,
+            query_spectrum_filter,
             query_spectrum,
         };
         let plugin_context =
@@ -6390,6 +6031,7 @@ impl NemManager {
         if let Err(error) = register_native_configuration(
             event_build_id,
             component_configuration_defaults(&registered_plugin_name),
+            configuration_schema,
             config,
             &component_modifiable_parameters(&registered_plugin_name),
             move |updates| {
@@ -6731,9 +6373,12 @@ mod tests {
             let defaults = component_configuration_defaults(plugin)
                 .into_iter()
                 .collect::<HashMap<_, _>>();
-            for required in component_required_parameters(plugin) {
+            for (required, _) in component_configuration_schema(plugin)
+                .iter()
+                .filter(|(_, spec)| spec.required)
+            {
                 assert_eq!(
-                    defaults.get(*required),
+                    defaults.get(required),
                     Some(&Vec::new()),
                     "{plugin} must manifest required parameter {required} without inventing a default"
                 );
@@ -6744,11 +6389,6 @@ mod tests {
             component_configuration_defaults(plugin)
                 .into_iter()
                 .map(|(name, _)| name)
-                .chain(
-                    component_required_parameters(plugin)
-                        .iter()
-                        .map(|name| (*name).to_string()),
-                )
                 .collect::<std::collections::BTreeSet<_>>()
         };
 
@@ -7034,6 +6674,7 @@ mod tests {
             cancel_timed_event,
             log,
             register_counter,
+            register_counter32,
             increment_counter,
             maximize_counter,
             register_double,
@@ -7056,6 +6697,7 @@ mod tests {
             publish_event,
             register_file_descriptor,
             unregister_file_descriptor,
+            query_spectrum_filter,
             query_spectrum,
         };
         let context = (capture_api().init)(nem_id, &framework);
@@ -7183,7 +6825,7 @@ mod tests {
                 "virtualtransport",
                 4,
                 &[
-                    ("bitrate".to_string(), vec!["0.0".to_string()]),
+                    ("bitrate".to_string(), vec!["0".to_string()]),
                     ("address".to_string(), vec!["172.30.1.1".to_string()]),
                     ("mask".to_string(), vec!["255.255.0.0".to_string()]),
                 ],
@@ -7336,6 +6978,7 @@ mod tests {
             cancel_timed_event: phy_capture_cancel,
             log: phy_capture_log,
             register_counter: phy_capture_register,
+            register_counter32: phy_capture_register,
             increment_counter: phy_capture_increment,
             maximize_counter: phy_capture_increment,
             register_double: phy_capture_register_double,
@@ -7358,6 +7001,7 @@ mod tests {
             publish_event,
             register_file_descriptor,
             unregister_file_descriptor,
+            query_spectrum_filter,
             query_spectrum,
         };
         let context = builtin_init(1, &framework, BuiltinKind::Phy);
@@ -7371,6 +7015,7 @@ mod tests {
         let payload = [1u8];
         let packet = FfiPacket {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: 1,
                 destination: 2,
                 priority: 0,
@@ -7695,6 +7340,7 @@ mod tests {
             cancel_timed_event: phy_capture_cancel,
             log: phy_capture_log,
             register_counter: phy_capture_register,
+            register_counter32: phy_capture_register,
             increment_counter: phy_capture_increment,
             maximize_counter: phy_capture_increment,
             register_double: phy_capture_register_double,
@@ -7717,6 +7363,7 @@ mod tests {
             publish_event,
             register_file_descriptor,
             unregister_file_descriptor,
+            query_spectrum_filter,
             query_spectrum,
         };
         let context = builtin_init(1, &framework, BuiltinKind::Phy);
@@ -7767,13 +7414,13 @@ mod tests {
             frequency_groups: vec![
                 vec![MimoTxFrequencySegment {
                     frequency_hz: 2_400_000_000,
-                    tx_power_dbm: 0.0,
+                    tx_power_dbm: Some(0.0),
                     duration_microseconds: 100,
                     offset_microseconds: 0,
                 }],
                 vec![MimoTxFrequencySegment {
                     frequency_hz: 2_410_000_000,
-                    tx_power_dbm: 0.0,
+                    tx_power_dbm: Some(0.0),
                     duration_microseconds: 50,
                     offset_microseconds: 100,
                 }],
@@ -7837,6 +7484,7 @@ mod tests {
         let payload = [1u8, 2, 3];
         let packet = FfiPacket {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: 2,
                 destination: 1,
                 priority: 0,
@@ -8071,7 +7719,17 @@ mod tests {
         let now = unix_time_microseconds().max(0) as u64;
         update_queue_metric(context, 1, 255, 4, 2, 30);
         update_neighbor_tx(context, 21, 1_000_000, now);
-        update_neighbor_rx(context, 21, 7, 15.0, -100.0, now, 200, 2_000_000);
+        update_neighbor_rx(
+            context,
+            21,
+            7,
+            [1u8; 16].as_ptr(),
+            15.0,
+            -100.0,
+            now,
+            200,
+            2_000_000,
+        );
         publish_r2ri(context, 1_000_000, 2_000_000, 500_000, 60_000_000);
         assert_eq!(R2RI_CAPTURE_COUNT.load(Ordering::Relaxed), 3);
     }
@@ -8105,6 +7763,7 @@ mod tests {
         let payload = [1u8, 2, 3, 4];
         let packet = FfiPacket {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: 30,
                 destination: 31,
                 priority: 0,
@@ -8118,7 +7777,7 @@ mod tests {
         };
         manager.process_downstream(30, &packet, &[]).unwrap();
 
-        let name = CString::new("numDownstreamPacketsUnicastRx").unwrap();
+        let name = CString::new("numDownstreamPacketsUnicastRx0").unwrap();
         let names = [name.as_ptr()];
         let mut error = [0i8; 64];
         let query = emane_rs_statistic_query(
@@ -8134,7 +7793,7 @@ mod tests {
         assert_eq!(unsafe { &*query.data }.value.u64_value, 1);
         emane_rs_statistic_free_query_result(query);
 
-        let name = CString::new("UnicastPacketAcceptTable").unwrap();
+        let name = CString::new("UnicastPacketAcceptTable0").unwrap();
         let names = [name.as_ptr()];
         let tables = emane_rs_statistic_query_table(
             build_id,
@@ -8171,7 +7830,7 @@ mod tests {
         manager.layers[&30][0]
             .invocation
             .call(|api, context| (api.process_upstream)(context, &dropped, std::ptr::null(), 4097));
-        let name = CString::new("UnicastPacketDropTable").unwrap();
+        let name = CString::new("UnicastPacketDropTable0").unwrap();
         let names = [name.as_ptr()];
         let tables = emane_rs_statistic_query_table(
             build_id,
@@ -8230,6 +7889,19 @@ mod tests {
         }
         .encode_to_vec();
         invocation.process_event(100, event.as_ptr(), event.len());
+
+        // A processing counter increments before the callback finishes; wait behind it in the queue.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        assert!(manager.layers[&40][0]
+            .queue
+            .enqueue(
+                QueueTaskKind::FileDescriptor,
+                Box::new(move || {
+                    let _ = done_tx.send(());
+                })
+            )
+            .is_ok());
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         let processed = CString::new("processedEvents").unwrap();
         let requested = [processed.as_ptr()];
@@ -8388,6 +8060,24 @@ mod tests {
             }
             panic!("{error}");
         }
+        manager
+            .add_layer_configured(
+                1,
+                "emanephy",
+                2,
+                &[
+                    ("subid".into(), vec!["1".into()]),
+                    (
+                        "frequencyofinterest".into(),
+                        vec!["2.4G".into(), "5.8G".into()],
+                    ),
+                    ("noisemode".into(), vec!["outofband".into()]),
+                ],
+            )
+            .unwrap();
+        let monitor = manager.runtime.spectrum_monitors.read().unwrap()[&(1, 0)]
+            .upgrade()
+            .unwrap();
         let layer = &manager.layers[&1][0];
         let build_id = layer.event_build_id;
         let invocation = layer.invocation;
@@ -8405,6 +8095,7 @@ mod tests {
         let payload = [0u8, 4, 0x08, 0xc0, 0x84, 0x3d, 1, 2];
         let packet = FfiPacket {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: 2,
                 destination: 1,
                 priority: 0,
@@ -8419,14 +8110,37 @@ mod tests {
         for (frequency_hz, rx_power_dbm, noise_floor_dbm) in
             [(2_400_000_000, -50.0, -60.0), (5_800_000_000, -70.0, -80.0)]
         {
+            let start = unix_time_microseconds() - 2000;
+            let segment = FfiFrequencySegment {
+                frequency_hz,
+                rx_power_dbm: noise_floor_dbm,
+                duration_microsec: 1000,
+                offset_microsec: 0,
+            };
+            monitor.lock().unwrap().update(
+                start,
+                start,
+                0,
+                0.0,
+                &[segment],
+                1_000_000,
+                &[10.0f64.powf(noise_floor_dbm / 10.0)],
+                false,
+                &[3],
+                2,
+                0,
+                0,
+                std::ptr::null(),
+                0,
+            );
             let rx = RxProperties {
                 frequency_hz,
                 bandwidth_hz: 1_000_000,
                 rx_power_dbm,
                 noise_floor_dbm,
-                tx_time_microseconds: 0,
+                tx_time_microseconds: start,
                 propagation_microseconds: 0,
-                duration_microseconds: 0,
+                duration_microseconds: 1000,
                 antenna_index: 0,
                 sub_id: 0,
                 signal_in_noise: false,
@@ -8453,7 +8167,7 @@ mod tests {
             });
         }
 
-        let table_name = CString::new("ReceiveMetricTable").unwrap();
+        let table_name = CString::new("RFSignalTable").unwrap();
         let table_names = [table_name.as_ptr()];
         let requested = FfiStringArray {
             data: table_names.as_ptr(),
@@ -8478,7 +8192,8 @@ mod tests {
         emane_rs_statistic_clear_table(build_id, requested, error.as_mut_ptr(), error.len());
         let result =
             emane_rs_statistic_query_table(build_id, requested, error.as_mut_ptr(), error.len());
-        assert_eq!(unsafe { &*result.data }.rows_len, 0);
+        assert_ne!(error[0], 0, "C++ RFSignalTable is not externally clearable");
+        assert_eq!(unsafe { &*result.data }.rows_len, 1);
         emane_rs_statistic_free_table_query_result(result);
         let _ = std::fs::remove_file(pcr_path);
     }
@@ -8492,6 +8207,7 @@ mod tests {
             queue: 0,
         };
         let runtime = Runtime {
+            uuid: [1; 16],
             invocations: RwLock::new(HashMap::from([
                 (1, vec![invocation]),
                 (2, vec![invocation]),
@@ -8504,6 +8220,7 @@ mod tests {
         let payload = [1u8];
         let packet = FfiPacket {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: 1,
                 destination: 2,
                 priority: 0,
@@ -8543,6 +8260,7 @@ mod tests {
         let payload = [9u8, 8, 7];
         let packet = FfiPacket {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: 1,
                 destination: 2,
                 priority: 0,
@@ -8623,6 +8341,7 @@ mod tests {
         let payload = [1u8, 2, 3, 4];
         let packet = FfiPacket {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: 7,
                 destination: 8,
                 priority: 0,
@@ -8682,6 +8401,7 @@ mod tests {
         let bytes = [1, 2, 3];
         let packet = FfiPacket {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: 1,
                 destination: 2,
                 priority: 0,
@@ -8764,6 +8484,7 @@ mod tests {
         let payload = [4u8, 5, 6];
         let packet = FfiPacket {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: 1,
                 destination: 2,
                 priority: 0,
@@ -8931,6 +8652,7 @@ mod tests {
         let payload = [5u8; 128];
         let packet = FfiPacket {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: 1,
                 destination: 2,
                 priority: 0,
@@ -8952,3 +8674,15 @@ mod tests {
         assert_eq!(BYPASS_STACK_BYTES.load(Ordering::Relaxed), 640);
     }
 }
+
+#[cfg(test)]
+#[path = "nem_parity_tests.rs"]
+mod parity_tests;
+
+#[cfg(test)]
+#[path = "nem_receive_tests.rs"]
+mod receive_regressions;
+
+#[cfg(test)]
+#[path = "nem_upstream_tests.rs"]
+mod upstream_regressions;

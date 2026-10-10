@@ -72,7 +72,18 @@ extern "C" fn set_table_row(
 }
 extern "C" fn neighbor_tx(_: *mut c_void, _: u16, _: u64, _: u64) {}
 extern "C" fn neighbor_status(_: *mut c_void) {}
-extern "C" fn neighbor_rx(_: *mut c_void, _: u16, _: u64, _: f64, _: f64, _: u64, _: u64, _: u64) {}
+extern "C" fn neighbor_rx(
+    _: *mut c_void,
+    _: u16,
+    _: u64,
+    _: *const u8,
+    _: f64,
+    _: f64,
+    _: u64,
+    _: u64,
+    _: u64,
+) {
+}
 extern "C" fn queue(_: *mut c_void, _: u16, _: u32, _: u32, _: u32, _: u64) {}
 extern "C" fn publish(_: *mut c_void, _: u64, _: u64, _: u64, _: u64) {}
 extern "C" fn register_rf(_: *mut c_void, _: u16) -> u64 {
@@ -145,6 +156,7 @@ fn main() -> Result<(), String> {
         cancel_timed_event: cancel,
         log,
         register_counter,
+        register_counter32: register_counter,
         increment_counter,
         maximize_counter: increment_counter,
         register_double,
@@ -167,6 +179,7 @@ fn main() -> Result<(), String> {
         publish_event,
         register_file_descriptor: register_descriptor,
         unregister_file_descriptor: unregister_descriptor,
+        query_spectrum_filter: emane_plugin_api::spectrum::unavailable_filter,
         query_spectrum: spectrum_unavailable,
     };
     let instance = (api.init)(42, &framework);

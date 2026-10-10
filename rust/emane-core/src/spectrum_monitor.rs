@@ -13,6 +13,7 @@ pub enum NoiseMode {
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct FfiFrequencySegment {
     pub frequency_hz: u64,
     pub rx_power_dbm: f64,
@@ -106,6 +107,13 @@ pub struct SpectrumMonitor {
     u16_sub_id: u16,
     foi: HashSet<u64>,
 
+    owned_filter_criteria: BTreeMap<
+        u16,
+        (
+            Box<emane_plugin_api::FilterCriterion>,
+            Box<FfiFilterMatchCriterion>,
+        ),
+    >,
     filter_noise_recorder_map: BTreeMap<u16, (u64, u64, Box<NoiseRecorder>, *const c_void)>,
     filter_transmitter_bandwidth_cache:
         HashMap<u64, (HashMap<u64, Vec<FilterRecord>>, HashSet<u64>)>,
@@ -151,6 +159,7 @@ impl SpectrumMonitor {
             d_receiver_sensitivity_milli_watt: 0.0,
             u16_sub_id: 0,
             foi: HashSet::new(),
+            owned_filter_criteria: BTreeMap::new(),
             filter_noise_recorder_map: BTreeMap::new(),
             filter_transmitter_bandwidth_cache: HashMap::new(),
             filter_transmitter_spectral_mask_cache: HashMap::new(),
@@ -289,9 +298,80 @@ impl SpectrumMonitor {
         }
         .max(self.d_receiver_sensitivity_milli_watt);
         Some(emane_plugin_api::FfiSpectrumResult {
+            receiver_sensitivity_dbm: self.get_receiver_sensitivity_dbm(),
             noise_floor_dbm: 10.0 * noise.log10(),
             signal_in_noise,
         })
+    }
+
+    pub fn add_owned_filter(&mut self, spec: emane_plugin_api::SpectrumFilterAdd) -> bool {
+        if self
+            .filter_noise_recorder_map
+            .contains_key(&spec.filter_index)
+            || spec.bandwidth_hz == 0
+        {
+            return false;
+        }
+        extern "C" fn matches(
+            ctx: *mut c_void,
+            frequency: u64,
+            bandwidth: u64,
+            subid: u16,
+            data: *const u8,
+            len: usize,
+        ) -> bool {
+            let criterion = unsafe { &*(ctx as *const emane_plugin_api::FilterCriterion) };
+            let data = if len == 0 {
+                &[]
+            } else if data.is_null() {
+                return false;
+            } else {
+                unsafe { std::slice::from_raw_parts(data, len) }
+            };
+            criterion.matches(frequency, bandwidth, subid, data)
+        }
+        let mut criterion = Box::new(spec.criterion);
+        let wrapper = Box::new(FfiFilterMatchCriterion {
+            context: (&mut *criterion as *mut emane_plugin_api::FilterCriterion).cast(),
+            matches,
+        });
+        self.initialize_filter(
+            spec.filter_index,
+            spec.frequency_hz,
+            spec.bandwidth_hz,
+            spec.sub_band_hz,
+            (&*wrapper as *const FfiFilterMatchCriterion).cast(),
+        );
+        self.owned_filter_criteria
+            .insert(spec.filter_index, (criterion, wrapper));
+        true
+    }
+
+    pub fn try_filter_window(
+        &self,
+        now: i64,
+        index: u16,
+        duration: i64,
+        start: i64,
+    ) -> Option<(Vec<f64>, i64, i64, f64, usize)> {
+        let duration = if duration > self.max_duration {
+            if self.b_max_clamp {
+                self.max_duration
+            } else {
+                return None;
+            }
+        } else {
+            duration
+        };
+        let (_, _, recorder, _) = self.filter_noise_recorder_map.get(&index)?;
+        let (bins, start) = recorder.try_get(now, duration, start)?;
+        Some((
+            bins,
+            start,
+            self.bin_size,
+            self.d_receiver_sensitivity_milli_watt,
+            recorder.get_sub_band_bin_count(),
+        ))
     }
 
     pub fn request_filter_i(
@@ -357,6 +437,7 @@ impl SpectrumMonitor {
     }
 
     pub fn remove_filter(&mut self, filter_index: u16) {
+        self.owned_filter_criteria.remove(&filter_index);
         if self
             .filter_noise_recorder_map
             .remove(&filter_index)

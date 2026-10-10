@@ -1,0 +1,1283 @@
+<!-- Parameter contracts from EMANE v1.5.3 manifests; keep runtime and manifest output in sync. -->
+<components baseline="3d9e8b48c6d01273f5d3cd4fd6d4d4464e9f40e3">
+  <component name="emanephy">
+    <parameter name="bandwidth" default="yes" required="no" modifiable="no">
+      <numeric minValue="1" maxValue="18446744073709551615" type="uint64">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="compatibilitymode" default="yes" required="no" modifiable="no">
+      <numeric minValue="1" maxValue="2" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="dopplershiftenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>true</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="excludesamesubidfromfilterenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>true</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fading.lognormal.dlthresh" default="yes" required="no" modifiable="yes">
+      <numeric minValue="-179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.250000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fading.lognormal.dmu" default="yes" required="no" modifiable="yes">
+      <numeric minValue="-179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>5.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fading.lognormal.dsigma" default="yes" required="no" modifiable="yes">
+      <numeric minValue="-179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fading.lognormal.duthresh" default="yes" required="no" modifiable="yes">
+      <numeric minValue="-179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.750000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fading.lognormal.lmean" default="yes" required="no" modifiable="yes">
+      <numeric minValue="0.000000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.005000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fading.lognormal.lstddev" default="yes" required="no" modifiable="yes">
+      <numeric minValue="0.000000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.001000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fading.lognormal.maxpathloss" default="yes" required="no" modifiable="yes">
+      <numeric minValue="-179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>100.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fading.lognormal.minpathloss" default="yes" required="no" modifiable="yes">
+      <numeric minValue="-179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fading.model" default="yes" required="no" modifiable="yes">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1">
+          <value>none</value>
+        </values>
+        <regex>^(none|event|lognormal|nakagami)$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="fading.nakagami.distance0" default="yes" required="no" modifiable="yes">
+      <numeric minValue="-179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>100.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fading.nakagami.distance1" default="yes" required="no" modifiable="yes">
+      <numeric minValue="-179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>250.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fading.nakagami.m0" default="yes" required="no" modifiable="yes">
+      <numeric minValue="0.500000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.750000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fading.nakagami.m1" default="yes" required="no" modifiable="yes">
+      <numeric minValue="0.500000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fading.nakagami.m2" default="yes" required="no" modifiable="yes">
+      <numeric minValue="0.500000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>200.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fixedantennagain" default="yes" required="no" modifiable="yes">
+      <numeric minValue="-179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fixedantennagainenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>true</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="frequency" default="yes" required="no" modifiable="no">
+      <numeric minValue="1" maxValue="18446744073709551615" type="uint64">
+        <values minOccurs="1" maxOccurs="1">
+          <value>2347000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="frequencyofinterest" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="18446744073709551615" type="uint64">
+        <values minOccurs="1" maxOccurs="18446744073709551615">
+          <value>2347000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="noisebinsize" default="yes" required="no" modifiable="no">
+      <numeric minValue="1" maxValue="18446744073709551615" type="uint64">
+        <values minOccurs="1" maxOccurs="1">
+          <value>20</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="noisemaxclampenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="noisemaxmessagepropagation" default="yes" required="no" modifiable="no">
+      <numeric minValue="1" maxValue="18446744073709551615" type="uint64">
+        <values minOccurs="1" maxOccurs="1">
+          <value>200000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="noisemaxsegmentduration" default="yes" required="no" modifiable="no">
+      <numeric minValue="1" maxValue="18446744073709551615" type="uint64">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="noisemaxsegmentoffset" default="yes" required="no" modifiable="no">
+      <numeric minValue="1" maxValue="18446744073709551615" type="uint64">
+        <values minOccurs="1" maxOccurs="1">
+          <value>300000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="noisemode" default="yes" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1">
+          <value>all</value>
+        </values>
+        <regex>^(none|all|outofband|passthrough)$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="processingpoolsize" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0</value>
+        </values>
+        <regex>^(0|[2-9]|[1-9]\d+)$</regex>
+      </numeric>
+    </parameter>
+    <parameter name="propagationmodel" default="yes" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1">
+          <value>precomputed</value>
+        </values>
+        <regex>^(precomputed|2ray|freespace)$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="radiosilenceenable" default="yes" required="no" modifiable="yes">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="rxsensitivitypromiscuousmodeenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="spectralmaskindex" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="stats.observedpowertableenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>true</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="stats.receivepowertableenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>true</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="subid" default="no" required="yes" modifiable="no">
+      <numeric minValue="1" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1" />
+      </numeric>
+    </parameter>
+    <parameter name="systemnoisefigure" default="yes" required="no" modifiable="no">
+      <numeric minValue="-179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>4.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="timesyncthreshold" default="yes" required="no" modifiable="no">
+      <numeric minValue="1" maxValue="18446744073709551615" type="uint64">
+        <values minOccurs="1" maxOccurs="1">
+          <value>10000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="txpower" default="yes" required="no" modifiable="yes">
+      <numeric minValue="-179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+  </component>
+  <component name="rfpipe">
+    <parameter name="datarate" default="yes" required="no" modifiable="yes">
+      <numeric minValue="1" maxValue="18446744073709551615" type="uint64">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="delay" default="yes" required="no" modifiable="yes">
+      <numeric minValue="0.000000" maxValue="340282346638528859811704183484516925440.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="enablepromiscuousmode" default="yes" required="no" modifiable="yes">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="flowcontrolenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="flowcontroltokens" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>10</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="jitter" default="yes" required="no" modifiable="yes">
+      <numeric minValue="0.000000" maxValue="340282346638528859811704183484516925440.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="neighbormetricdeletetime" default="yes" required="no" modifiable="yes">
+      <numeric minValue="1.000000" maxValue="3660.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>60.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="pcrcurveuri" default="no" required="yes" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="radiometricenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="radiometricreportinterval" default="yes" required="no" modifiable="no">
+      <numeric minValue="0.100000" maxValue="60.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="rfsignaltable.averageallantennas" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="rfsignaltable.averageallfrequencies" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+  </component>
+  <component name="ieee80211abg">
+    <parameter name="aifs0" default="yes" required="no" modifiable="no">
+      <numeric minValue="0.000000" maxValue="0.000255" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.000002</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="aifs1" default="yes" required="no" modifiable="no">
+      <numeric minValue="0.000000" maxValue="0.000255" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.000002</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="aifs2" default="yes" required="no" modifiable="no">
+      <numeric minValue="0.000000" maxValue="0.000255" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.000002</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="aifs3" default="yes" required="no" modifiable="no">
+      <numeric minValue="0.000000" maxValue="0.000255" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.000001</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="channelactivityestimationtimer" default="yes" required="no" modifiable="no">
+      <numeric minValue="0.001000" maxValue="1.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.100000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="cwmax0" default="yes" required="no" modifiable="yes">
+      <numeric minValue="1" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1024</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="cwmax1" default="yes" required="no" modifiable="yes">
+      <numeric minValue="1" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1024</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="cwmax2" default="yes" required="no" modifiable="yes">
+      <numeric minValue="1" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>64</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="cwmax3" default="yes" required="no" modifiable="yes">
+      <numeric minValue="1" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>16</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="cwmin0" default="yes" required="no" modifiable="yes">
+      <numeric minValue="1" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>32</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="cwmin1" default="yes" required="no" modifiable="yes">
+      <numeric minValue="1" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>32</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="cwmin2" default="yes" required="no" modifiable="yes">
+      <numeric minValue="1" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>16</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="cwmin3" default="yes" required="no" modifiable="yes">
+      <numeric minValue="1" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>8</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="distance" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="4294967295" type="uint32">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="enablepromiscuousmode" default="yes" required="no" modifiable="yes">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="flowcontrolenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="flowcontroltokens" default="yes" required="no" modifiable="no">
+      <numeric minValue="1" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>10</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="mode" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="3" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="msdu0" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>65535</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="msdu1" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>65535</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="msdu2" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>65535</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="msdu3" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>65535</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="multicastrate" default="yes" required="no" modifiable="yes">
+      <numeric minValue="1" maxValue="12" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="neighbormetricdeletetime" default="yes" required="no" modifiable="no">
+      <numeric minValue="1.000000" maxValue="3660.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>60.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="neighbortimeout" default="yes" required="no" modifiable="no">
+      <numeric minValue="0.000000" maxValue="3600.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>30.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="pcrcurveuri" default="no" required="yes" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="queuesize0" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="255" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>255</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="queuesize1" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="255" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>255</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="queuesize2" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="255" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>255</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="queuesize3" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="255" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>255</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="radiometricenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="radiometricreportinterval" default="yes" required="no" modifiable="no">
+      <numeric minValue="0.100000" maxValue="60.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="retrylimit0" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="255" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>2</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="retrylimit1" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="255" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>2</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="retrylimit2" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="255" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>2</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="retrylimit3" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="255" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>2</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="rtsthreshold" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>255</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="txop0" default="yes" required="no" modifiable="no">
+      <numeric minValue="0.000000" maxValue="1.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="txop1" default="yes" required="no" modifiable="no">
+      <numeric minValue="0.000000" maxValue="1.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="txop2" default="yes" required="no" modifiable="no">
+      <numeric minValue="0.000000" maxValue="1.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="txop3" default="yes" required="no" modifiable="no">
+      <numeric minValue="0.000000" maxValue="1.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="unicastrate" default="yes" required="no" modifiable="yes">
+      <numeric minValue="1" maxValue="12" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>4</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="wmmenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+  </component>
+  <component name="tdma">
+    <parameter name="enablepromiscuousmode" default="yes" required="no" modifiable="yes">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="flowcontrolenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="flowcontroltokens" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>10</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fragmentcheckthreshold" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>2</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="fragmenttimeoutthreshold" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>5</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="neighbormetricdeletetime" default="yes" required="no" modifiable="yes">
+      <numeric minValue="1.000000" maxValue="3660.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>60.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="neighbormetricupdateinterval" default="yes" required="no" modifiable="no">
+      <numeric minValue="0.100000" maxValue="60.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="pcrcurveuri" default="no" required="yes" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="queue.aggregationenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>true</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="queue.aggregationslotthreshold" default="yes" required="no" modifiable="no">
+      <numeric minValue="0.000000" maxValue="100.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>90.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="queue.depth" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>256</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="queue.fragmentationenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>true</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="queue.strictdequeueenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+  </component>
+  <component name="bentpipe">
+    <parameter name="antenna.defines" default="no" required="yes" modifiable="yes">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:(omni;(-){0,1}\d+(\.\d+){0,1}|\d+;(-){0,1}\d+(\.\d+){0,1};(-){0,1}\d+(\.\d+){0,1});\d+$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="pcrcurveuri" default="no" required="yes" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="queue.aggregationenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>true</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="queue.depth" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>256</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="queue.fragmentationenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>true</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="reassembly.fragmentcheckthreshold" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>2</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="reassembly.fragmenttimeoutthreshold" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>5</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="transponder.receive.action" default="no" required="yes" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:(process|ubend)$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.receive.antenna" default="no" required="yes" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:\d+$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.receive.bandwidth" default="no" required="yes" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:\d+(\.\d+){0,1}(G|M|K){0,1}$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.receive.enable" default="no" required="yes" modifiable="yes">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:(on|off|yes|no)$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.receive.frequency" default="no" required="yes" modifiable="yes">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:\d+(\.\d+){0,1}(G|M|K){0,1}$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.transmit.antenna" default="no" required="yes" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:\d+$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.transmit.bandwidth" default="no" required="yes" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:\d+(\.\d+){0,1}(G|M|K){0,1}$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.transmit.datarate" default="no" required="yes" modifiable="yes">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:\d+(\.\d+){0,1}(G|M|K){0,1}$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.transmit.enable" default="no" required="yes" modifiable="yes">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:(on|off|yes|no)$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.transmit.frequency" default="no" required="yes" modifiable="yes">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:\d+(\.\d+){0,1}(G|M|K){0,1}$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.transmit.mtu" default="no" required="yes" modifiable="yes">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="18446744073709551615" />
+        <regex>^\d+:(na|\d+)$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.transmit.pcrcurveindex" default="no" required="yes" modifiable="yes">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:\d+$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.transmit.power" default="no" required="yes" modifiable="yes">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:\d+(\.\d+){0,1}(G|M|K){0,1}$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.transmit.slotperframe" default="no" required="yes" modifiable="yes">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:(na|\d+)$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.transmit.slotsize" default="no" required="yes" modifiable="yes">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:(na|\d+)$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.transmit.tosmap" default="no" required="yes" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:(na|((\d+|\d+-\d+)(;){0,1}){1,})</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.transmit.txslots" default="no" required="yes" modifiable="yes">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:(na|(\d+|\d+-\d+)(;(\d+|\d+-\d+)){0,})$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="transponder.transmit.ubend.delay" default="no" required="yes" modifiable="yes">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="65535" />
+        <regex>^\d+:(na|\d+)$</regex>
+      </nonnumeric>
+    </parameter>
+  </component>
+  <component name="timinganalysisshim">
+    <parameter name="maxqueuesize" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="4294967295" type="uint32">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0</value>
+        </values>
+      </numeric>
+    </parameter>
+  </component>
+  <component name="virtualtransport">
+    <parameter name="address" default="no" required="no" modifiable="no">
+      <nonnumeric type="inetaddr">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="arpcacheenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>true</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="arpmodeenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>true</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="bitrate" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="18446744073709551615" type="uint64">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="broadcastmodeenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="device" default="yes" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1">
+          <value>emane0</value>
+        </values>
+      </nonnumeric>
+    </parameter>
+    <parameter name="devicepath" default="yes" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1">
+          <value>/dev/net/tun</value>
+        </values>
+      </nonnumeric>
+    </parameter>
+    <parameter name="ethernet.type.arp.priority" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="255" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="ethernet.type.unknown.priority" default="no" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="0" maxOccurs="65535" />
+        <regex>^(0[xX]){0,1}\d+:\d+$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="flowcontrolenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="mask" default="no" required="no" modifiable="no">
+      <nonnumeric type="inetaddr">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+  </component>
+  <component name="rawtransport">
+    <parameter name="arpcacheenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>true</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="bitrate" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="18446744073709551615" type="uint64">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="broadcastmodeenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="device" default="no" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="ethernet.type.arp.priority" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="255" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="ethernet.type.unknown.priority" default="no" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="0" maxOccurs="65535" />
+        <regex>^(0[xX]){0,1}\d+:\d+$</regex>
+      </nonnumeric>
+    </parameter>
+  </component>
+  <component name="phyapitestshim">
+    <parameter name="antennaazimuth" default="no" required="no" modifiable="no">
+      <numeric minValue="0.000000" maxValue="360.000000" type="double">
+        <values minOccurs="1" maxOccurs="1" />
+      </numeric>
+    </parameter>
+    <parameter name="antennaelevation" default="no" required="no" modifiable="no">
+      <numeric minValue="-90.000000" maxValue="90.000000" type="double">
+        <values minOccurs="1" maxOccurs="1" />
+      </numeric>
+    </parameter>
+    <parameter name="antennaprofileid" default="no" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1" />
+      </numeric>
+    </parameter>
+    <parameter name="bandwidth" default="no" required="yes" modifiable="no">
+      <numeric minValue="1" maxValue="18446744073709551615" type="uint64">
+        <values minOccurs="1" maxOccurs="1" />
+      </numeric>
+    </parameter>
+    <parameter name="destination" default="yes" required="no" modifiable="no">
+      <numeric minValue="1" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>65535</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="frequency" default="no" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="0" maxOccurs="255" />
+        <regex>^\d+(\.\d+)?[GMK]?:\d+(\.\d+)?:\d+(\.\d+)?$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="packetrate" default="yes" required="no" modifiable="no">
+      <numeric minValue="-340282346638528859811704183484516925440.000000" maxValue="340282346638528859811704183484516925440.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="packetsize" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>128</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="transmitter" default="no" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="0" maxOccurs="255" />
+        <regex>^\d+:\d+(\.\d+)?$</regex>
+      </nonnumeric>
+    </parameter>
+    <parameter name="txpower" default="yes" required="no" modifiable="no">
+      <numeric minValue="-340282346638528859811704183484516925440.000000" maxValue="340282346638528859811704183484516925440.000000" type="float">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+  </component>
+  <component name="commeffectshim">
+    <parameter name="defaultconnectivitymode" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>true</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="enablepromiscuousmode" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="filterfile" default="no" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="groupid" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="4294967295" type="uint32">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="receivebufferperiod" default="yes" required="no" modifiable="no">
+      <numeric minValue="-179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" maxValue="179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000" type="double">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1.000000</value>
+        </values>
+      </numeric>
+    </parameter>
+  </component>
+  <component name="bypass_mac" />
+  <component name="bypass_phy" />
+  <component name="nemmanager">
+    <parameter name="antennaprofilemanifesturi" default="no" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="controlportendpoint" default="no" required="yes" modifiable="no">
+      <nonnumeric type="inetaddr">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0.0.0.0:47000</value>
+        </values>
+      </nonnumeric>
+    </parameter>
+    <parameter name="eventservicedevice" default="no" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="eventservicegroup" default="no" required="yes" modifiable="no">
+      <nonnumeric type="inetaddr">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="eventservicettl" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="255" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="otamanagerchannelenable" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>true</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="otamanagerdevice" default="no" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="otamanagergroup" default="no" required="no" modifiable="no">
+      <nonnumeric type="inetaddr">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="otamanagerloopback" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="otamanagermtu" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="4294967295" type="uint32">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="otamanagerpartcheckthreshold" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>2</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="otamanagerparttimeoutthreshold" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="65535" type="uint16">
+        <values minOccurs="1" maxOccurs="1">
+          <value>5</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="otamanagerttl" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="255" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="spectralmaskmanifesturi" default="no" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="stats.event.maxeventcountrows" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="4294967295" type="uint32">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="stats.ota.maxeventcountrows" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="4294967295" type="uint32">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0</value>
+        </values>
+      </numeric>
+    </parameter>
+    <parameter name="stats.ota.maxpacketcountrows" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="4294967295" type="uint32">
+        <values minOccurs="1" maxOccurs="1">
+          <value>0</value>
+        </values>
+      </numeric>
+    </parameter>
+  </component>
+  <component name="transportmanager" />
+  <component name="eventagentmanager">
+    <parameter name="eventservicedevice" default="no" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="eventservicegroup" default="no" required="yes" modifiable="no">
+      <nonnumeric type="inetaddr">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="eventservicettl" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="255" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1</value>
+        </values>
+      </numeric>
+    </parameter>
+  </component>
+  <component name="eventgeneratormanager">
+    <parameter name="eventservicedevice" default="no" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="eventservicegroup" default="no" required="yes" modifiable="no">
+      <nonnumeric type="inetaddr">
+        <values minOccurs="1" maxOccurs="1" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="eventservicettl" default="yes" required="no" modifiable="no">
+      <numeric minValue="0" maxValue="255" type="uint8">
+        <values minOccurs="1" maxOccurs="1">
+          <value>1</value>
+        </values>
+      </numeric>
+    </parameter>
+  </component>
+</components>

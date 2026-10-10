@@ -1,10 +1,12 @@
+use emane_plugin_api::random::LegacyRandom;
 mod pcr;
 
 use emane_plugin_api::{
     CommonLayerCounters, FfiConfigRequest, FfiControlMessage, FfiFrameworkService, FfiPacket,
-    FfiPacketInfo, FfiSlice, FlowControlToken, ModelHeader, PluginApi, RxProperties, TxProperties,
-    CONTROL_FLOW_CONTROL_TOKEN, CONTROL_MODEL_HEADER, CONTROL_RX_PROPERTIES, CONTROL_TX_PROPERTIES,
-    MAC_REGISTRATION_RFPIPE, PLUGIN_ABI_VERSION,
+    FfiPacketInfo, FfiSlice, FfiSpectrumQuery, FlowControlToken, ModelHeader, PluginApi,
+    RxFrequencySegments, RxProperties, TxProperties, CONTROL_FLOW_CONTROL_TOKEN,
+    CONTROL_MODEL_HEADER, CONTROL_RX_FREQUENCY_SEGMENTS, CONTROL_RX_PROPERTIES,
+    CONTROL_TX_PROPERTIES, MAC_REGISTRATION_RFPIPE, PLUGIN_ABI_VERSION,
 };
 use pcr::PcrCurve;
 use prost::Message;
@@ -44,6 +46,14 @@ struct PendingTx {
     data_rate: u64,
 }
 
+struct PendingReception {
+    packet: OwnedPacket,
+    received_at: i64,
+    query: FfiSpectrumQuery,
+    sequence: u64,
+    data_rate: u64,
+}
+
 struct State {
     promiscuous_mode: bool,
     data_rate_bps: u64,
@@ -58,7 +68,7 @@ struct State {
     queue: VecDeque<PendingTx>,
     current_end_of_transmission: i64,
     next_transmit_wakeup: i64,
-    pending_receptions: HashMap<u64, (OwnedPacket, i64)>,
+    pending_receptions: HashMap<u64, PendingReception>,
     next_reception_id: u64,
     radiometric_enabled: bool,
     radiometric_report_interval_microseconds: u64,
@@ -68,7 +78,8 @@ struct State {
     rf_signal_average_all_frequencies: bool,
     queue_discards: u32,
     timers: HashSet<u64>,
-    random_state: u64,
+    random_state: LegacyRandom,
+    jitter_random: LegacyRandom,
     started: bool,
 }
 
@@ -96,7 +107,7 @@ impl RfpipeMac {
             c"Average downstream queue delay in microseconds".as_ptr(),
             true,
         );
-        let queue_high_water_counter = (framework.register_counter)(
+        let queue_high_water_counter = (framework.register_counter32)(
             framework.framework_ctx,
             c"numHighWaterMark".as_ptr(),
             c"Downstream queue high water mark in packets".as_ptr(),
@@ -149,7 +160,8 @@ impl RfpipeMac {
                 rf_signal_average_all_frequencies: false,
                 queue_discards: 0,
                 timers: HashSet::new(),
-                random_state: 0x9E37_79B9_7F4A_7C15 ^ u64::from(id),
+                random_state: LegacyRandom::from_clock(),
+                jitter_random: LegacyRandom::from_clock(),
                 started: false,
             }),
         }
@@ -314,17 +326,13 @@ fn duration_microseconds(length: usize, data_rate: u64) -> u64 {
         (length as u64)
             .saturating_mul(8)
             .saturating_mul(1_000_000)
-            .div_ceil(data_rate)
+            .checked_div(data_rate)
+            .unwrap_or(0)
     }
 }
 
 fn random_unit(state: &mut State) -> f64 {
-    let mut value = state.random_state;
-    value ^= value << 13;
-    value ^= value >> 7;
-    value ^= value << 17;
-    state.random_state = value;
-    (value >> 11) as f64 / ((1u64 << 53) as f64)
+    f64::from(state.random_state.unit())
 }
 
 fn schedule(mac: &RfpipeMac, when: i64, event_id: u32, data: &[u8]) -> u64 {
@@ -475,6 +483,14 @@ fn drive_transmit(mac: &RfpipeMac, now: i64) {
         let transmission = if can_send {
             let pending = state.queue.pop_front().unwrap();
             let queue_delay = now.saturating_sub(pending.acquired_at).max(0) as u64;
+            (mac.framework.update_queue_metric)(
+                mac.framework.framework_ctx,
+                0,
+                QUEUE_CAPACITY as u32,
+                state.queue.len().min(u32::MAX as usize) as u32,
+                std::mem::take(&mut state.queue_discards),
+                queue_delay,
+            );
             (mac.framework.increment_counter)(
                 mac.framework.framework_ctx,
                 mac.queue_delay_counter,
@@ -527,6 +543,81 @@ fn drive_transmit(mac: &RfpipeMac, now: i64) {
     }
     if let Some(when) = next_wakeup {
         schedule_transmit(mac, when);
+    }
+}
+
+fn complete_receive(mac: &RfpipeMac, pending: PendingReception) {
+    let PendingReception {
+        packet,
+        received_at,
+        query,
+        sequence,
+        data_rate,
+    } = pending;
+    let Some(spectrum) = mac.framework.reception_noise(&query) else {
+        mac.counters.upstream_drop_packet(
+            mac.framework,
+            packet.info.source,
+            packet.info.destination,
+            6,
+        );
+        return;
+    };
+    let sinr = query.rx_power_dbm - spectrum.noise_floor_dbm;
+    let (accepted, destination, table) = {
+        let mut state = mac.state.lock().unwrap();
+        let probability = state
+            .pcr_curve
+            .as_ref()
+            .map_or(1.0, |curve| curve.probability(sinr, packet.payload.len()));
+        (
+            probability >= random_unit(&mut state),
+            state.promiscuous_mode
+                || packet.info.destination == mac.id
+                || packet.info.destination == BROADCAST_NEM,
+            state.rf_signal_table_handle,
+        )
+    };
+    if !accepted {
+        mac.counters.upstream_drop_packet(
+            mac.framework,
+            packet.info.source,
+            packet.info.destination,
+            1,
+        );
+        return;
+    }
+    (mac.framework.update_neighbor_rx)(
+        mac.framework.framework_ctx,
+        packet.info.source,
+        sequence,
+        packet.info.uuid.as_ptr(),
+        sinr,
+        spectrum.noise_floor_dbm,
+        query.start_time_microseconds.max(0) as u64,
+        query.duration_microseconds,
+        data_rate,
+    );
+    (mac.framework.update_rf_signal_table)(
+        mac.framework.framework_ctx,
+        table,
+        packet.info.source,
+        0,
+        query.frequency_hz,
+        query.rx_power_dbm,
+        sinr,
+        spectrum.noise_floor_dbm,
+        spectrum.receiver_sensitivity_dbm,
+    );
+    if destination {
+        send_upstream(mac, packet, received_at);
+    } else {
+        mac.counters.upstream_drop_packet(
+            mac.framework,
+            packet.info.source,
+            packet.info.destination,
+            3,
+        );
     }
 }
 
@@ -799,75 +890,74 @@ extern "C" fn process_upstream(
         return;
     }
     packet.payload.drain(..serialization_len + 2);
-    (mac.framework.update_neighbor_rx)(
-        mac.framework.framework_ctx,
-        packet.info.source,
-        header.sequence,
-        rx.rx_power_dbm - rx.noise_floor_dbm,
-        rx.noise_floor_dbm,
-        now_microseconds().max(0) as u64,
-        rx.duration_microseconds,
-        wire_header.data_rate_bps,
-    );
-    let receiver_sensitivity_dbm = -174.0 + 10.0 * (rx.bandwidth_hz.max(1) as f64).log10() + 4.0;
-    let table_handle = mac.state.lock().unwrap().rf_signal_table_handle;
-    (mac.framework.update_rf_signal_table)(
-        mac.framework.framework_ctx,
-        table_handle,
-        packet.info.source,
-        0,
-        rx.frequency_hz,
-        rx.rx_power_dbm,
-        rx.rx_power_dbm - rx.noise_floor_dbm,
-        rx.noise_floor_dbm,
-        receiver_sensitivity_dbm,
-    );
-    let (por_accepted, destination_accepted) = {
-        let mut state = mac.state.lock().unwrap();
-        let sinr = rx.rx_power_dbm - rx.noise_floor_dbm;
-        let probability = state
-            .pcr_curve
-            .as_ref()
-            .map_or(1.0, |curve| curve.probability(sinr, packet.payload.len()));
+    let first_segment = message_views
+        .iter()
+        .find(|m| m.msg_type == CONTROL_RX_FREQUENCY_SEGMENTS)
+        .and_then(|m| {
+            if m.payload.data.is_null() {
+                None
+            } else {
+                RxFrequencySegments::decode(unsafe {
+                    std::slice::from_raw_parts(m.payload.data, m.payload.len)
+                })
+            }
+        })
+        .and_then(|segments| segments.segments.first().copied());
+    let (frequency_hz, rx_power_dbm, offset, duration) = first_segment.map_or(
         (
-            probability >= random_unit(&mut state),
-            state.promiscuous_mode
-                || packet.info.destination == mac.id
-                || packet.info.destination == BROADCAST_NEM,
-        )
+            rx.frequency_hz,
+            rx.rx_power_dbm,
+            0,
+            rx.duration_microseconds,
+        ),
+        |s| {
+            (
+                s.frequency_hz,
+                s.rx_power_dbm,
+                s.offset_microseconds,
+                s.duration_microseconds,
+            )
+        },
+    );
+    let query = FfiSpectrumQuery {
+        frequency_hz,
+        rx_power_dbm,
+        antenna_index: 0,
+        start_time_microseconds: rx
+            .tx_time_microseconds
+            .saturating_add(i64::try_from(rx.propagation_microseconds).unwrap_or(i64::MAX))
+            .saturating_add(i64::try_from(offset).unwrap_or(i64::MAX)),
+        duration_microseconds: duration,
     };
-    if !por_accepted || !destination_accepted {
-        mac.counters.upstream_drop_packet(
-            mac.framework,
-            packet.info.source,
-            packet.info.destination,
-            if por_accepted { 3 } else { 1 },
-        );
+    let end = query
+        .start_time_microseconds
+        .saturating_add(i64::try_from(duration).unwrap_or(i64::MAX));
+    let pending = PendingReception {
+        packet,
+        received_at,
+        query,
+        sequence: header.sequence,
+        data_rate: wire_header.data_rate_bps,
+    };
+    if end <= now_microseconds() {
+        complete_receive(mac, pending);
         return;
     }
     let (reception_id, when) = {
         let mut state = mac.state.lock().unwrap();
         state.next_reception_id = state.next_reception_id.wrapping_add(1).max(1);
         let reception_id = state.next_reception_id;
-        state
-            .pending_receptions
-            .insert(reception_id, (packet, received_at));
-        (
-            reception_id,
-            now_microseconds().saturating_add(rx.duration_microseconds as i64),
-        )
+        state.pending_receptions.insert(reception_id, pending);
+        (reception_id, end)
     };
     let timer = schedule(mac, when, EVENT_RECEIVE, &reception_id.to_be_bytes());
     if timer == 0 {
-        if let Some((packet, received_at)) = mac
-            .state
+        // Do not deliver early when scheduling fails.
+        mac.state
             .lock()
             .unwrap()
             .pending_receptions
-            .remove(&reception_id)
-        {
-            send_upstream(mac, packet, received_at);
-        }
+            .remove(&reception_id);
     } else {
         mac.state.lock().unwrap().timers.insert(timer);
     }
@@ -901,7 +991,7 @@ extern "C" fn process_downstream(
         packet.payload.len(),
     );
     let now = now_microseconds();
-    let (ready_at, queue_depth, queue_discards) = {
+    let ready_at = {
         let mut state = mac.state.lock().unwrap();
         if !state.started || (state.flow_control_enable && state.available_tokens == 0) {
             mac.counters.downstream_drop_packet(
@@ -920,7 +1010,8 @@ extern "C" fn process_downstream(
         let jitter = if state.jitter_microseconds == 0 {
             0
         } else {
-            ((random_unit(&mut state) - 0.5) * state.jitter_microseconds as f64).round() as i64
+            ((f64::from(state.jitter_random.unit()) - 0.5) * state.jitter_microseconds as f64)
+                .trunc() as i64
         };
         let ready_at = now
             .saturating_add(state.delay_microseconds)
@@ -955,20 +1046,8 @@ extern "C" fn process_downstream(
             mac.queue_high_water_counter,
             state.queue.len() as u64,
         );
-        (
-            ready_at.max(state.current_end_of_transmission).max(now),
-            state.queue.len(),
-            state.queue_discards,
-        )
+        ready_at.max(state.current_end_of_transmission).max(now)
     };
-    (mac.framework.update_queue_metric)(
-        mac.framework.framework_ctx,
-        0,
-        QUEUE_CAPACITY as u32,
-        u32::try_from(queue_depth).unwrap_or(u32::MAX),
-        queue_discards,
-        0,
-    );
     if ready_at <= now {
         drive_transmit(mac, now);
     } else {
@@ -1009,8 +1088,8 @@ extern "C" fn process_timed_event(
         }
         EVENT_RECEIVE => {
             let packet = mac.state.lock().unwrap().pending_receptions.remove(&value);
-            if let Some((packet, received_at)) = packet {
-                send_upstream(mac, packet, received_at);
+            if let Some(pending) = packet {
+                complete_receive(mac, pending);
             }
         }
         EVENT_R2RI_REPORT => {
@@ -1075,3 +1154,6 @@ mod tests {
         assert_eq!(duration_microseconds(125, 1_000_000), 1_000);
     }
 }
+
+#[cfg(test)]
+mod regression_tests;

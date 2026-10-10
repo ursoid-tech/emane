@@ -98,11 +98,19 @@ impl SpectralMaskManager {
 
     pub fn load(&mut self, uri: &str) -> Result<(), String> {
         let path = file_uri_path(uri)?;
-        let content = std::fs::read_to_string(&path)
+        let content = emane_plugin_api::xml_document::read(&path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        let doc = Document::parse(&content).map_err(|e| format!("Failed to parse XML: {}", e))?;
+        let doc = Document::parse_with_options(
+            &content,
+            roxmltree::ParsingOptions {
+                allow_dtd: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| format!("Failed to parse XML: {}", e))?;
 
         let root = doc.root_element();
+        emane_plugin_api::xml_schema::validate(root, emane_plugin_api::xml_schema::SPECTRAL_MASK)?;
         if root.tag_name().name() != "spectral-mask-manifest" {
             return Err("Invalid document root".to_string());
         }

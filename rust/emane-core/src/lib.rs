@@ -17,6 +17,7 @@ pub mod event_service;
 pub mod events;
 pub mod file_descriptor_service;
 pub mod flow_control_manager;
+mod legacy_controls;
 pub mod native_configuration;
 pub mod neighbor_metric_manager;
 pub mod nem_manager;
@@ -87,9 +88,7 @@ pub extern "C" fn emane_rs_freespace_pathloss_single(d_distance: f64, freq_hz: f
 }
 
 /// Stateful Lognormal Fading Algorithm
-use rand::rngs::StdRng;
-use rand::SeedableRng;
-use rand_distr::{Distribution, LogNormal, Normal};
+use emane_plugin_api::random::{LegacyNormal, LegacyRandom};
 
 #[repr(C)]
 pub struct LognormalFadingParameters {
@@ -109,7 +108,9 @@ pub struct LognormalFadingState {
     reset: bool,
     depth_dbm: f64,
     nexttime_microsec: u64,
-    rng: StdRng,
+    rng: LegacyRandom,
+    length_distribution: LegacyNormal,
+    depth_distribution: LegacyNormal,
 }
 
 impl Default for LognormalFadingState {
@@ -125,7 +126,9 @@ impl LognormalFadingState {
             reset: true,
             depth_dbm: 0.0,
             nexttime_microsec: 0,
-            rng: StdRng::seed_from_u64(5489),
+            rng: LegacyRandom::seeded(5489),
+            length_distribution: LegacyNormal::default(),
+            depth_distribution: LegacyNormal::default(),
         }
     }
 
@@ -155,26 +158,18 @@ impl LognormalFadingState {
         }
 
         if self.reset || now_microsec >= self.nexttime_microsec {
-            let length_seconds = if params.lstddev == 0.0 {
-                params.lmean
-            } else {
-                Normal::new(params.lmean, params.lstddev)
-                    .ok()?
-                    .sample(&mut self.rng)
-                    .max(0.0)
-            };
-            let length_microseconds = (length_seconds * 1_000_000.0)
-                .round()
-                .clamp(0.0, u64::MAX as f64) as u64;
-            self.nexttime_microsec = now_microsec.saturating_add(length_microseconds);
-
-            let depth_norm = if params.dsigma == 0.0 {
-                params.dmu.exp()
-            } else {
-                LogNormal::new(params.dmu, params.dsigma)
-                    .ok()?
-                    .sample(&mut self.rng)
-            };
+            // Even a zero standard deviation consumes a draw and retains the
+            // distribution's spare, just as the original std distributions do.
+            let length_seconds =
+                self.length_distribution
+                    .sample(&mut self.rng, params.lmean, params.lstddev);
+            let length_microseconds = (length_seconds * 1_000.0).trunc() as i64;
+            self.nexttime_microsec =
+                now_microsec.saturating_add_signed(length_microseconds.saturating_mul(1_000));
+            let depth_norm = self
+                .depth_distribution
+                .sample(&mut self.rng, params.dmu, params.dsigma)
+                .exp();
 
             self.depth_dbm = if depth_norm <= params.dlthresh {
                 params.maxpathloss
@@ -264,3 +259,9 @@ pub mod raw_transport;
 pub mod types;
 pub mod r#virtual;
 pub mod xml_parser;
+
+mod configuration_schema;
+
+pub mod xml_contract;
+
+mod processing_pool;

@@ -166,11 +166,20 @@ fn load_definition(
     path: &Path,
     expected_root: &str,
 ) -> Result<(String, HashMap<String, Vec<String>>), String> {
-    let content = fs::read_to_string(path)
+    let content = emane_plugin_api::xml_document::read(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    let document = Document::parse(&content)
-        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+    let document = Document::parse_with_options(
+        &content,
+        roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
     let root = document.root_element();
+    if !emane_plugin_api::xml_document::has_doctype(&content) {
+        emane_core::xml_contract::validate(root, false)?;
+    }
     if root.tag_name().name() != expected_root {
         return Err(format!("{} root must be {expected_root}", path.display()));
     }
@@ -432,11 +441,20 @@ pub fn run_event_application(expected_root: &str, component_tag: &str) -> Result
 
     let config = config.ok_or_else(|| "missing CONFIG_URL".to_string())?;
     let path = Path::new(&config);
-    let content =
-        fs::read_to_string(path).map_err(|error| format!("failed to read {config}: {error}"))?;
-    let document =
-        Document::parse(&content).map_err(|error| format!("failed to parse {config}: {error}"))?;
+    let content = emane_plugin_api::xml_document::read(path)
+        .map_err(|error| format!("failed to read {config}: {error}"))?;
+    let document = Document::parse_with_options(
+        &content,
+        roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|error| format!("failed to parse {config}: {error}"))?;
     let root = document.root_element();
+    if !emane_plugin_api::xml_document::has_doctype(&content) {
+        emane_core::xml_contract::validate(root, false)?;
+    }
     if root.tag_name().name() != expected_root {
         return Err(format!("configuration root must be {expected_root}"));
     }
@@ -447,12 +465,18 @@ pub fn run_event_application(expected_root: &str, component_tag: &str) -> Result
     {
         if let Some(definition) = component.attribute("definition") {
             let definition_path = path.parent().unwrap_or(Path::new("")).join(definition);
-            let definition_content = fs::read_to_string(&definition_path).map_err(|error| {
-                format!("failed to read {}: {error}", definition_path.display())
-            })?;
-            Document::parse(&definition_content).map_err(|error| {
-                format!("failed to parse {}: {error}", definition_path.display())
-            })?;
+            let definition_content = emane_plugin_api::xml_document::read(&definition_path)
+                .map_err(|error| {
+                    format!("failed to read {}: {error}", definition_path.display())
+                })?;
+            Document::parse_with_options(
+                &definition_content,
+                roxmltree::ParsingOptions {
+                    allow_dtd: true,
+                    ..Default::default()
+                },
+            )
+            .map_err(|error| format!("failed to parse {}: {error}", definition_path.display()))?;
         }
         component_count += 1;
     }

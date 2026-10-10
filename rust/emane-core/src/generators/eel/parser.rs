@@ -1,3 +1,4 @@
+use emane_plugin_api::numeric::LegacyParse;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::slice;
@@ -87,7 +88,7 @@ impl EelInputParser {
         }
 
         let f_event_time = args[0]
-            .parse::<f32>()
+            .parse_legacy::<f32>()
             .map_err(|error| format!("Invalid event time {}: {error}", args[0]))?;
         let s_module_id = args[1].clone();
         let s_event_type = args[2].clone();

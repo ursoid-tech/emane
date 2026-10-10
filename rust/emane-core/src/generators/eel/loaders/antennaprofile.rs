@@ -1,3 +1,4 @@
+use emane_plugin_api::numeric::LegacyParse;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
@@ -39,13 +40,13 @@ impl AntennaProfileLoader {
             }
 
             let profile_id = params[0]
-                .parse::<u16>()
+                .parse_legacy::<u16>()
                 .map_err(|e| format!("EELEventGenerator: Parameter conversion error. {}", e))?;
             let azimuth = params[1]
-                .parse::<f64>()
+                .parse_legacy::<f64>()
                 .map_err(|e| format!("EELEventGenerator: Parameter conversion error. {}", e))?;
             let elevation = params[2]
-                .parse::<f64>()
+                .parse_legacy::<f64>()
                 .map_err(|e| format!("EELEventGenerator: Parameter conversion error. {}", e))?;
 
             let profile = EmaneRsAntennaProfile {

@@ -1,4 +1,5 @@
 use crate::protobufs::emane_message;
+use emane_plugin_api::numeric::LegacyParse;
 use prost::Message;
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -55,15 +56,15 @@ impl PathlossLoader {
                 return Err("LoaderPathloss only supports 'nem' module type".to_string());
             }
             let dst_nem: u16 = dest_str[colon_pos.unwrap() + 1..]
-                .parse()
+                .parse_legacy()
                 .map_err(|e| format!("LoaderPathloss loader: Parameter conversion error. {}", e))?;
 
             let fwd_db: f32 = params[1]
-                .parse()
+                .parse_legacy()
                 .map_err(|e| format!("LoaderPathloss loader: Parameter conversion error. {}", e))?;
 
             let rev_db: f32 = if params.len() >= 3 {
-                params[2].parse().map_err(|e| {
+                params[2].parse_legacy().map_err(|e| {
                     format!("LoaderPathloss loader: Parameter conversion error. {}", e)
                 })?
             } else {

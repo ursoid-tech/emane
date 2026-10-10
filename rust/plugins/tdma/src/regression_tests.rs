@@ -78,6 +78,7 @@ extern "C" fn neighbor_rx_callback(
     _: *mut c_void,
     _: u16,
     _: u64,
+    _: *const u8,
     _: f64,
     _: f64,
     _: u64,
@@ -141,6 +142,7 @@ fn test_mac() -> TdmaMac {
             cancel_timed_event: cancel_callback,
             log: log_callback,
             register_counter: register_callback,
+            register_counter32: register_callback,
             increment_counter: increment_callback,
             maximize_counter: increment_callback,
             register_double: register_double_callback,
@@ -163,6 +165,7 @@ fn test_mac() -> TdmaMac {
             publish_event: publish_event_callback,
             register_file_descriptor: register_descriptor_callback,
             unregister_file_descriptor: unregister_descriptor_callback,
+            query_spectrum_filter: emane_plugin_api::spectrum::unavailable_filter,
             query_spectrum: capture_spectrum,
         },
     )
@@ -215,6 +218,7 @@ extern "C" fn capture_spectrum(
     if let Some(noise) = capture.noise {
         unsafe {
             *result = FfiSpectrumResult {
+                receiver_sensitivity_dbm: -100.0,
                 noise_floor_dbm: noise,
                 signal_in_noise: false,
             };
@@ -234,6 +238,7 @@ fn mac(capture: &Mutex<Capture>) -> TdmaMac {
 }
 fn info(source: u16) -> FfiPacketInfo {
     FfiPacketInfo {
+        uuid: [0; 16],
         source,
         destination: 1,
         priority: 0,
@@ -434,4 +439,54 @@ fn slot_end_pcr_uses_late_interference_and_failed_candidates_stay_locked() {
     capture.lock().unwrap().noise = None;
     complete_receive(&mac, slot);
     assert!(capture.lock().unwrap().upstream.is_empty());
+}
+
+// Appended to the existing private test fixture in an isolated plugin copy.
+#[test]
+fn duplicate_fragments_do_not_extend_reassembly_lifetime() {
+    let capture = Mutex::new(Capture {
+        noise: Some(-100.0),
+        ..Default::default()
+    });
+    let mut mac = mac(&capture);
+    mac.state.lock().unwrap().schedule = Some(schedule(60_000_000, 100, false));
+    let slot = receive(
+        &mut mac,
+        2,
+        100,
+        Some(TdmaFragment {
+            more: true,
+            index: 0,
+            offset: 0,
+            sequence: 10,
+        }),
+    );
+    let duplicate = {
+        let state = mac.state.lock().unwrap();
+        let p = &state.pending_rx[&slot];
+        PendingReception {
+            info: p.info,
+            wire: p.wire.clone(),
+            model_sequence: p.model_sequence,
+            packet_len: p.packet_len,
+            spectrum_query: p.spectrum_query,
+        }
+    };
+    complete_receive(&mac, slot);
+    let previous = now_us() - 4_000_000;
+    {
+        let mut state = mac.state.lock().unwrap();
+        state
+            .reassembly
+            .get_mut(&(2, 0, 10))
+            .unwrap()
+            .last_update_us = previous;
+        state.pending_rx.insert(slot + 1, duplicate);
+    }
+    complete_receive(&mac, slot + 1);
+    let mut state = mac.state.lock().unwrap();
+    let refreshed = state.reassembly[&(2, 0, 10)].last_update_us > previous;
+    expire_reassembly(&mac, &mut state, previous + 6_000_001);
+    assert!(!refreshed);
+    assert!(state.reassembly.is_empty());
 }

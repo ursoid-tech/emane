@@ -1,4 +1,5 @@
 use crate::protobufs::emane_message;
+use emane_plugin_api::numeric::LegacyParse;
 use prost::Message;
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -48,24 +49,26 @@ impl PathlossExLoader {
             if colon_pos.is_none() || &dest_str[..colon_pos.unwrap()] != "nem" {
                 return Err("LoaderPathlossEx only supports 'nem' module type".to_string());
             }
-            let dst_nem: u16 = dest_str[colon_pos.unwrap() + 1..].parse().map_err(|e| {
-                format!("LoaderPathlossEx loader: Parameter conversion error. {}", e)
-            })?;
+            let dst_nem: u16 = dest_str[colon_pos.unwrap() + 1..]
+                .parse_legacy()
+                .map_err(|e| {
+                    format!("LoaderPathlossEx loader: Parameter conversion error. {}", e)
+                })?;
 
             let src_nem = module_id;
 
             for parameter in params.iter().skip(1) {
                 let pathloss_params: Vec<&str> = parameter.split(':').collect();
                 if pathloss_params.len() == 2 || pathloss_params.len() == 3 {
-                    let freq_hz: u64 = pathloss_params[0].parse().map_err(|e| {
+                    let freq_hz: u64 = pathloss_params[0].parse_legacy().map_err(|e| {
                         format!("LoaderPathlossEx loader: Parameter conversion error. {}", e)
                     })?;
-                    let fwd_db: f32 = pathloss_params[1].parse().map_err(|e| {
+                    let fwd_db: f32 = pathloss_params[1].parse_legacy().map_err(|e| {
                         format!("LoaderPathlossEx loader: Parameter conversion error. {}", e)
                     })?;
 
                     let rev_db: f32 = if pathloss_params.len() == 3 {
-                        pathloss_params[2].parse().map_err(|e| {
+                        pathloss_params[2].parse_legacy().map_err(|e| {
                             format!("LoaderPathlossEx loader: Parameter conversion error. {}", e)
                         })?
                     } else {

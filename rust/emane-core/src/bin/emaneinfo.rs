@@ -1,7 +1,6 @@
 use emane_core::native_configuration::ConfigurationValue;
 use emane_core::nem_manager::{
-    canonical_plugin_name, component_configuration_defaults, component_modifiable_parameters,
-    resolve_plugin_path, NemManager,
+    canonical_plugin_name, component_configuration_schema, resolve_plugin_path, NemManager,
 };
 use emane_core::plugin_interface::{PluginApi, PluginEntryFunc, PLUGIN_ABI_VERSION};
 use emane_core::statistics::{
@@ -10,10 +9,8 @@ use emane_core::statistics::{
 };
 use libloading::{Library, Symbol};
 use roxmltree::{Document, Node};
-use std::collections::HashSet;
 use std::env;
 use std::ffi::CStr;
-use std::fs;
 use std::process::{self, ExitCode};
 
 fn usage() {
@@ -61,81 +58,15 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn parameter_values(node: Node<'_, '_>) -> Vec<String> {
-    if let Some(value) = node.attribute("value") {
-        return vec![value.to_string()];
-    }
-    node.children()
-        .filter(|child| child.is_element() && child.tag_name().name() == "value")
-        .filter_map(|child| child.attribute("value").or_else(|| child.text()))
-        .map(str::to_string)
-        .collect()
-}
-
-fn configuration_from_xml(root: Node<'_, '_>) -> Vec<(String, Vec<String>)> {
-    root.children()
-        .filter(|node| node.is_element() && node.tag_name().name() == "param")
-        .filter_map(|node| {
-            node.attribute("name")
-                .map(|name| (name.to_string(), parameter_values(node)))
+fn configuration_from_xml(root: Node<'_, '_>) -> Result<Vec<(String, Vec<String>)>, String> {
+    emane_core::xml_parser::parse_params(root)
+        .map(|params| {
+            params
+                .into_iter()
+                .map(|(name, values)| (name, values.values))
+                .collect()
         })
-        .collect()
-}
-
-fn required_parameters(plugin: &str) -> Vec<(&'static str, ConfigurationValue)> {
-    use ConfigurationValue::{String as Text, UInt16, UInt64};
-    match canonical_plugin_name(plugin) {
-        "emanephy" => vec![("subid", UInt16(0))],
-        "rfpipe" | "ieee80211abg" | "tdma" => {
-            vec![("pcrcurveuri", Text(String::new()))]
-        }
-        "bentpipe" => vec![
-            ("pcrcurveuri", Text(String::new())),
-            ("antenna.defines", Text(String::new())),
-            ("transponder.receive.frequency", Text(String::new())),
-            ("transponder.receive.bandwidth", Text(String::new())),
-            ("transponder.receive.antenna", Text(String::new())),
-            ("transponder.receive.action", Text(String::new())),
-            ("transponder.receive.enable", Text(String::new())),
-            ("transponder.transmit.pcrcurveindex", Text(String::new())),
-            ("transponder.transmit.frequency", Text(String::new())),
-            ("transponder.transmit.bandwidth", Text(String::new())),
-            ("transponder.transmit.antenna", Text(String::new())),
-            ("transponder.transmit.ubend.delay", Text(String::new())),
-            ("transponder.transmit.datarate", Text(String::new())),
-            ("transponder.transmit.power", Text(String::new())),
-            ("transponder.transmit.tosmap", Text(String::new())),
-            ("transponder.transmit.slotperframe", Text(String::new())),
-            ("transponder.transmit.slotsize", Text(String::new())),
-            ("transponder.transmit.txslots", Text(String::new())),
-            ("transponder.transmit.mtu", Text(String::new())),
-            ("transponder.transmit.enable", Text(String::new())),
-        ],
-        "phyapitestshim" => vec![("bandwidth", UInt64(0))],
-        _ => Vec::new(),
-    }
-}
-
-fn optional_without_defaults(plugin: &str) -> Vec<(&'static str, ConfigurationValue, usize)> {
-    use ConfigurationValue::String as Text;
-    match canonical_plugin_name(plugin) {
-        "virtualtransport" => vec![
-            ("ethernet.type.unknown.priority", Text(String::new()), 255),
-            ("address", Text(String::new()), 1),
-            ("mask", Text(String::new()), 1),
-        ],
-        "rawtransport" => vec![
-            ("device", Text(String::new()), 1),
-            ("ethernet.type.unknown.priority", Text(String::new()), 255),
-        ],
-        "commeffectshim" => vec![("filterfile", Text(String::new()), 1)],
-        "phyapitestshim" => vec![
-            ("frequency", Text(String::new()), 255),
-            ("transmitter", Text(String::new()), 255),
-            ("antennaprofile", Text(String::new()), 1),
-        ],
-        _ => Vec::new(),
-    }
+        .map_err(|error| error.to_string())
 }
 
 fn inspection_required_values(plugin: &str) -> Vec<(String, Vec<String>)> {
@@ -190,107 +121,36 @@ fn type_name(value: &ConfigurationValue) -> &'static str {
     }
 }
 
-fn numeric_bounds(value: &ConfigurationValue) -> Option<(String, String)> {
-    match value {
-        ConfigurationValue::Int8(_) => Some((i8::MIN.to_string(), i8::MAX.to_string())),
-        ConfigurationValue::UInt8(_) => Some((u8::MIN.to_string(), u8::MAX.to_string())),
-        ConfigurationValue::Int16(_) => Some((i16::MIN.to_string(), i16::MAX.to_string())),
-        ConfigurationValue::UInt16(_) => Some((u16::MIN.to_string(), u16::MAX.to_string())),
-        ConfigurationValue::Int32(_) => Some((i32::MIN.to_string(), i32::MAX.to_string())),
-        ConfigurationValue::UInt32(_) => Some((u32::MIN.to_string(), u32::MAX.to_string())),
-        ConfigurationValue::Int64(_) => Some((i64::MIN.to_string(), i64::MAX.to_string())),
-        ConfigurationValue::UInt64(_) => Some((u64::MIN.to_string(), u64::MAX.to_string())),
-        ConfigurationValue::Float(_) => Some((f32::MIN.to_string(), f32::MAX.to_string())),
-        ConfigurationValue::Double(_) => Some((f64::MIN.to_string(), f64::MAX.to_string())),
-        ConfigurationValue::Boolean(_) => Some(("false".to_string(), "true".to_string())),
-        ConfigurationValue::String(_) | ConfigurationValue::InetAddr(_) => None,
-    }
-}
-
-fn parameter_bounds(
-    plugin: &str,
-    name: &str,
-    prototype: &ConfigurationValue,
-) -> Option<(String, String)> {
-    let bounds = match canonical_plugin_name(plugin) {
-        "ieee80211abg" => match name {
-            "mode" => Some(("0", "3")),
-            "unicastrate" | "multicastrate" => Some(("1", "12")),
-            "flowcontroltokens" | "cwmin0" | "cwmin1" | "cwmin2" | "cwmin3" | "cwmax0"
-            | "cwmax1" | "cwmax2" | "cwmax3" => Some(("1", "65535")),
-            "aifs0" | "aifs1" | "aifs2" | "aifs3" => Some(("0", "0.000255")),
-            "txop0" | "txop1" | "txop2" | "txop3" => Some(("0", "1")),
-            "channelactivityestimationtimer" => Some(("0.001", "1")),
-            "neighbortimeout" => Some(("0", "3600")),
-            "radiometricreportinterval" => Some(("0.1", "60")),
-            "neighbormetricdeletetime" => Some(("1", "3660")),
-            _ => None,
-        },
-        "rfpipe" => match name {
-            "datarate" => Some(("1", "18446744073709551615")),
-            "jitter" | "delay" => Some(("0", "340282350000000000000000000000000000000")),
-            "radiometricreportinterval" => Some(("0.1", "60")),
-            "neighbormetricdeletetime" => Some(("1", "3660")),
-            _ => None,
-        },
-        "tdma" => match name {
-            "neighbormetricdeletetime" => Some(("1", "3660")),
-            "neighbormetricupdateinterval" => Some(("0.1", "60")),
-            "queue.aggregationslotthreshold" => Some(("0", "100")),
-            _ => None,
-        },
-        "emanephy" => match name {
-            "compatibilitymode" => Some(("1", "2")),
-            "processingpoolsize" => Some(("0", "65535")),
-            _ => None,
-        },
-        _ => None,
-    };
-    bounds
-        .map(|(minimum, maximum)| (minimum.to_string(), maximum.to_string()))
-        .or_else(|| numeric_bounds(prototype))
-}
-
-fn print_parameter(
-    plugin: &str,
-    name: &str,
-    prototype: &ConfigurationValue,
-    defaults: &[ConfigurationValue],
-    required: bool,
-    modifiable: bool,
-    max_occurs: usize,
-) {
+fn print_parameter(name: &str, spec: &emane_core::native_configuration::ParameterSchema) {
     println!(
         "      <parameter name=\"{}\" default=\"{}\" required=\"{}\" modifiable=\"{}\">",
         xml_escape(name),
-        if defaults.is_empty() { "no" } else { "yes" },
-        if required { "yes" } else { "no" },
-        if modifiable { "yes" } else { "no" }
+        if spec.has_default { "yes" } else { "no" },
+        if spec.required { "yes" } else { "no" },
+        if spec.modifiable { "yes" } else { "no" }
     );
-    let bounds = parameter_bounds(plugin, name, prototype);
-    let tag = if bounds.is_some() {
+    let tag = if spec.minimum.is_some() {
         "numeric"
     } else {
         "nonnumeric"
     };
-    if let Some((minimum, maximum)) = bounds {
-        println!(
-            "        <{tag} type=\"{}\" minValue=\"{minimum}\" maxValue=\"{maximum}\">",
-            type_name(prototype)
-        );
-    } else {
-        println!("        <{tag} type=\"{}\">", type_name(prototype));
+    print!("        <{tag} type=\"{}\"", type_name(&spec.prototype));
+    if let (Some(min), Some(max)) = (&spec.minimum, &spec.maximum) {
+        print!(" minValue=\"{}\" maxValue=\"{}\"", min.text(), max.text());
     }
+    println!(">");
     println!(
-        "          <values minOccurs=\"{}\" maxOccurs=\"{max_occurs}\">",
-        usize::from(required)
+        "          <values minOccurs=\"{}\" maxOccurs=\"{}\">",
+        spec.min_occurs, spec.max_occurs
     );
-    for value in defaults {
+    for value in &spec.defaults {
         println!("            <value>{}</value>", xml_escape(&value.text()));
     }
     println!("          </values>");
-    println!("        </{tag}>");
-    println!("      </parameter>");
+    if let Some(regex) = &spec.regex {
+        println!("          <regex>{}</regex>", xml_escape(regex.as_str()));
+    }
+    println!("        </{tag}>\n      </parameter>");
 }
 
 fn statistic_type_name(value: i32) -> &'static str {
@@ -313,53 +173,13 @@ fn statistic_type_name(value: i32) -> &'static str {
 }
 
 fn print_manifest(plugin: &str, build_id: Option<u16>) {
-    let defaults = component_configuration_defaults(plugin);
-    let modifiable: HashSet<_> = component_modifiable_parameters(plugin)
-        .into_iter()
-        .collect();
-    let required = required_parameters(plugin);
-    let required_names: HashSet<_> = required.iter().map(|(name, _)| *name).collect();
-    println!("<?xml version=\"1.0\"?>");
-    println!("<manifest>");
-    println!("  <plugin name=\"{}\">", xml_escape(plugin));
-    println!("    <configuration>");
-    for (name, values) in defaults {
-        if required_names.contains(name.as_str()) {
-            continue;
-        }
-        if let Some(prototype) = values.first() {
-            print_parameter(
-                plugin,
-                &name,
-                prototype,
-                &values,
-                false,
-                modifiable.contains(&name),
-                if name == "frequencyofinterest" {
-                    255
-                } else {
-                    1
-                },
-            );
-        }
-    }
-    for (name, prototype) in required {
-        print_parameter(
-            plugin,
-            name,
-            &prototype,
-            &[],
-            true,
-            modifiable.contains(name),
-            if canonical_plugin_name(plugin) == "bentpipe" && name != "pcrcurveuri" {
-                255
-            } else {
-                1
-            },
-        );
-    }
-    for (name, prototype, max_occurs) in optional_without_defaults(plugin) {
-        print_parameter(plugin, name, &prototype, &[], false, false, max_occurs);
+    println!("<?xml version=\"1.0\"?>\n<manifest>");
+    println!(
+        "  <plugin name=\"{}\">\n    <configuration>",
+        xml_escape(plugin)
+    );
+    for (name, spec) in component_configuration_schema(plugin) {
+        print_parameter(&name, &spec);
     }
     println!("    </configuration>");
     println!("    <statistics>");
@@ -455,17 +275,30 @@ fn run() -> Result<(), String> {
     ];
     if !configuration && manager_names.contains(&target.as_str()) {
         if manifest {
-            print_manifest(&target, None);
+            emane_core::event_service::configure_statistics(0);
+            if target == "nemmanager" {
+                emane_core::ota_manager::configure_statistics(0, 0);
+            }
+            print_manifest(&target, Some(0));
         }
         return Ok(());
     }
 
     let (plugin, declared_type, config) = if configuration {
-        let content = fs::read_to_string(&target)
+        let content = emane_plugin_api::xml_document::read(&target)
             .map_err(|error| format!("failed to read {target}: {error}"))?;
-        let document = Document::parse(&content)
-            .map_err(|error| format!("failed to parse {target}: {error}"))?;
+        let document = Document::parse_with_options(
+            &content,
+            roxmltree::ParsingOptions {
+                allow_dtd: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|error| format!("failed to parse {target}: {error}"))?;
         let root = document.root_element();
+        if !emane_plugin_api::xml_document::has_doctype(&content) {
+            emane_core::xml_contract::validate(root, false)?;
+        }
         let layer_type = root.tag_name().name().to_string();
         if !matches!(layer_type.as_str(), "mac" | "phy" | "shim" | "transport") {
             return Err(format!(
@@ -482,7 +315,7 @@ fn run() -> Result<(), String> {
         (
             plugin.to_string(),
             Some(layer_type),
-            configuration_from_xml(root),
+            configuration_from_xml(root)?,
         )
     } else {
         (target.clone(), None, Vec::new())
@@ -538,19 +371,6 @@ fn run() -> Result<(), String> {
                 .any(|(name, _)| name == &required.0)
             {
                 inspection_config.push(required);
-            }
-        }
-    }
-    if configuration {
-        let supplied: HashSet<_> = inspection_config
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect();
-        for (name, _) in required_parameters(&reported_name) {
-            if !supplied.contains(name) {
-                return Err(format!(
-                    "required configuration parameter {name} is missing"
-                ));
             }
         }
     }

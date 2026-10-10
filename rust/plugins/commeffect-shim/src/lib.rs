@@ -8,7 +8,6 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use roxmltree::{Document, Node};
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
-use std::fs;
 use std::net::Ipv4Addr;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -991,6 +990,7 @@ fn decode_pending(data: &[u8]) -> Option<Pending> {
         .collect();
     let packet = FfiPacket {
         info: FfiPacketInfo {
+            uuid: [0; 16],
             source,
             destination,
             priority,
@@ -1096,8 +1096,15 @@ fn text_value<T: std::str::FromStr + Default>(
 }
 
 fn load_filters(path: &str) -> Result<Vec<Filter>, String> {
-    let xml = fs::read_to_string(path).map_err(|error| error.to_string())?;
-    let document = Document::parse(&xml).map_err(|error| error.to_string())?;
+    let xml = emane_plugin_api::xml_document::read(path).map_err(|error| error.to_string())?;
+    let document = Document::parse_with_options(
+        &xml,
+        roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
     let root = document.root_element();
     if root.tag_name().name() != "commeffect" {
         return Err("invalid CommEffect filter root".into());
@@ -1341,6 +1348,7 @@ mod tests {
         _: *mut c_void,
         _: u16,
         _: u64,
+        _: *const u8,
         _: f64,
         _: f64,
         _: u64,
@@ -1464,6 +1472,7 @@ mod tests {
             cancel_timed_event: capture_cancel,
             log: capture_log,
             register_counter: capture_register,
+            register_counter32: capture_register,
             increment_counter: capture_increment,
             maximize_counter: capture_increment,
             register_double: capture_register_double,
@@ -1486,6 +1495,7 @@ mod tests {
             publish_event: capture_publish_event,
             register_file_descriptor: capture_register_descriptor,
             unregister_file_descriptor: capture_unregister_descriptor,
+            query_spectrum_filter: emane_plugin_api::spectrum::unavailable_filter,
             query_spectrum: spectrum_unavailable,
         };
         let plugin = init(1, &framework);
@@ -1502,6 +1512,7 @@ mod tests {
         let payload = [1u8, 2, 3];
         let outgoing = FfiPacket {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: 1,
                 destination: 2,
                 priority: 0,

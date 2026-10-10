@@ -63,6 +63,7 @@ extern "C" fn capture_spectrum(
     if let Some(noise) = capture.noise {
         unsafe {
             *result = FfiSpectrumResult {
+                receiver_sensitivity_dbm: -100.0,
                 noise_floor_dbm: noise,
                 signal_in_noise: capture.signal_in_noise,
             };
@@ -110,6 +111,7 @@ fn mac(capture: &Mutex<Capture>) -> Ieee80211Mac {
 }
 fn packet_info(source: u16, destination: u16) -> FfiPacketInfo {
     FfiPacketInfo {
+        uuid: [0; 16],
         source,
         destination,
         priority: 0,
@@ -319,11 +321,12 @@ fn pre_delay_matches_legacy_conditional_overhead_subtraction() {
     state.estimated_one_hop_neighbors = 10.0;
     state.total_one_hop_utilization_microseconds = 100_000;
     state.channel_activity_interval_microseconds = 100_000;
+    state.random_state = LegacyRandom::seeded(11);
     // A fixed draw selects one node; cover below, equal and above overhead (1152us).
-    let seed = state.random_state;
+    let seed = state.random_state.clone();
     assert_eq!((f64::from(random_unit(&mut state)) * 10.0).floor(), 1.0);
     for average in [10, 1152, 2000] {
-        state.random_state = seed;
+        state.random_state = seed.clone();
         state.average_message_duration_microseconds = average;
         let expected = if average > 1152 {
             average - 1152

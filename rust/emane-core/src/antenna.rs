@@ -39,7 +39,7 @@ pub struct AntennaPattern {
 impl AntennaPattern {
     pub fn new(uri: &str, sub_root_name: &str, missing_value: f64) -> Result<Self, String> {
         let path = file_uri_path(uri)?;
-        let content = std::fs::read_to_string(&path)
+        let content = emane_plugin_api::xml_document::read(&path)
             .map_err(|e| format!("Unable to read {}: {}", path.display(), e))?;
         let doc = Document::parse_with_options(
             &content,
@@ -248,7 +248,7 @@ impl AntennaProfileManifest {
 
     pub fn load(&mut self, uri: &str) -> Result<(), String> {
         let manifest_path = file_uri_path(uri)?;
-        let content = std::fs::read_to_string(&manifest_path)
+        let content = emane_plugin_api::xml_document::read(&manifest_path)
             .map_err(|e| format!("Unable to read {}: {}", manifest_path.display(), e))?;
         let doc = Document::parse_with_options(
             &content,

@@ -1,6 +1,6 @@
 use emane_plugin_api::{
     CommonLayerCounters, FfiConfigRequest, FfiControlMessage, FfiFrameworkService, FfiPacket,
-    PluginApi, PLUGIN_ABI_VERSION,
+    FfiSlice, PluginApi, CONTROL_BYPASS_PHY, PLUGIN_ABI_VERSION,
 };
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -118,12 +118,27 @@ extern "C" fn downstream(
             elapsed_microseconds(begin),
             false,
         );
+        if count != 0 && messages.is_null() {
+            return;
+        }
+        let mut controls = if count == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(messages, count) }.to_vec()
+        };
+        controls.push(FfiControlMessage {
+            msg_type: CONTROL_BYPASS_PHY,
+            payload: FfiSlice {
+                data: std::ptr::null(),
+                len: 0,
+            },
+        });
         (phy.framework.send_downstream_packet)(
             phy.framework.framework_ctx,
             phy.id,
             packet,
-            messages,
-            count,
+            controls.as_ptr(),
+            controls.len(),
         );
     }
 }

@@ -1,8 +1,9 @@
+use emane_plugin_api::random::LegacyRandom;
 mod pcr_manager;
 
 use emane_plugin_api::{
     AntennaPattern, FfiConfigRequest, FfiControlMessage, FfiFrameworkService, FfiPacket,
-    FfiPacketInfo, FfiSlice, FfiStatisticValue, MimoRxProperties, MimoTxAntenna,
+    FfiPacketInfo, FfiSlice, FfiSpectrumQuery, FfiStatisticValue, MimoRxProperties, MimoTxAntenna,
     MimoTxFrequencySegment, MimoTxProperties, ModelHeader, PluginApi, RxAntennaAdd,
     RxAntennaRemove, RxProperties, TxAntennaProfile, TxProperties, CONTROL_MIMO_RX_PROPERTIES,
     CONTROL_MIMO_TX_PROPERTIES, CONTROL_MODEL_HEADER, CONTROL_RX_ANTENNA_ADD,
@@ -20,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const EVENT_TRANSMIT: u32 = 1;
 const EVENT_REASSEMBLY_CHECK: u32 = 2;
 const EVENT_RECEIVE: u32 = 3;
+const EVENT_RECEPTION_CHECK: u32 = 4;
 const DEFAULT_QUEUE_DEPTH: usize = 256;
 const BENTPIPE_MESSAGE_TYPE: u8 = 1;
 const BROADCAST_NEM: u16 = u16::MAX;
@@ -196,6 +198,7 @@ enum PacketDropReason {
     Destination = 2,
     QueueOverflow = 3,
     BadControl = 4,
+    Spectrum = 5,
     TooBig = 6,
     MissingFragment = 8,
     BadCurve = 9,
@@ -208,6 +211,17 @@ enum PacketDropReason {
 struct AntennaDefinition {
     pattern: AntennaPattern,
     spectral_mask_index: u16,
+}
+
+struct PendingReception {
+    info: FfiPacketInfo,
+    controls: Vec<OwnedControl>,
+    wire: BentPipeMessage,
+    length: usize,
+    index: u16,
+    action: ReceiveAction,
+    delay: u64,
+    query: FfiSpectrumQuery,
 }
 
 struct State {
@@ -238,8 +252,9 @@ struct State {
     timers: HashSet<u64>,
     next_receive_id: u64,
     pending_receptions: HashMap<u64, OwnedPacket>,
+    receive_candidates: BTreeMap<(u16, i64, u64), PendingReception>,
     reassembly: HashMap<(u16, u64), Reassembly>,
-    random_state: u64,
+    receive_random: HashMap<u16, LegacyRandom>,
     started: bool,
 }
 
@@ -467,8 +482,9 @@ impl BentpipeMac {
                 timers: HashSet::new(),
                 next_receive_id: 0,
                 pending_receptions: HashMap::new(),
+                receive_candidates: BTreeMap::new(),
                 reassembly: HashMap::new(),
-                random_state: 0xD1B5_4A32_D192_ED03 ^ u64::from(id),
+                receive_random: HashMap::new(),
                 started: false,
             }),
         }
@@ -1117,15 +1133,6 @@ fn airtime(bytes: usize, rate: u64) -> u64 {
         .unwrap_or(0)
 }
 
-fn random_unit(state: &mut State) -> f32 {
-    let mut value = state.random_state;
-    value ^= value << 13;
-    value ^= value >> 7;
-    value ^= value << 17;
-    state.random_state = value;
-    ((value >> 40) as f32) / ((1u32 << 24) as f32)
-}
-
 fn next_slot(transponder: &Transponder, now: i64) -> i64 {
     if transponder.transmit_slots.is_empty()
         || transponder.transmit_slots_per_frame == 0
@@ -1497,7 +1504,7 @@ fn send_downstream(
     let mimo_bytes = MimoTxProperties {
         frequency_groups: vec![vec![MimoTxFrequencySegment {
             frequency_hz: transponder.transmit_frequency_hz,
-            tx_power_dbm: transponder.transmit_power_dbm,
+            tx_power_dbm: Some(transponder.transmit_power_dbm),
             duration_microseconds: duration,
             offset_microseconds: 0,
         }]],
@@ -1552,6 +1559,7 @@ fn send_downstream(
     });
     let packet = FfiPacket {
         info: FfiPacketInfo {
+            uuid: [0; 16],
             source: mac.id,
             destination,
             priority: 0,
@@ -2158,6 +2166,7 @@ extern "C" fn stop(plugin: *mut c_void) {
         state.started = false;
         state.queues.clear();
         state.pending_receptions.clear();
+        state.receive_candidates.clear();
         state.reassembly.clear();
         state.receive_end.clear();
         state.wakeups.clear();
@@ -2236,7 +2245,7 @@ extern "C" fn upstream(
         );
         return;
     }
-    let Ok(curve_index) = u16::try_from(wire.curve_index) else {
+    let Ok(_curve_index) = u16::try_from(wire.curve_index) else {
         record_component_drops(
             mac,
             &mut mac.state.lock().unwrap(),
@@ -2324,7 +2333,7 @@ extern "C" fn upstream(
             receive_action,
             transmit_delay_us,
             rx_power_dbm,
-            noise_floor_dbm,
+            _noise_floor_dbm,
             start_of_reception,
             span_microseconds,
         )) = observation
@@ -2351,49 +2360,15 @@ extern "C" fn upstream(
             );
             return;
         }
-        state.receive_end.insert(
-            index,
-            start_of_reception.saturating_add(i64::try_from(span_microseconds).unwrap_or(i64::MAX)),
-        );
-        let Some(probability) = state.pcr.get_por(
-            curve_index,
-            (rx_power_dbm - noise_floor_dbm) as f32,
-            packet_ref.payload.len,
-        ) else {
-            record_component_drops(
-                mac,
-                &mut state,
-                packet_ref.info.source,
-                &wire.messages,
-                PacketDropReason::BadCurve,
-            );
-            return;
+        let transponder = &state.transponders[&index];
+        let query = FfiSpectrumQuery {
+            frequency_hz: transponder.receive_frequency_hz,
+            antenna_index: transponder.receive_antenna_index,
+            rx_power_dbm,
+            start_time_microseconds: start_of_reception,
+            duration_microseconds: span_microseconds,
         };
-        if probability < random_unit(&mut state) {
-            record_component_drops(
-                mac,
-                &mut state,
-                packet_ref.info.source,
-                &wire.messages,
-                PacketDropReason::Sinr,
-            );
-            return;
-        }
-        update_neighbor_statistics(
-            mac,
-            &mut state,
-            packet_ref.info.source,
-            index,
-            rx_power_dbm - noise_floor_dbm,
-            noise_floor_dbm,
-            wire.start_of_transmission_microseconds,
-        );
-        (
-            index,
-            receive_action,
-            transmit_delay_us,
-            start_of_reception.saturating_add(i64::try_from(span_microseconds).unwrap_or(i64::MAX)),
-        )
+        (index, receive_action, transmit_delay_us, query)
     };
     let controls = message_views
         .iter()
@@ -2412,6 +2387,159 @@ extern "C" fn upstream(
             })
         })
         .collect::<Vec<_>>();
+    let end = decision
+        .3
+        .start_time_microseconds
+        .saturating_add(i64::try_from(decision.3.duration_microseconds).unwrap_or(i64::MAX));
+    let key = {
+        let mut state = mac.state.lock().unwrap();
+        state.next_receive_id = state.next_receive_id.wrapping_add(1);
+        let key = (
+            decision.0,
+            decision.3.start_time_microseconds,
+            state.next_receive_id,
+        );
+        state.receive_candidates.insert(
+            key,
+            PendingReception {
+                info: packet_ref.info,
+                controls,
+                wire,
+                length: packet_ref.payload.len - 2,
+                index: decision.0,
+                action: decision.1,
+                delay: decision.2,
+                query: decision.3,
+            },
+        );
+        key
+    };
+    if end <= now_us() {
+        complete_receptions(mac, now_us());
+    } else {
+        let when = end.max(0) as u64;
+        let timer = (mac.framework.schedule_timed_event)(
+            mac.framework.framework_ctx,
+            mac.id,
+            when / 1_000_000,
+            (when % 1_000_000) as u32,
+            EVENT_RECEPTION_CHECK,
+            std::ptr::null(),
+            0,
+        );
+        let mut state = mac.state.lock().unwrap();
+        if timer != 0 {
+            state.timers.insert(timer);
+        } else {
+            state.receive_candidates.remove(&key);
+        }
+    }
+}
+
+fn complete_receptions(mac: &BentpipeMac, now: i64) {
+    loop {
+        let next = {
+            let mut state = mac.state.lock().unwrap();
+            let mut seen = HashSet::new();
+            let key = state
+                .receive_candidates
+                .iter()
+                .find_map(|(key, candidate)| {
+                    if !seen.insert(key.0) {
+                        return None;
+                    }
+                    let end = candidate.query.start_time_microseconds.saturating_add(
+                        i64::try_from(candidate.query.duration_microseconds).unwrap_or(i64::MAX),
+                    );
+                    (end <= now).then_some(*key)
+                });
+            key.and_then(|key| state.receive_candidates.remove(&key))
+        };
+        let Some(candidate) = next else { break };
+        complete_reception(mac, candidate);
+    }
+}
+
+fn complete_reception(mac: &BentpipeMac, candidate: PendingReception) {
+    let PendingReception {
+        info,
+        controls,
+        wire,
+        length,
+        index,
+        action,
+        delay,
+        query,
+    } = candidate;
+    let end = query
+        .start_time_microseconds
+        .saturating_add(i64::try_from(query.duration_microseconds).unwrap_or(i64::MAX));
+    {
+        let mut state = mac.state.lock().unwrap();
+        if query.start_time_microseconds < state.receive_end.get(&index).copied().unwrap_or(0) {
+            record_component_drops(
+                mac,
+                &mut state,
+                info.source,
+                &wire.messages,
+                PacketDropReason::Lock,
+            );
+            return;
+        }
+    }
+    let Some(spectrum) = mac.framework.reception_noise(&query) else {
+        record_component_drops(
+            mac,
+            &mut mac.state.lock().unwrap(),
+            info.source,
+            &wire.messages,
+            PacketDropReason::Spectrum,
+        );
+        return;
+    };
+    {
+        let mut state = mac.state.lock().unwrap();
+        let sinr = query.rx_power_dbm - spectrum.noise_floor_dbm;
+        let Some(probability) = state
+            .pcr
+            .get_por(wire.curve_index as u16, sinr as f32, length)
+        else {
+            record_component_drops(
+                mac,
+                &mut state,
+                info.source,
+                &wire.messages,
+                PacketDropReason::BadCurve,
+            );
+            return;
+        };
+        if probability
+            < state
+                .receive_random
+                .entry(index)
+                .or_insert_with(LegacyRandom::from_clock)
+                .unit()
+        {
+            record_component_drops(
+                mac,
+                &mut state,
+                info.source,
+                &wire.messages,
+                PacketDropReason::Sinr,
+            );
+            return;
+        }
+        update_neighbor_statistics(
+            mac,
+            &mut state,
+            info.source,
+            index,
+            sinr,
+            spectrum.noise_floor_dbm,
+            query.start_time_microseconds.max(0) as u64,
+        );
+    }
+    let decision = (index, action, delay, end);
     for component in wire.messages {
         let Ok(destination) = u16::try_from(component.destination) else {
             continue;
@@ -2425,7 +2553,7 @@ extern "C" fn upstream(
             record_packet_drop(
                 mac,
                 &mut mac.state.lock().unwrap(),
-                packet_ref.info.source,
+                info.source,
                 destination,
                 component.data.len(),
                 PacketDropReason::Destination,
@@ -2434,13 +2562,13 @@ extern "C" fn upstream(
         }
         let info = FfiPacketInfo {
             destination,
-            ..packet_ref.info
+            ..info
         };
         let completed = if let Some(fragment) = component.fragment {
             let mut state = mac.state.lock().unwrap();
             let now = now_us();
             expire_reassembly(mac, &mut state, now);
-            let key = (packet_ref.info.source, fragment.sequence);
+            let key = (info.source, fragment.sequence);
             let entry = state.reassembly.entry(key).or_insert_with(|| Reassembly {
                 info,
                 controls: controls.clone(),
@@ -2498,6 +2626,11 @@ extern "C" fn upstream(
                 }
             })
         } else {
+            mac.state
+                .lock()
+                .unwrap()
+                .receive_end
+                .insert(decision.0, decision.3);
             Some(OwnedPacket {
                 info,
                 payload: component.data,
@@ -2508,7 +2641,7 @@ extern "C" fn upstream(
         record_packet_accept(
             mac,
             &mut mac.state.lock().unwrap(),
-            packet_ref.info.source,
+            info.source,
             packet.info.destination,
             packet.payload.len(),
             true,
@@ -2604,6 +2737,10 @@ extern "C" fn timed(
         return;
     };
     mac.state.lock().unwrap().timers.remove(&timer_id);
+    if event_id == EVENT_RECEPTION_CHECK {
+        complete_receptions(mac, now_us());
+        return;
+    }
     if event_id == EVENT_REASSEMBLY_CHECK {
         let mut state = mac.state.lock().unwrap();
         if !state.started {
@@ -2673,9 +2810,16 @@ mod tests {
     extern "C" fn spectrum_unavailable(
         _: *mut c_void,
         _: *const emane_plugin_api::FfiSpectrumQuery,
-        _: *mut emane_plugin_api::FfiSpectrumResult,
+        result: *mut emane_plugin_api::FfiSpectrumResult,
     ) -> bool {
-        false
+        unsafe {
+            *result = emane_plugin_api::FfiSpectrumResult {
+                noise_floor_dbm: -90.0,
+                receiver_sensitivity_dbm: -100.0,
+                signal_in_noise: false,
+            };
+        }
+        true
     }
 
     use super::*;
@@ -2807,6 +2951,7 @@ mod tests {
         _: *mut c_void,
         _: u16,
         _: u64,
+        _: *const u8,
         _: f64,
         _: f64,
         _: u64,
@@ -2868,6 +3013,7 @@ mod tests {
             cancel_timed_event: cancel_noop,
             log: log_noop,
             register_counter: register_noop,
+            register_counter32: register_noop,
             increment_counter: increment_noop,
             maximize_counter: increment_noop,
             register_double: register_double_noop,
@@ -2890,6 +3036,7 @@ mod tests {
             publish_event: publish_event_noop,
             register_file_descriptor: register_descriptor_noop,
             unregister_file_descriptor: unregister_descriptor_noop,
+            query_spectrum_filter: emane_plugin_api::spectrum::unavailable_filter,
             query_spectrum: spectrum_unavailable,
         }
     }
@@ -2897,6 +3044,7 @@ mod tests {
     fn packet(destination: u16, data: &[u8]) -> OwnedPacket {
         OwnedPacket {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: 1,
                 destination,
                 priority: 0,
@@ -3142,6 +3290,7 @@ mod tests {
         ];
         let packet = FfiPacket {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: 1,
                 destination: 2,
                 priority: 0,
@@ -3225,6 +3374,7 @@ mod tests {
             wire.extend_from_slice(&serialization);
             let packet = FfiPacket {
                 info: FfiPacketInfo {
+                    uuid: [0; 16],
                     source: 1,
                     destination: 2,
                     priority: 0,
@@ -3248,5 +3398,233 @@ mod tests {
         }
         assert_eq!(*UPSTREAM_CAPTURE.lock().unwrap(), vec![b"abcdef".to_vec()]);
         std::fs::remove_file(pcr_path).unwrap();
+    }
+    mod reception_regressions {
+        use super::*;
+        use emane_plugin_api::FfiSpectrumResult;
+        #[derive(Default)]
+        struct Probe {
+            noise: f64,
+            queries: usize,
+            sources: Vec<u16>,
+        }
+        extern "C" fn capture(
+            ctx: *mut c_void,
+            _: u16,
+            p: *const FfiPacket,
+            _: *const FfiControlMessage,
+            _: usize,
+        ) {
+            unsafe {
+                (&mut *(ctx as *mut Probe)).sources.push((*p).info.source);
+            }
+        }
+        extern "C" fn spectrum(
+            ctx: *mut c_void,
+            q: *const FfiSpectrumQuery,
+            r: *mut FfiSpectrumResult,
+        ) -> bool {
+            let probe = unsafe { &mut *(ctx as *mut Probe) };
+            assert_eq!(unsafe { (*q).antenna_index }, 7);
+            probe.queries += 1;
+            unsafe {
+                *r = FfiSpectrumResult {
+                    noise_floor_dbm: probe.noise,
+                    receiver_sensitivity_dbm: -100.0,
+                    signal_in_noise: false,
+                };
+            }
+            true
+        }
+        extern "C" fn schedule(
+            _: *mut c_void,
+            _: u16,
+            _: u64,
+            _: u32,
+            event: u32,
+            _: *const u8,
+            _: usize,
+        ) -> u64 {
+            if event == EVENT_RECEPTION_CHECK {
+                1
+            } else {
+                0
+            }
+        }
+        fn receiver(probe: &mut Probe) -> BentpipeMac {
+            let mut fw = framework(false);
+            fw.framework_ctx = probe as *mut _ as *mut c_void;
+            fw.query_spectrum = spectrum;
+            fw.send_upstream_packet = capture;
+            fw.schedule_timed_event = schedule;
+            let mac = BentpipeMac::new(2, fw);
+            let path = std::env::temp_dir().join(format!(
+                "bentpipe-regression-{}-{:?}.xml",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path,r#"<bentpipe-model-pcr packetsize="0"><curve index="0"><entry sinr="-10" por="0"/><entry sinr="10" por="100"/></curve></bentpipe-model-pcr>"#).unwrap();
+            {
+                let mut state = mac.state.lock().unwrap();
+                state.pcr.load(path.to_str().unwrap()).unwrap();
+                state.transponders.insert(
+                    1,
+                    Transponder {
+                        receive_frequency_hz: 2_400_000_000,
+                        receive_antenna_index: 7,
+                        receive_enable: true,
+                        receive_action: ReceiveAction::Process,
+                        ..Transponder::default()
+                    },
+                );
+            }
+            std::fs::remove_file(path).unwrap();
+            mac
+        }
+        fn receive(mac: &BentpipeMac, source: u16, start: i64, power: f64) {
+            let body = BentPipeMessage {
+                start_of_transmission_microseconds: start as u64,
+                curve_index: 0,
+                messages: vec![BentPipeComponent {
+                    destination: 2,
+                    data: vec![42],
+                    fragment: None,
+                }],
+            }
+            .encode_to_vec();
+            let mut payload = (body.len() as u16).to_be_bytes().to_vec();
+            payload.extend(body);
+            let header = ModelHeader {
+                registration_id: MAC_REGISTRATION_BENTPIPE,
+                sequence: 1,
+                data_rate_bps: 1_000_000,
+                category: 0,
+                message_type: BENTPIPE_MESSAGE_TYPE,
+                flags: 0,
+            }
+            .encode();
+            let rx = RxProperties {
+                frequency_hz: 2_400_000_000,
+                bandwidth_hz: 1_000_000,
+                rx_power_dbm: power,
+                noise_floor_dbm: -100.0,
+                tx_time_microseconds: start,
+                propagation_microseconds: 0,
+                duration_microseconds: 100_000,
+                antenna_index: 7,
+                sub_id: 1,
+                signal_in_noise: false,
+            }
+            .encode();
+            let messages = [
+                FfiControlMessage {
+                    msg_type: CONTROL_MODEL_HEADER,
+                    payload: FfiSlice {
+                        data: header.as_ptr(),
+                        len: header.len(),
+                    },
+                },
+                FfiControlMessage {
+                    msg_type: CONTROL_RX_PROPERTIES,
+                    payload: FfiSlice {
+                        data: rx.as_ptr(),
+                        len: rx.len(),
+                    },
+                },
+            ];
+            let packet = FfiPacket {
+                info: FfiPacketInfo {
+                    uuid: [1; 16],
+                    source,
+                    destination: 2,
+                    priority: 0,
+                    creation_time_sec: 0,
+                    creation_time_usec: 0,
+                },
+                payload: FfiSlice {
+                    data: payload.as_ptr(),
+                    len: payload.len(),
+                },
+            };
+            upstream(
+                mac as *const _ as *mut c_void,
+                &packet,
+                messages.as_ptr(),
+                messages.len(),
+            );
+        }
+        #[test]
+        fn earlier_start_wins_even_when_its_callback_arrives_later() {
+            let mut probe = Probe {
+                noise: -100.0,
+                ..Probe::default()
+            };
+            let mac = receiver(&mut probe);
+            let start = now_us() + 1_000_000;
+            receive(&mac, 3, start + 20_000, -50.0);
+            receive(&mac, 1, start + 10_000, -50.0);
+            assert_eq!(mac.state.lock().unwrap().receive_candidates.len(), 2);
+            assert_eq!(probe.queries, 0);
+            complete_receptions(&mac, start + 120_000);
+            assert_eq!(probe.sources, vec![1]);
+            assert_eq!(probe.queries, 1);
+        }
+        #[test]
+        fn failed_reception_does_not_reserve_the_channel() {
+            let mut probe = Probe {
+                noise: -50.0,
+                ..Probe::default()
+            };
+            let mac = receiver(&mut probe);
+            let start = now_us() + 1_000_000;
+            receive(&mac, 3, start + 20_000, -30.0);
+            receive(&mac, 1, start + 10_000, -70.0);
+            complete_receptions(&mac, start + 120_000);
+            assert_eq!(probe.sources, vec![3]);
+            assert_eq!(probe.queries, 2);
+        }
+        #[test]
+        fn late_interference_changes_the_completed_reception() {
+            let mut probe = Probe {
+                noise: -100.0,
+                ..Probe::default()
+            };
+            let mac = receiver(&mut probe);
+            let start = now_us() + 1_000_000;
+            receive(&mac, 1, start, -70.0);
+            assert_eq!(probe.queries, 0);
+            probe.noise = -50.0;
+            complete_receptions(&mac, start + 100_000);
+            assert!(probe.sources.is_empty());
+            assert_eq!(probe.queries, 1);
+            assert!(mac.state.lock().unwrap().receive_end.is_empty());
+        }
+        #[test]
+        fn pcr_length_excludes_prefix() {
+            let mut probe = Probe {
+                noise: -100.0,
+                ..Probe::default()
+            };
+            let mac = receiver(&mut probe);
+            receive(&mac, 1, now_us() + 1_000_000, -50.0);
+            let mut state = mac.state.lock().unwrap();
+            let path =
+                std::env::temp_dir().join(format!("bentpipe-length-{}.xml", std::process::id()));
+            std::fs::write(&path, r#"<bentpipe-model-pcr packetsize="128"><curve index="0"><entry sinr="0" por="25"/><entry sinr="100" por="75"/></curve></bentpipe-model-pcr>"#).unwrap();
+            state.pcr.load(path.to_str().unwrap()).unwrap();
+            std::fs::remove_file(path).unwrap();
+            let candidate = state.receive_candidates.values().next().unwrap();
+            assert_eq!(
+                candidate.length,
+                candidate.wire.encoded_len(),
+                "C++ strips the two-byte prefix before passing length to PCR"
+            );
+            let expected = 0.5f32.powf(candidate.wire.encoded_len() as f32 / 128.0);
+            assert_eq!(state.pcr.get_por(0, 50.0, candidate.length), Some(expected));
+            assert_ne!(
+                state.pcr.get_por(0, 50.0, candidate.length + 2),
+                Some(expected)
+            );
+        }
     }
 }

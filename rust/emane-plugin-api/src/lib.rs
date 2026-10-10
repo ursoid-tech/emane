@@ -1,3 +1,7 @@
+pub mod numeric;
+pub mod random;
+pub mod spectrum;
+pub use spectrum::*;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
@@ -7,6 +11,7 @@ use std::sync::{Mutex, OnceLock};
 /// Values live outside the legacy framework range and the payloads use an
 /// explicitly versioned, big-endian wire format so they are also safe to
 /// carry over OTA multicast.
+pub const CONTROL_BYPASS_PHY: u32 = 0x454D_0014;
 pub const CONTROL_TX_PROPERTIES: u32 = 0x454D_0001;
 pub const CONTROL_RX_PROPERTIES: u32 = 0x454D_0002;
 pub const CONTROL_MODEL_HEADER: u32 = 0x454D_0003;
@@ -33,8 +38,13 @@ pub const MAC_REGISTRATION_RFPIPE: u16 = 0x0004;
 pub const MAC_REGISTRATION_TDMA: u16 = 0x0005;
 pub const MAC_REGISTRATION_BENTPIPE: u16 = 0x0006;
 
+pub const CONTROL_SPECTRUM_FILTER_ADD: u32 = 0x454D_0015;
+pub const CONTROL_SPECTRUM_FILTER_REMOVE: u32 = 0x454D_0016;
+pub const CONTROL_SPECTRUM_FILTER_DATA: u32 = 0x454D_0017;
+pub const CONTROL_SELF_INTERFERENCE: u32 = 0x454D_0018;
+
 const PROPERTIES_VERSION: u8 = 1;
-const MIMO_TX_PROPERTIES_VERSION: u8 = 2;
+const MIMO_TX_PROPERTIES_VERSION: u8 = 3;
 const MIMO_RX_PROPERTIES_VERSION: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,7 +331,7 @@ impl FrequencyOfInterest {
         let frequencies_hz: Vec<_> = (0..count)
             .map(|index| get_u64(data, 11 + index * 8))
             .collect();
-        (bandwidth_hz != 0 && !frequencies_hz.contains(&0)).then_some(Self {
+        (!frequencies_hz.contains(&0)).then_some(Self {
             bandwidth_hz,
             frequencies_hz,
         })
@@ -551,7 +561,8 @@ impl TxAntennaProfile {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MimoTxFrequencySegment {
     pub frequency_hz: u64,
-    pub tx_power_dbm: f64,
+    /// None uses each collaborating transmitter's own power.
+    pub tx_power_dbm: Option<f64>,
     pub duration_microseconds: u64,
     pub offset_microseconds: u64,
 }
@@ -626,7 +637,7 @@ pub struct MimoTxProperties {
 }
 
 impl MimoTxProperties {
-    const SEGMENT_LEN: usize = 32;
+    const SEGMENT_LEN: usize = 33;
     const ANTENNA_LEN: usize = 14 + AntennaPattern::ENCODED_LEN;
 
     pub fn encode(&self) -> Option<Vec<u8>> {
@@ -639,7 +650,7 @@ impl MimoTxProperties {
                     || group.len() > usize::from(u16::MAX)
                     || group
                         .iter()
-                        .any(|segment| !segment.tx_power_dbm.is_finite())
+                        .any(|segment| segment.tx_power_dbm.is_some_and(|power| !power.is_finite()))
             })
         {
             return None;
@@ -660,7 +671,10 @@ impl MimoTxProperties {
             data.extend_from_slice(&u16::try_from(group.len()).ok()?.to_be_bytes());
             for segment in group {
                 data.extend_from_slice(&segment.frequency_hz.to_be_bytes());
-                data.extend_from_slice(&segment.tx_power_dbm.to_bits().to_be_bytes());
+                data.push(u8::from(segment.tx_power_dbm.is_some()));
+                data.extend_from_slice(
+                    &segment.tx_power_dbm.unwrap_or(0.0).to_bits().to_be_bytes(),
+                );
                 data.extend_from_slice(&segment.duration_microseconds.to_be_bytes());
                 data.extend_from_slice(&segment.offset_microseconds.to_be_bytes());
             }
@@ -699,7 +713,16 @@ impl MimoTxProperties {
             for _ in 0..count {
                 group.push(MimoTxFrequencySegment {
                     frequency_hz: read_u64(data, &mut offset)?,
-                    tx_power_dbm: f64::from_bits(read_u64(data, &mut offset)?),
+                    tx_power_dbm: {
+                        let present = *data.get(offset)?;
+                        offset += 1;
+                        let power = f64::from_bits(read_u64(data, &mut offset)?);
+                        match present {
+                            0 => None,
+                            1 => Some(power),
+                            _ => return None,
+                        }
+                    },
                     duration_microseconds: read_u64(data, &mut offset)?,
                     offset_microseconds: read_u64(data, &mut offset)?,
                 });
@@ -734,7 +757,7 @@ impl MimoTxProperties {
             .frequency_groups
             .iter()
             .flatten()
-            .all(|segment| segment.tx_power_dbm.is_finite())
+            .all(|segment| segment.tx_power_dbm.is_none_or(f64::is_finite))
             .then_some(result)
     }
 }
@@ -748,7 +771,7 @@ pub struct RxAntennaAdd {
 impl RxAntennaAdd {
     pub fn encode(&self) -> Option<Vec<u8>> {
         let count = u16::try_from(self.frequencies_hz.len()).ok()?;
-        if count == 0 || self.antenna.bandwidth_hz == 0 || self.frequencies_hz.contains(&0) {
+        if self.frequencies_hz.contains(&0) {
             return None;
         }
         let mut data =
@@ -775,13 +798,13 @@ impl RxAntennaAdd {
         let spectral_mask_index = read_u16(data, &mut offset)?;
         let pattern = AntennaPattern::decode(data, &mut offset)?;
         let count = usize::from(read_u16(data, &mut offset)?);
-        if count == 0 || data.len() != offset.checked_add(count.checked_mul(8)?)? {
+        if data.len() != offset.checked_add(count.checked_mul(8)?)? {
             return None;
         }
         let frequencies_hz = (0..count)
             .map(|_| read_u64(data, &mut offset))
             .collect::<Option<Vec<_>>>()?;
-        (bandwidth_hz != 0 && !frequencies_hz.contains(&0)).then_some(Self {
+        (!frequencies_hz.contains(&0)).then_some(Self {
             antenna: MimoTxAntenna {
                 frequency_group_index: 0,
                 antenna_index,
@@ -1132,8 +1155,10 @@ fn read_u64(data: &[u8], offset: &mut usize) -> Option<u64> {
 // floating-point statistics. Version 10 adds typed native statistic tables;
 // version 11 lets their owners clear rows when model state is replaced;
 // version 12 adds removal of individual table rows.
-// Version 14 adds completed-reception spectrum queries.
-pub const PLUGIN_ABI_VERSION: u32 = 14;
+// Version 15 preserves packet UUIDs through reception and neighbor metrics.
+// Version 16 exposes spectrum filter windows.
+// Version 17 preserves optional MIMO segment powers. Rebuild core and plugins together.
+pub const PLUGIN_ABI_VERSION: u32 = 17;
 
 pub const STATISTIC_VALUE_U64: u32 = 1;
 pub const STATISTIC_VALUE_F64: u32 = 2;
@@ -1160,6 +1185,7 @@ pub struct FfiSlice {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FfiPacketInfo {
+    pub uuid: [u8; 16],
     pub source: u16,
     pub destination: u16,
     pub priority: u8,
@@ -1213,6 +1239,7 @@ impl FfiSpectrumQuery {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FfiSpectrumResult {
+    pub receiver_sensitivity_dbm: f64,
     pub noise_floor_dbm: f64,
     pub signal_in_noise: bool,
 }
@@ -1264,6 +1291,12 @@ pub struct FfiFrameworkService {
         description: *const c_char,
         clearable: bool,
     ) -> u64,
+    pub register_counter32: extern "C" fn(
+        ctx: *mut c_void,
+        name: *const c_char,
+        description: *const c_char,
+        clearable: bool,
+    ) -> u64,
     pub increment_counter: extern "C" fn(ctx: *mut c_void, handle: u64, amount: u64) -> bool,
     pub maximize_counter: extern "C" fn(ctx: *mut c_void, handle: u64, value: u64) -> bool,
     pub register_double: extern "C" fn(
@@ -1310,6 +1343,7 @@ pub struct FfiFrameworkService {
         ctx: *mut c_void,
         source: u16,
         sequence: u64,
+        uuid: *const u8,
         sinr_db: f64,
         noise_floor_dbm: f64,
         rx_time_microseconds: u64,
@@ -1360,6 +1394,11 @@ pub struct FfiFrameworkService {
         callback: FfiFileDescriptorCallback,
     ) -> u64,
     pub unregister_file_descriptor: extern "C" fn(ctx: *mut c_void, handle: u64) -> bool,
+    pub query_spectrum_filter: extern "C" fn(
+        ctx: *mut c_void,
+        query: *const FfiFilterQuery,
+        result: *mut FfiFilterResult,
+    ) -> bool,
     /// Returns false for unavailable, expired or incomplete spectrum windows.
     pub query_spectrum: extern "C" fn(
         ctx: *mut c_void,
@@ -2141,13 +2180,13 @@ mod tests {
             frequency_groups: vec![
                 vec![MimoTxFrequencySegment {
                     frequency_hz: 2_400_000_000,
-                    tx_power_dbm: 3.0,
+                    tx_power_dbm: Some(3.0),
                     duration_microseconds: 100,
                     offset_microseconds: 0,
                 }],
                 vec![MimoTxFrequencySegment {
                     frequency_hz: 2_410_000_000,
-                    tx_power_dbm: -2.0,
+                    tx_power_dbm: Some(-2.0),
                     duration_microseconds: 50,
                     offset_microseconds: 100,
                 }],
@@ -2177,6 +2216,14 @@ mod tests {
             MimoTxProperties::decode(&mimo_tx.encode().unwrap()),
             Some(mimo_tx.clone())
         );
+        let mut fallback = mimo_tx.clone();
+        for segment in fallback.frequency_groups.iter_mut().flatten() {
+            segment.tx_power_dbm = None;
+        }
+        assert_eq!(
+            MimoTxProperties::decode(&fallback.encode().unwrap()),
+            Some(fallback)
+        );
         let mut invalid_group = mimo_tx.encode().unwrap();
         let antenna_offset = invalid_group.len() - 2 * MimoTxProperties::ANTENNA_LEN;
         invalid_group[antenna_offset..antenna_offset + 2].copy_from_slice(&9u16.to_be_bytes());
@@ -2199,7 +2246,14 @@ mod tests {
         };
         assert_eq!(
             RxAntennaAdd::decode(&rx_antenna.encode().unwrap()),
-            Some(rx_antenna)
+            Some(rx_antenna.clone())
+        );
+        let mut defaults = rx_antenna;
+        defaults.antenna.bandwidth_hz = 0;
+        defaults.frequencies_hz.clear();
+        assert_eq!(
+            RxAntennaAdd::decode(&defaults.encode().unwrap()),
+            Some(defaults)
         );
 
         let mimo_rx = MimoRxProperties {
@@ -2221,3 +2275,9 @@ mod tests {
         );
     }
 }
+
+pub mod pcr_validation;
+
+pub mod xml_document;
+
+pub mod xml_schema;

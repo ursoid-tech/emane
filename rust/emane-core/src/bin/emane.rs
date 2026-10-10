@@ -320,6 +320,9 @@ fn run() -> Result<(), String> {
             return Err(format!("NEM {} has unexpected parameter {name}", nem.id));
         }
         for layer in nem.layers {
+            if nem.external_transport && layer.layer_type == "transport" {
+                continue;
+            }
             let expected_type = match layer.layer_type.as_str() {
                 "mac" => 1,
                 "phy" => 2,

@@ -5,6 +5,7 @@ use super::loaders::{
 };
 use super::parser::EelInputParser;
 use crate::event_service::emane_rs_event_service_send_event;
+use emane_plugin_api::numeric::LegacyParse;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fs::File;
@@ -266,7 +267,7 @@ impl NativeEelGenerator {
                 let (module_type, module_id) = module.split_once(':').ok_or_else(|| {
                     format!("{filename}:{}: invalid module {module}", line_number + 1)
                 })?;
-                let module_id = module_id.parse::<u16>().map_err(|_| {
+                let module_id = module_id.parse_legacy::<u16>().map_err(|_| {
                     format!(
                         "{filename}:{}: invalid module id in {module}",
                         line_number + 1

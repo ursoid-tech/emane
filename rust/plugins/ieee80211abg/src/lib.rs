@@ -1,3 +1,4 @@
+use emane_plugin_api::random::LegacyRandom;
 mod pcr_manager;
 
 use emane_plugin_api::{
@@ -232,7 +233,7 @@ struct State {
     table_generations: HashMap<String, u64>,
     duplicate_history: HashMap<u16, VecDeque<(u64, i64)>>,
     timers: HashSet<u64>,
-    random_state: u64,
+    random_state: LegacyRandom,
     started: bool,
 }
 
@@ -291,7 +292,7 @@ impl Ieee80211Mac {
         }
         for name in names {
             let c_name = CString::new(name.as_str()).unwrap();
-            let handle = (framework.register_counter)(
+            let handle = (framework.register_counter32)(
                 framework.framework_ctx,
                 c_name.as_ptr(),
                 c"".as_ptr(),
@@ -492,7 +493,7 @@ impl Ieee80211Mac {
                 table_generations: HashMap::new(),
                 duplicate_history: HashMap::new(),
                 timers: HashSet::new(),
-                random_state: 0xA076_1D64_78BD_642F ^ u64::from(id),
+                random_state: LegacyRandom::from_clock(),
                 started: false,
             }),
         }
@@ -895,17 +896,8 @@ fn is_duplicate(state: &mut State, source: u16, sequence: u64, now: i64) -> bool
     false
 }
 
-fn random_u64(state: &mut State) -> u64 {
-    let mut value = state.random_state;
-    value ^= value << 13;
-    value ^= value >> 7;
-    value ^= value << 17;
-    state.random_state = value;
-    value
-}
-
 fn random_unit(state: &mut State) -> f32 {
-    (random_u64(state) >> 40) as f32 / ((1u32 << 24) as f32)
+    state.random_state.unit()
 }
 
 fn record_channel_activity(
@@ -1580,6 +1572,7 @@ fn send_cts(
     let pending = PendingTx {
         packet: OwnedPacket {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: mac.id,
                 destination: BROADCAST_NEM,
                 priority: 0,
@@ -2101,6 +2094,7 @@ fn complete_receive(mac: &Ieee80211Mac, id: u64) {
             );
         }
         let neighbor_metric = reception_ok.then_some((
+            pending.packet.info.uuid,
             pending.source,
             pending.sequence,
             accepted_sinr,
@@ -2120,11 +2114,12 @@ fn complete_receive(mac: &Ieee80211Mac, id: u64) {
     if let Some((packet, category, acquired_at)) = packet {
         send_upstream(mac, packet, category, acquired_at);
     }
-    if let Some((source, sequence, sinr, noise, duration, data_rate)) = neighbor_metric {
+    if let Some((uuid, source, sequence, sinr, noise, duration, data_rate)) = neighbor_metric {
         (mac.framework.update_neighbor_rx)(
             mac.framework.framework_ctx,
             source,
             sequence,
+            uuid.as_ptr(),
             sinr,
             noise,
             now_us().max(0) as u64,
@@ -2932,6 +2927,7 @@ mod tests {
         _: *mut c_void,
         _: u16,
         _: u64,
+        _: *const u8,
         _: f64,
         _: f64,
         _: u64,
@@ -3015,6 +3011,7 @@ mod tests {
                 cancel_timed_event: cancel_callback,
                 log: log_callback,
                 register_counter: register_callback,
+                register_counter32: register_callback,
                 increment_counter: increment_callback,
                 maximize_counter: increment_callback,
                 register_double: register_double_callback,
@@ -3037,6 +3034,7 @@ mod tests {
                 publish_event: publish_event_callback,
                 register_file_descriptor: register_descriptor_callback,
                 unregister_file_descriptor: unregister_descriptor_callback,
+                query_spectrum_filter: emane_plugin_api::spectrum::unavailable_filter,
                 query_spectrum: spectrum_unavailable,
             },
         )
@@ -3097,6 +3095,7 @@ mod tests {
             state.queues[0].push_back(PendingTx {
                 packet: OwnedPacket {
                     info: FfiPacketInfo {
+                        uuid: [0; 16],
                         source: 1,
                         destination: 2,
                         priority: 0,

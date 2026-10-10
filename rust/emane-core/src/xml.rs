@@ -1,6 +1,5 @@
 use roxmltree::{Document, Node};
 use std::ffi::{CStr, CString};
-use std::fs;
 use std::os::raw::c_char;
 use std::ptr;
 
@@ -122,12 +121,18 @@ pub extern "C" fn emane_rs_xml_parse(uri: *const c_char) -> *mut EmaneXmlDoc {
     }
     let path = unsafe { CStr::from_ptr(uri).to_string_lossy().into_owned() };
 
-    let xml_text = match fs::read_to_string(&path) {
+    let xml_text = match emane_plugin_api::xml_document::read(&path) {
         Ok(t) => t,
         Err(_) => return ptr::null_mut(),
     };
 
-    let doc = match Document::parse(&xml_text) {
+    let doc = match Document::parse_with_options(
+        &xml_text,
+        roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    ) {
         Ok(d) => d,
         Err(_) => return ptr::null_mut(),
     };

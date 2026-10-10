@@ -1,5 +1,3 @@
-use std::fs;
-
 pub struct PCREntry {
     pub sinr: f32,
     pub por: f32,
@@ -29,9 +27,16 @@ impl PCRManager {
     }
 
     pub fn load(&mut self, uri: &str) -> Result<(), String> {
-        let content = fs::read_to_string(uri).map_err(|e| format!("Failed to read file: {}", e))?;
-        let doc = roxmltree::Document::parse(&content)
-            .map_err(|e| format!("Failed to parse XML: {}", e))?;
+        let content = emane_plugin_api::xml_document::read(uri)
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+        let doc = roxmltree::Document::parse_with_options(
+            &content,
+            roxmltree::ParsingOptions {
+                allow_dtd: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| format!("Failed to parse XML: {}", e))?;
 
         self.pcr_entry_vector.clear();
         self.por_vector.clear();

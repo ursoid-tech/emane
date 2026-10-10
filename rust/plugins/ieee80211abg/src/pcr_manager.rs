@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
-use std::fs;
 
 pub struct PCREntry {
     pub sinr: f32,
@@ -29,7 +28,8 @@ impl PCRManager {
 
     pub fn load(&mut self, uri: &str) -> Result<(), String> {
         let uri = uri.strip_prefix("file://").unwrap_or(uri);
-        let content = fs::read_to_string(uri).map_err(|e| format!("Failed to read file: {}", e))?;
+        let content = emane_plugin_api::xml_document::read(uri)
+            .map_err(|e| format!("Failed to read file: {}", e))?;
         let doc = roxmltree::Document::parse_with_options(
             &content,
             roxmltree::ParsingOptions {

@@ -26,11 +26,14 @@ struct PartInfo {
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]
 struct PartKey {
+    uuid: [u8; 16],
     source: u16,
     sequence: u64,
 }
 
 struct PartsData {
+    has_info: bool,
+    end_offset: Option<usize>,
     total_size: usize,
     events_size: usize,
     controls_size: usize,
@@ -38,6 +41,89 @@ struct PartsData {
     parts: BTreeMap<usize, Vec<u8>>,
     last_part_time: SystemTime,
     uuid: [u8; 16],
+}
+
+impl PartsData {
+    /// Continuations may precede offset zero and omit PayloadInfo (the C++ format).
+    fn insert(
+        &mut self,
+        info: Option<&ota::ota_header::PayloadInfo>,
+        offset: usize,
+        more: bool,
+        bytes: &[u8],
+        now: SystemTime,
+    ) -> Result<Option<Vec<u8>>, ()> {
+        let end = offset.checked_add(bytes.len()).ok_or(())?;
+        if bytes.is_empty() || end > MAX_OTA_PAYLOAD {
+            return Err(());
+        }
+        if let Some(info) = info {
+            let sizes = (
+                info.event_length as usize,
+                info.control_length as usize,
+                info.data_length as usize,
+            );
+            if self.has_info && sizes != (self.events_size, self.controls_size, self.data_size) {
+                return Err(());
+            }
+            (self.events_size, self.controls_size, self.data_size) = sizes;
+            self.has_info = true;
+        }
+        if !more {
+            if self.end_offset.is_some_and(|previous| previous != end) {
+                return Err(());
+            }
+            self.end_offset = Some(end);
+        }
+        if let Some(previous) = self.parts.get(&offset) {
+            if previous != bytes {
+                return Err(());
+            }
+        } else {
+            // Reject overlaps, but accept identical retransmissions without double counting.
+            if self
+                .parts
+                .iter()
+                .any(|(start, part)| *start < end && start + part.len() > offset)
+            {
+                return Err(());
+            }
+            self.total_size = self.total_size.checked_add(bytes.len()).ok_or(())?;
+            if self.total_size > MAX_OTA_PAYLOAD {
+                return Err(());
+            }
+            self.parts.insert(offset, bytes.to_vec());
+        }
+        self.last_part_time = now;
+        if !self.has_info {
+            return Ok(None);
+        }
+        let total = self
+            .events_size
+            .checked_add(self.controls_size)
+            .and_then(|n| n.checked_add(self.data_size))
+            .ok_or(())?;
+        if total > MAX_OTA_PAYLOAD
+            || self.end_offset.is_some_and(|end| end != total)
+            || self
+                .parts
+                .iter()
+                .any(|(offset, part)| offset + part.len() > total)
+        {
+            return Err(());
+        }
+        if self.total_size != total || self.end_offset != Some(total) {
+            return Ok(None);
+        }
+        let mut payload = Vec::with_capacity(total);
+        for (offset, part) in &self.parts {
+            if *offset != payload.len() {
+                return Ok(None);
+            }
+            payload.extend_from_slice(part);
+        }
+        Ok(Some(payload))
+    }
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]
@@ -107,21 +193,21 @@ impl OtaStatistics {
         .unwrap_or(0);
         let event_tx = register_native_counter(
             0,
-            "numOTAEventsTx",
+            "numOTAChannelEventsTx",
             "Number of events transmitted over the OTA channel.",
             true,
         )
         .unwrap_or(0);
         let event_rx = register_native_counter(
             0,
-            "numOTAEventsRx",
+            "numOTAChannelEventsRx",
             "Number of events received over the OTA channel.",
             true,
         )
         .unwrap_or(0);
         let event_table = register_native_table(
             0,
-            "OTAEventCountTable",
+            "OTAChannelEventCountTable",
             &["Src", "Emulator UUID", "Num Events Tx", "Num Events Rx"],
             "OTA Event count table.",
             true,
@@ -504,110 +590,50 @@ pub extern "C" fn emane_rs_ota_manager_process_loop() {
                                         // Fragmented message
                                         let mut manager = get_ota_manager().lock().unwrap();
                                         let key = PartKey {
+                                            uuid: remote_uuid,
                                             source: ota_header.source as u16,
                                             sequence: ota_header.sequence,
                                         };
 
-                                        let payload_info =
-                                            ota_header.payload_info.unwrap_or_default();
-                                        let event_len = payload_info.event_length as usize;
-                                        let control_len = payload_info.control_length as usize;
-                                        let data_len = payload_info.data_length as usize;
-                                        let Some(expected_total) = event_len
-                                            .checked_add(control_len)
-                                            .and_then(|size| size.checked_add(data_len))
-                                        else {
-                                            continue;
-                                        };
-                                        if expected_total > MAX_OTA_PAYLOAD
-                                            || u32_offset.checked_add(u32_size).is_none()
-                                            || u32_offset + u32_size > expected_total
-                                            || (u8_more == 0
-                                                && u32_offset + u32_size != expected_total)
-                                        {
-                                            continue;
-                                        }
-
                                         let entry =
                                             manager.part_store.entry(key).or_insert_with(|| {
                                                 PartsData {
+                                                    has_info: false,
+                                                    end_offset: None,
                                                     total_size: 0,
-                                                    events_size: event_len,
-                                                    controls_size: control_len,
-                                                    data_size: data_len,
+                                                    events_size: 0,
+                                                    controls_size: 0,
+                                                    data_size: 0,
                                                     parts: BTreeMap::new(),
                                                     last_part_time: now,
                                                     uuid: remote_uuid,
                                                 }
                                             });
-
-                                        // Update info if it was 0 (from subsequent parts that lack PayloadInfo)
-                                        if entry.events_size == 0
-                                            && entry.controls_size == 0
-                                            && entry.data_size == 0
-                                        {
-                                            entry.events_size = event_len;
-                                            entry.controls_size = control_len;
-                                            entry.data_size = data_len;
-                                        }
-
-                                        if entry.events_size != event_len
-                                            || entry.controls_size != control_len
-                                            || entry.data_size != data_len
-                                            || entry.uuid != remote_uuid
-                                        {
-                                            manager.part_store.remove(&key);
-                                            continue;
-                                        }
-                                        if let Some(previous) = entry.parts.insert(
+                                        match entry.insert(
+                                            ota_header.payload_info.as_ref(),
                                             u32_offset,
-                                            buf[payload_index..payload_index + u32_size].to_vec(),
+                                            u8_more != 0,
+                                            &buf[payload_index..payload_index + u32_size],
+                                            now,
                                         ) {
-                                            entry.total_size =
-                                                entry.total_size.saturating_sub(previous.len());
-                                        }
-                                        entry.total_size =
-                                            entry.total_size.saturating_add(u32_size);
-                                        entry.last_part_time = now;
-
-                                        let mut next_offset = 0usize;
-                                        let contiguous =
-                                            entry.parts.iter().all(|(offset, part)| {
-                                                if *offset != next_offset {
-                                                    return false;
-                                                }
-                                                next_offset =
-                                                    next_offset.saturating_add(part.len());
-                                                next_offset <= expected_total
-                                            });
-                                        if entry.total_size == expected_total
-                                            && contiguous
-                                            && next_offset == expected_total
-                                        {
-                                            // All parts received!
-                                            let mut full_payload =
-                                                Vec::with_capacity(expected_total);
-                                            for part in entry.parts.values() {
-                                                full_payload.extend_from_slice(part);
+                                            Err(()) => {
+                                                manager.part_store.remove(&key);
                                             }
-
-                                            let e_size = entry.events_size;
-                                            let c_size = entry.controls_size;
-                                            let d_size = entry.data_size;
-                                            let remote_uuid = entry.uuid;
-
-                                            manager.part_store.remove(&key);
-                                            drop(manager);
-
-                                            let _ = handle_ota_message(
-                                                ota_header.source as u16,
-                                                ota_header.destination as u16,
-                                                &remote_uuid,
-                                                e_size,
-                                                c_size,
-                                                d_size,
-                                                &full_payload,
-                                            );
+                                            Ok(None) => {}
+                                            Ok(Some(full_payload)) => {
+                                                let entry =
+                                                    manager.part_store.remove(&key).unwrap();
+                                                drop(manager);
+                                                let _ = handle_ota_message(
+                                                    ota_header.source as u16,
+                                                    ota_header.destination as u16,
+                                                    &remote_uuid,
+                                                    entry.events_size,
+                                                    entry.controls_size,
+                                                    entry.data_size,
+                                                    &full_payload,
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -813,7 +839,7 @@ pub extern "C" fn emane_rs_ota_manager_send_ota_packet(
     };
     drop(manager);
 
-    let ota_header = ota::OtaHeader {
+    let mut ota_header = ota::OtaHeader {
         source: source as u32,
         destination: destination as u32,
         sequence: seq,
@@ -824,13 +850,6 @@ pub extern "C" fn emane_rs_ota_manager_send_ota_packet(
             event_length: events_len as u32,
         }),
     };
-
-    let ota_header_bytes = ota_header.encode_to_vec();
-    let header_len = ota_header_bytes.len();
-    if header_len > u16::MAX as usize {
-        return false;
-    }
-    let u16_header_length = (header_len as u16).to_be_bytes();
 
     let mut sent_bytes = 0;
 
@@ -850,12 +869,21 @@ pub extern "C" fn emane_rs_ota_manager_send_ota_packet(
         unsafe { std::slice::from_raw_parts(packet_data, packet_len) }
     };
 
-    let overhead = 2 + header_len + std::mem::size_of::<PartInfo>();
-    if ota_mtu != 0 && ota_mtu <= overhead && total_payload_size != 0 {
-        return false;
-    }
-
     while sent_bytes < total_payload_size {
+        if sent_bytes != 0 {
+            ota_header.payload_info = None;
+        }
+        let ota_header_bytes = ota_header.encode_to_vec();
+        let header_len = ota_header_bytes.len();
+        if header_len > u16::MAX as usize {
+            return false;
+        }
+        let u16_header_length = (header_len as u16).to_be_bytes();
+
+        let overhead = 2 + header_len + std::mem::size_of::<PartInfo>();
+        if ota_mtu != 0 && ota_mtu <= overhead {
+            return false;
+        }
         let total_wire_size =
             total_payload_size - sent_bytes + header_len + 2 + std::mem::size_of::<PartInfo>();
 
@@ -1199,5 +1227,70 @@ mod tests {
             ..Default::default()
         };
         assert!(parse_uuid(&header.uuid).is_none());
+    }
+}
+
+#[cfg(test)]
+mod fragment_regressions {
+    use super::*;
+    fn parts() -> PartsData {
+        PartsData {
+            has_info: false,
+            end_offset: None,
+            total_size: 0,
+            events_size: 0,
+            controls_size: 0,
+            data_size: 0,
+            parts: BTreeMap::new(),
+            last_part_time: SystemTime::now(),
+            uuid: [1; 16],
+        }
+    }
+    #[test]
+    fn cpp_continuations_reassemble_in_any_order() {
+        let info = ota::ota_header::PayloadInfo {
+            event_length: 1,
+            control_length: 1,
+            data_length: 4,
+        };
+        for order in [
+            [0, 1, 2],
+            [2, 1, 0],
+            [1, 0, 2],
+            [1, 2, 0],
+            [0, 2, 1],
+            [2, 0, 1],
+        ] {
+            let mut parts = parts();
+            let mut result = None;
+            for index in order {
+                result = parts
+                    .insert(
+                        (index == 0).then_some(&info),
+                        index * 2,
+                        index != 2,
+                        &b"abcdef"[index * 2..index * 2 + 2],
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(result.as_deref(), Some(&b"abcdef"[..]));
+        }
+    }
+    #[test]
+    fn duplicate_is_idempotent_and_overlaps_are_rejected() {
+        let mut parts = parts();
+        assert!(parts
+            .insert(None, 2, true, b"cd", SystemTime::now())
+            .unwrap()
+            .is_none());
+        assert!(parts
+            .insert(None, 2, true, b"cd", SystemTime::now())
+            .unwrap()
+            .is_none());
+        assert_eq!(parts.total_size, 2);
+        assert!(parts
+            .insert(None, 3, false, b"ef", SystemTime::now())
+            .is_err());
     }
 }

@@ -5,3 +5,7 @@ edition = "2021"
 
 [lib]
 crate-type = ["lib"]
+
+[dependencies]
+roxmltree = "0.19"
+regex = "1.10"

@@ -1,3 +1,4 @@
+use emane_plugin_api::numeric::LegacyParse;
 use prost::Message;
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -46,7 +47,7 @@ impl FadingSelectionLoader {
 
             let tx_nem_str = params[0];
             let tx_nem = if let Some(stripped) = tx_nem_str.strip_prefix("nem:") {
-                stripped.parse::<u16>().map_err(|e| {
+                stripped.parse_legacy::<u16>().map_err(|e| {
                     format!(
                         "LoaderFadingSelection loader: Parameter conversion error. {}",
                         e

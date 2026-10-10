@@ -2,12 +2,51 @@ use emane_plugin_api::{
     FfiConfigItem, FfiConfigRequest, FfiControlMessage, FfiFrameworkService, FfiPacket, FfiSlice,
     PluginApi, TimingAnalysisHeader, CONTROL_TIMING_ANALYSIS_HEADER, PLUGIN_ABI_VERSION,
 };
+use prost::Message;
 use std::collections::VecDeque;
 use std::ffi::{c_void, CStr};
 use std::fs::File;
 use std::io::Write;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// Wire schema: rust/protos/shimheader.proto.
+#[derive(Clone, PartialEq, Message)]
+struct WireHeader {
+    #[prost(uint64, required, tag = "1")]
+    tx_time_microseconds: u64,
+    #[prost(uint32, required, tag = "2")]
+    source: u32,
+    #[prost(uint32, required, tag = "3")]
+    packet_id: u32,
+}
+
+fn frame(header: TimingAnalysisHeader, payload: &[u8]) -> Vec<u8> {
+    let body = WireHeader {
+        tx_time_microseconds: header.tx_time_microseconds,
+        source: u32::from(header.source),
+        packet_id: u32::from(header.packet_id),
+    }
+    .encode_to_vec();
+    let mut bytes = Vec::with_capacity(2 + body.len() + payload.len());
+    bytes.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(&body);
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+fn unframe(bytes: &[u8]) -> Option<(TimingAnalysisHeader, &[u8])> {
+    let len = usize::from(u16::from_be_bytes(bytes.get(..2)?.try_into().ok()?));
+    let header = WireHeader::decode(bytes.get(2..2 + len)?).ok()?;
+    Some((
+        TimingAnalysisHeader {
+            tx_time_microseconds: header.tx_time_microseconds,
+            source: header.source.try_into().ok()?,
+            packet_id: header.packet_id.try_into().ok()?,
+        },
+        &bytes[2 + len..],
+    ))
+}
 
 #[derive(Clone, Copy)]
 struct Entry {
@@ -148,14 +187,16 @@ extern "C" fn upstream(
         );
         return;
     }
-    if let Some(header) = incoming.iter().find_map(|message| {
-        if message.msg_type != CONTROL_TIMING_ANALYSIS_HEADER || message.payload.data.is_null() {
-            return None;
-        }
-        TimingAnalysisHeader::decode(unsafe {
-            std::slice::from_raw_parts(message.payload.data, message.payload.len)
-        })
-    }) {
+    let packet_ref = unsafe { &*packet };
+    if packet_ref.payload.data.is_null() {
+        return;
+    }
+    let bytes =
+        unsafe { std::slice::from_raw_parts(packet_ref.payload.data, packet_ref.payload.len) };
+    let Some((header, payload)) = unframe(bytes) else {
+        return;
+    };
+    {
         if state.max_queue_size != 0 && state.entries.len() >= state.max_queue_size as usize {
             state.entries.pop_front();
         }
@@ -171,10 +212,17 @@ extern "C" fn upstream(
         .copied()
         .filter(|message| message.msg_type != CONTROL_TIMING_ANALYSIS_HEADER)
         .collect();
+    let packet = FfiPacket {
+        info: packet_ref.info,
+        payload: FfiSlice {
+            data: payload.as_ptr(),
+            len: payload.len(),
+        },
+    };
     (state.framework.send_upstream_packet)(
         state.framework.framework_ctx,
         state.id,
-        packet,
+        &packet,
         outgoing.as_ptr(),
         outgoing.len(),
     );
@@ -207,25 +255,29 @@ extern "C" fn downstream(
         packet_id: state.packet_id,
     };
     state.packet_id = state.packet_id.wrapping_add(1);
-    let body = header.encode();
-    let mut outgoing: Vec<_> = incoming
-        .iter()
-        .copied()
-        .filter(|message| message.msg_type != CONTROL_TIMING_ANALYSIS_HEADER)
-        .collect();
-    outgoing.push(FfiControlMessage {
-        msg_type: CONTROL_TIMING_ANALYSIS_HEADER,
+    let packet_ref = unsafe { &*packet };
+    if packet_ref.payload.len != 0 && packet_ref.payload.data.is_null() {
+        return;
+    }
+    let payload = if packet_ref.payload.len == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(packet_ref.payload.data, packet_ref.payload.len) }
+    };
+    let bytes = frame(header, payload);
+    let packet = FfiPacket {
+        info: packet_ref.info,
         payload: FfiSlice {
-            data: body.as_ptr(),
-            len: body.len(),
+            data: bytes.as_ptr(),
+            len: bytes.len(),
         },
-    });
+    };
     (state.framework.send_downstream_packet)(
         state.framework.framework_ctx,
         state.id,
-        packet,
-        outgoing.as_ptr(),
-        outgoing.len(),
+        &packet,
+        incoming.as_ptr(),
+        incoming.len(),
     );
 }
 
@@ -264,6 +316,9 @@ mod tests {
             source: 2,
             packet_id: 7,
         };
-        assert_eq!(TimingAnalysisHeader::decode(&header.encode()), Some(header));
+        let bytes = frame(header, b"abc");
+        // Original shimheader.proto: fields 1, 2, 3 as varints after a u16 length.
+        assert_eq!(bytes, [0, 6, 8, 99, 16, 2, 24, 7, b'a', b'b', b'c']);
+        assert_eq!(unframe(&bytes), Some((header, &b"abc"[..])));
     }
 }

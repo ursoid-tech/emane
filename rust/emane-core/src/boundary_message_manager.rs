@@ -283,16 +283,16 @@ fn encode_controls(controls: &[FfiControlMessage]) -> Result<Vec<u8>, String> {
     if controls.len() > u16::MAX as usize {
         return Err("too many boundary control messages".to_string());
     }
-    let mut data = Vec::new();
-    data.extend_from_slice(&(controls.len() as u16).to_be_bytes());
+    let mut data = vec![0, 0];
+    let mut count = 0u16;
     for control in controls {
-        let message_type = u16::try_from(control.msg_type).map_err(|_| {
-            format!(
-                "control message id {} is not legacy-compatible",
-                control.msg_type
-            )
-        })?;
         let payload = ffi_slice(control.payload)?;
+        let Some((message_type, payload)) =
+            crate::legacy_controls::encode(control.msg_type, payload)?
+        else {
+            continue;
+        };
+        count += 1;
         if payload.len() > u16::MAX as usize {
             return Err(format!(
                 "control message {message_type} exceeds legacy boundary size limit"
@@ -300,8 +300,9 @@ fn encode_controls(controls: &[FfiControlMessage]) -> Result<Vec<u8>, String> {
         }
         data.extend_from_slice(&message_type.to_be_bytes());
         data.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        data.extend_from_slice(payload);
+        data.extend_from_slice(&payload);
     }
+    data[..2].copy_from_slice(&count.to_be_bytes());
     Ok(data)
 }
 
@@ -322,9 +323,12 @@ fn decode_controls(mut data: &[u8]) -> Result<Vec<OwnedControlMessage>, String> 
         if data.len() < length {
             return Err("truncated boundary control-message payload".to_string());
         }
+        let (message_type, payload) =
+            crate::legacy_controls::decode(message_type as u16, &data[..length])
+                .ok_or_else(|| format!("invalid legacy control {message_type}"))?;
         controls.push(OwnedControlMessage {
             message_type,
-            payload: data[..length].to_vec(),
+            payload,
         });
         data = &data[length..];
     }
@@ -370,6 +374,7 @@ fn decode_message(data: &[u8]) -> Result<BoundaryMessage, String> {
                 .unwrap_or_default();
             Ok(BoundaryMessage::Packet(BoundaryPacket {
                 info: FfiPacketInfo {
+                    uuid: [0; 16],
                     source,
                     destination,
                     priority: header[12],
@@ -540,6 +545,7 @@ mod tests {
     fn packet(payload: &[u8]) -> FfiPacket {
         FfiPacket {
             info: FfiPacketInfo {
+                uuid: [0; 16],
                 source: 1,
                 destination: 2,
                 priority: 3,
@@ -556,9 +562,9 @@ mod tests {
     #[test]
     fn legacy_wire_round_trip() {
         let payload = b"payload";
-        let control_payload = b"control";
+        let control_payload = &emane_plugin_api::FlowControlToken { tokens: 10 }.encode();
         let control = FfiControlMessage {
-            msg_type: 104,
+            msg_type: emane_plugin_api::CONTROL_FLOW_CONTROL_TOKEN,
             payload: FfiSlice {
                 data: control_payload.as_ptr(),
                 len: control_payload.len(),
@@ -583,7 +589,10 @@ mod tests {
         assert_eq!(decoded.info.destination, 2);
         assert_eq!(decoded.info.priority, 3);
         assert_eq!(decoded.payload, payload);
-        assert_eq!(decoded.controls[0].message_type, 104);
+        assert_eq!(
+            decoded.controls[0].message_type,
+            emane_plugin_api::CONTROL_FLOW_CONTROL_TOKEN
+        );
         assert_eq!(decoded.controls[0].payload, control_payload);
     }
 

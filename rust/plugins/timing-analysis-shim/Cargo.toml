@@ -9,3 +9,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 emane-plugin-api = { path = "../../emane-plugin-api" }
+prost = "0.12"

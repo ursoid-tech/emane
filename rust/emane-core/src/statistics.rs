@@ -166,7 +166,8 @@ enum StatisticSource {
 
 #[derive(Default)]
 struct NativeAverage {
-    sum: f64,
+    average: f64,
+    single_precision: bool,
     count: u64,
 }
 
@@ -208,6 +209,7 @@ pub struct StatisticService {
     stats: HashMap<u16, HashMap<String, StatisticInfo>>,
     tables: HashMap<u16, HashMap<String, StatisticTableInfo>>,
     native_counters: HashMap<u64, Arc<AtomicU64>>,
+    counter_masks: HashMap<u64, u64>,
     native_averages: HashMap<u64, Arc<Mutex<NativeAverage>>>,
     native_rf_signal_tables: HashMap<u64, Arc<Mutex<RFSignalTable>>>,
     native_tables: HashMap<u64, Arc<Mutex<NativeTable>>>,
@@ -221,6 +223,7 @@ fn get_statistic_service() -> &'static Mutex<StatisticService> {
             stats: HashMap::new(),
             tables: HashMap::new(),
             native_counters: HashMap::new(),
+            counter_masks: HashMap::new(),
             native_averages: HashMap::new(),
             native_rf_signal_tables: HashMap::new(),
             native_tables: HashMap::new(),
@@ -254,7 +257,7 @@ fn statistic_value(info: &StatisticInfo) -> FfiAny {
     match &info.source {
         StatisticSource::Legacy(pointer) => unsafe { emane_c_statistic_as_any(pointer.0) },
         StatisticSource::NativeU64 { value, .. } => FfiAny {
-            any_type: 8,
+            any_type: info.any_type,
             i64_value: 0,
             u64_value: value.load(Ordering::Relaxed),
             d_value: 0.0,
@@ -270,13 +273,13 @@ fn statistic_value(info: &StatisticInfo) -> FfiAny {
         StatisticSource::NativeAverage { value, .. } => {
             let average = value.lock().ok();
             FfiAny {
-                any_type: 10,
+                any_type: info.any_type,
                 i64_value: 0,
                 u64_value: 0,
                 d_value: average
                     .as_ref()
                     .filter(|value| value.count != 0)
-                    .map_or(0.0, |value| value.sum / value.count as f64),
+                    .map_or(0.0, |value| value.average),
                 s_value: std::ptr::null(),
             }
         }
@@ -292,7 +295,10 @@ fn clear_statistic(info: &StatisticInfo) {
         }
         StatisticSource::NativeAverage { value, .. } => {
             if let Ok(mut value) = value.lock() {
-                *value = NativeAverage::default();
+                *value = NativeAverage {
+                    single_precision: value.single_precision,
+                    ..Default::default()
+                };
             }
         }
     }
@@ -331,6 +337,20 @@ pub fn register_native_counter(
     Some(handle)
 }
 
+/// C++ model counters declared as uint32 wrap at 32 bits, including updates.
+pub fn register_native_counter32(
+    build_id: u16,
+    name: &str,
+    description: &str,
+    clearable: bool,
+) -> Option<u64> {
+    let handle = register_native_counter(build_id, name, description, clearable)?;
+    let mut service = get_statistic_service().lock().ok()?;
+    service.stats.get_mut(&build_id)?.get_mut(name)?.any_type = 6;
+    service.counter_masks.insert(handle, u32::MAX as u64);
+    Some(handle)
+}
+
 pub fn increment_native_counter(handle: u64, amount: u64) -> bool {
     let Ok(service) = get_statistic_service().lock() else {
         return false;
@@ -338,7 +358,14 @@ pub fn increment_native_counter(handle: u64, amount: u64) -> bool {
     let Some(value) = service.native_counters.get(&handle) else {
         return false;
     };
-    value.fetch_add(amount, Ordering::Relaxed);
+    let mask = service
+        .counter_masks
+        .get(&handle)
+        .copied()
+        .unwrap_or(u64::MAX);
+    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.wrapping_add(amount) & mask)
+    });
     true
 }
 
@@ -349,7 +376,12 @@ pub fn maximize_native_counter(handle: u64, value: u64) -> bool {
     let Some(counter) = service.native_counters.get(&handle) else {
         return false;
     };
-    counter.fetch_max(value, Ordering::Relaxed);
+    let mask = service
+        .counter_masks
+        .get(&handle)
+        .copied()
+        .unwrap_or(u64::MAX);
+    counter.fetch_max(value & mask, Ordering::Relaxed);
     true
 }
 
@@ -406,6 +438,23 @@ pub fn register_native_average(
     description: &str,
     clearable: bool,
 ) -> Option<u64> {
+    register_average_precision(build_id, name, description, clearable, false)
+}
+pub fn register_native_float_average(
+    build_id: u16,
+    name: &str,
+    description: &str,
+    clearable: bool,
+) -> Option<u64> {
+    register_average_precision(build_id, name, description, clearable, true)
+}
+fn register_average_precision(
+    build_id: u16,
+    name: &str,
+    description: &str,
+    clearable: bool,
+    single_precision: bool,
+) -> Option<u64> {
     if !valid_name(name) {
         return None;
     }
@@ -419,12 +468,15 @@ pub fn register_native_average(
     }
     let handle = service.next_native_handle.max(1);
     service.next_native_handle = handle.wrapping_add(1).max(1);
-    let value = Arc::new(Mutex::new(NativeAverage::default()));
+    let value = Arc::new(Mutex::new(NativeAverage {
+        single_precision,
+        ..Default::default()
+    }));
     service.native_averages.insert(handle, Arc::clone(&value));
     service.stats.entry(build_id).or_default().insert(
         name.to_string(),
         StatisticInfo {
-            any_type: 10,
+            any_type: if single_precision { 9 } else { 10 },
             properties: u64::from(clearable),
             description: description.to_string(),
             source: StatisticSource::NativeAverage { handle, value },
@@ -446,7 +498,18 @@ pub fn sample_native_average(handle: u64, sample: f64) -> bool {
     let Ok(mut value) = value.lock() else {
         return false;
     };
-    value.sum += sample;
+    value.average = if value.single_precision {
+        let sample = sample as f32;
+        f64::from(if value.count == 0 {
+            sample
+        } else {
+            (value.average as f32 * value.count as f32 + sample) / (value.count + 1) as f32
+        })
+    } else if value.count == 0 {
+        sample
+    } else {
+        (value.average * value.count as f64 + sample) / (value.count + 1) as f64
+    };
     value.count = value.count.saturating_add(1);
     true
 }
@@ -456,7 +519,7 @@ pub fn register_native_rf_signal_table(build_id: u16, nem_id: u16) -> Option<u64
     if service
         .tables
         .get(&build_id)
-        .is_some_and(|store| store.contains_key("ReceiveMetricTable"))
+        .is_some_and(|store| store.contains_key("RFSignalTable"))
     {
         return None;
     }
@@ -467,9 +530,9 @@ pub fn register_native_rf_signal_table(build_id: u16, nem_id: u16) -> Option<u64
         .native_rf_signal_tables
         .insert(handle, Arc::clone(&table));
     service.tables.entry(build_id).or_default().insert(
-        "ReceiveMetricTable".to_string(),
+        "RFSignalTable".to_string(),
         StatisticTableInfo {
-            properties: 1,
+            properties: 0,
             description: "Table of RF receive metrics from peering NEMs".to_string(),
             source: StatisticTableSource::NativeRfSignal { handle, table },
         },
@@ -635,6 +698,7 @@ pub fn unregister_native_statistics(build_id: u16) {
         .collect();
     for handle in handles {
         service.native_counters.remove(&handle);
+        service.counter_masks.remove(&handle);
         service.native_averages.remove(&handle);
     }
     if let Some(tables) = service.tables.remove(&build_id) {
@@ -1401,6 +1465,18 @@ mod tests {
     }
 
     #[test]
+    fn uint32_counters_wrap_and_query_as_the_declared_type() {
+        let build_id = emane_rs_buildid_assign();
+        let handle = register_native_counter32(build_id, "test.counter32", "", true).unwrap();
+        increment_native_counter(handle, u32::MAX as u64);
+        increment_native_counter(handle, 2);
+        let service = get_statistic_service().lock().unwrap();
+        let value = statistic_value(&service.stats[&build_id]["test.counter32"]);
+        assert_eq!(value.any_type, 6);
+        assert_eq!(value.u64_value, 1);
+    }
+
+    #[test]
     fn native_average_clear_resets_sample_history() {
         let build_id = emane_rs_buildid_assign();
         let handle = register_native_average(build_id, "test.average", "average", true).unwrap();
@@ -1456,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn native_rf_signal_table_is_manifested_queried_and_clearable() {
+    fn native_rf_signal_table_is_manifested_and_not_externally_clearable() {
         let build_id = emane_rs_buildid_assign();
         let handle = register_native_rf_signal_table(build_id, 1).unwrap();
         assert!(configure_native_rf_signal_table(handle, true, true));
@@ -1513,7 +1589,7 @@ mod tests {
         emane_rs_statistic_clear_table(build_id, empty, error.as_mut_ptr(), error.len());
         let result =
             emane_rs_statistic_query_table(build_id, empty, error.as_mut_ptr(), error.len());
-        assert_eq!(unsafe { &*result.data }.rows_len, 0);
+        assert_eq!(unsafe { &*result.data }.rows_len, 1);
         emane_rs_statistic_free_table_query_result(result);
         unregister_native_statistics(build_id);
     }

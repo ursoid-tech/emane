@@ -349,6 +349,7 @@ extern "C" fn timed(plugin: *mut c_void, _: u64, event_id: u32, _: *const u8, _:
     let now = now_microseconds();
     let packet = FfiPacket {
         info: FfiPacketInfo {
+            uuid: [0; 16],
             source: state.id,
             destination: state.destination,
             priority: 0,

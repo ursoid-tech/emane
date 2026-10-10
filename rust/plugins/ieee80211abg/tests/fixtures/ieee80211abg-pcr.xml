@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE pcr SYSTEM "ieee80211pcr.dtd">
+<!DOCTYPE pcr SYSTEM "../../../../../dtd/ieee80211pcr.dtd">
 <pcr>
   <table pktsize="128">
 

@@ -9,7 +9,7 @@ pub const TYPE_STRING: i32 = 11;
 pub const TYPE_BOOLEAN: i32 = 12;
 pub const TYPE_INETADDR: i32 = 13;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub enum ConfigurationValue {
     Int8(i8),
     UInt8(u8),
@@ -63,41 +63,25 @@ impl ConfigurationValue {
     }
 
     pub fn parse_as(prototype: &Self, value: &str) -> Option<Self> {
-        fn scaled_unsigned(value: &str) -> Option<u64> {
-            let (number, multiplier) = match value.as_bytes().last().copied() {
-                Some(b'K' | b'k') => (&value[..value.len() - 1], 1_000.0),
-                Some(b'M' | b'm') => (&value[..value.len() - 1], 1_000_000.0),
-                Some(b'G' | b'g') => (&value[..value.len() - 1], 1_000_000_000.0),
-                _ => return value.parse().ok(),
-            };
-            let scaled = number.parse::<f64>().ok()? * multiplier;
-            (scaled.is_finite() && scaled >= 0.0 && scaled <= u64::MAX as f64)
-                .then_some(scaled.round() as u64)
-        }
+        use emane_plugin_api::numeric::LegacyParse;
         match prototype {
-            Self::Int8(_) => value.parse().ok().map(Self::Int8),
-            Self::UInt8(_) => scaled_unsigned(value)
-                .and_then(|value| u8::try_from(value).ok())
-                .map(Self::UInt8),
-            Self::Int16(_) => value.parse().ok().map(Self::Int16),
-            Self::UInt16(_) => scaled_unsigned(value)
-                .and_then(|value| u16::try_from(value).ok())
-                .map(Self::UInt16),
-            Self::Int32(_) => value.parse().ok().map(Self::Int32),
-            Self::UInt32(_) => scaled_unsigned(value)
-                .and_then(|value| u32::try_from(value).ok())
-                .map(Self::UInt32),
-            Self::Int64(_) => value.parse().ok().map(Self::Int64),
-            Self::UInt64(_) => scaled_unsigned(value).map(Self::UInt64),
+            Self::Int8(_) => value.parse_legacy::<i8>().ok().map(Self::Int8),
+            Self::UInt8(_) => value.parse_legacy::<u8>().ok().map(Self::UInt8),
+            Self::Int16(_) => value.parse_legacy::<i16>().ok().map(Self::Int16),
+            Self::UInt16(_) => value.parse_legacy::<u16>().ok().map(Self::UInt16),
+            Self::Int32(_) => value.parse_legacy::<i32>().ok().map(Self::Int32),
+            Self::UInt32(_) => value.parse_legacy::<u32>().ok().map(Self::UInt32),
+            Self::Int64(_) => value.parse_legacy::<i64>().ok().map(Self::Int64),
+            Self::UInt64(_) => value.parse_legacy::<u64>().ok().map(Self::UInt64),
             Self::Float(_) => value
-                .parse::<f32>()
+                .parse_legacy::<f32>()
                 .ok()
-                .filter(|value| value.is_finite())
+                .filter(|v| v.is_finite())
                 .map(Self::Float),
             Self::Double(_) => value
-                .parse::<f64>()
+                .parse_legacy::<f64>()
                 .ok()
-                .filter(|value| value.is_finite())
+                .filter(|v| v.is_finite())
                 .map(Self::Double),
             Self::String(_) => Some(Self::String(value.to_string())),
             Self::Boolean(_) => match value.to_ascii_lowercase().as_str() {
@@ -140,7 +124,101 @@ impl ConfigurationValue {
 pub type ConfigurationUpdate = Vec<(String, Vec<ConfigurationValue>)>;
 type UpdateHandler = Arc<dyn Fn(&ConfigurationUpdate) -> Result<(), String> + Send + Sync>;
 
+#[derive(Clone)]
+pub struct ParameterSchema {
+    pub prototype: ConfigurationValue,
+    pub min_occurs: usize,
+    pub max_occurs: usize,
+    pub required: bool,
+    pub has_default: bool,
+    pub modifiable: bool,
+    pub defaults: Vec<ConfigurationValue>,
+    pub minimum: Option<ConfigurationValue>,
+    pub maximum: Option<ConfigurationValue>,
+    pub regex: Option<regex::Regex>,
+}
+impl ParameterSchema {
+    pub fn scalar(prototype: ConfigurationValue) -> Self {
+        Self {
+            prototype,
+            min_occurs: 1,
+            max_occurs: 1,
+            required: false,
+            has_default: false,
+            modifiable: false,
+            defaults: Vec::new(),
+            minimum: None,
+            maximum: None,
+            regex: None,
+        }
+    }
+    pub fn validate(&self, values: &[ConfigurationValue]) -> bool {
+        (self.min_occurs..=self.max_occurs).contains(&values.len())
+            && values.iter().all(|value| {
+                value.any_type() == self.prototype.any_type()
+                    && !matches!(value, ConfigurationValue::Float(v) if !v.is_finite())
+                    && !matches!(value, ConfigurationValue::Double(v) if !v.is_finite())
+                    && self.minimum.as_ref().is_none_or(|min| value >= min)
+                    && self.maximum.as_ref().is_none_or(|max| value <= max)
+                    && self
+                        .regex
+                        .as_ref()
+                        .is_none_or(|regex| regex.is_match(&value.text()))
+            })
+    }
+}
+pub type ConfigurationSchema = BTreeMap<String, ParameterSchema>;
+
+pub fn parse_initial(
+    schema: &ConfigurationSchema,
+    initial: &[(String, Vec<String>)],
+) -> Result<ConfigurationUpdate, String> {
+    for (name, spec) in schema {
+        if spec.required && !initial.iter().any(|(key, _)| key == name) {
+            return Err(format!(
+                "required configuration parameter {name} is missing"
+            ));
+        }
+    }
+    let mut seen = HashSet::new();
+    initial
+        .iter()
+        .map(|(name, values)| {
+            if !seen.insert(name) {
+                return Err(format!("duplicate configuration parameter {name}"));
+            }
+            let Some(spec) = schema.get(name) else {
+                if schema.is_empty() {
+                    return Ok((
+                        name.clone(),
+                        values
+                            .iter()
+                            .map(|s| ConfigurationValue::infer(s))
+                            .collect(),
+                    ));
+                }
+                return Err(format!("unknown configuration parameter {name}"));
+            };
+            if !(spec.min_occurs..=spec.max_occurs).contains(&values.len()) {
+                return Err(format!("invalid value count for parameter {name}"));
+            }
+            let values = values
+                .iter()
+                .map(|value| {
+                    ConfigurationValue::parse_as(&spec.prototype, value)
+                        .ok_or_else(|| format!("invalid value for parameter {name}: {value}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if !spec.validate(&values) {
+                return Err(format!("value outside constraints for parameter {name}"));
+            }
+            Ok((name.clone(), values))
+        })
+        .collect()
+}
+
 struct ComponentConfiguration {
+    schema: ConfigurationSchema,
     values: BTreeMap<String, Vec<ConfigurationValue>>,
     modifiable: HashSet<String>,
     update: UpdateHandler,
@@ -180,6 +258,7 @@ where
         .insert(
             build_id,
             ComponentConfiguration {
+                schema: ConfigurationSchema::new(),
                 values,
                 modifiable,
                 update: Arc::new(update),
@@ -205,24 +284,36 @@ pub fn register_with_defaults<F>(
 where
     F: Fn(&ConfigurationUpdate) -> Result<(), String> + Send + Sync + 'static,
 {
+    let schema = defaults
+        .iter()
+        .map(|(name, values)| {
+            (
+                name.clone(),
+                ParameterSchema::scalar(
+                    values
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| ConfigurationValue::String(String::new())),
+                ),
+            )
+        })
+        .collect();
+    register_with_schema(build_id, defaults, schema, initial, modifiable, update)
+}
+
+pub fn register_with_schema<F>(
+    build_id: u16,
+    defaults: ConfigurationUpdate,
+    schema: ConfigurationSchema,
+    initial: &[(String, Vec<String>)],
+    modifiable: &[String],
+    update: F,
+) -> Result<(), String>
+where
+    F: Fn(&ConfigurationUpdate) -> Result<(), String> + Send + Sync + 'static,
+{
     let mut values = defaults.into_iter().collect::<BTreeMap<_, _>>();
-    for (name, supplied) in initial {
-        let parsed = if let Some(prototype) = values.get(name).and_then(|values| values.first()) {
-            supplied
-                .iter()
-                .map(|value| {
-                    ConfigurationValue::parse_as(prototype, value)
-                        .unwrap_or_else(|| ConfigurationValue::infer(value))
-                })
-                .collect()
-        } else {
-            supplied
-                .iter()
-                .map(|value| ConfigurationValue::infer(value))
-                .collect()
-        };
-        values.insert(name.clone(), parsed);
-    }
+    values.extend(parse_initial(&schema, initial)?);
     let mut registry = registry()
         .lock()
         .map_err(|_| "configuration registry lock poisoned".to_string())?;
@@ -230,6 +321,7 @@ where
         .insert(
             build_id,
             ComponentConfiguration {
+                schema,
                 values,
                 modifiable: modifiable.iter().cloned().collect(),
                 update: Arc::new(update),
@@ -316,11 +408,16 @@ pub fn update(build_id: u16, updates: ConfigurationUpdate) -> Result<(), String>
                 .values
                 .get(name)
                 .ok_or_else(|| format!("unknown configuration parameter {name}"))?;
+            if let Some(spec) = component.schema.get(name) {
+                if !spec.validate(values) {
+                    return Err(format!("invalid value type or count for parameter {name}"));
+                }
+            }
             let expected_type = current
                 .first()
                 .map(ConfigurationValue::any_type)
                 .or_else(|| values.first().map(ConfigurationValue::any_type));
-            if values.is_empty()
+            if (values.is_empty() && !component.schema.contains_key(name))
                 || expected_type
                     .is_some_and(|expected| values.iter().any(|value| value.any_type() != expected))
             {

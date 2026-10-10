@@ -57,6 +57,7 @@ impl Ord for TimerEntry {
 struct TimerState {
     timers: BinaryHeap<TimerEntry>,
     cancelled: HashSet<usize>,
+    repeating_in_flight: HashSet<usize>,
     next_event_id: usize,
     shutdown: bool,
 }
@@ -71,6 +72,7 @@ fn get_timer_state() -> Arc<(Mutex<TimerState>, Condvar)> {
                 Mutex::new(TimerState {
                     timers: BinaryHeap::new(),
                     cancelled: HashSet::new(),
+                    repeating_in_flight: HashSet::new(),
                     next_event_id: 1,
                     shutdown: false,
                 }),
@@ -85,70 +87,67 @@ static INIT_THREAD: Once = Once::new();
 fn timer_thread() {
     let pair = get_timer_state();
     let mut state = pair.0.lock().unwrap();
-
     loop {
         if state.shutdown {
             break;
         }
-
-        if let Some(mut top) = state.timers.peek().cloned() {
-            if state.cancelled.contains(&top.event_id) {
-                state.timers.pop();
-                state.cancelled.remove(&top.event_id);
-                if let Some(free_cb) = top.free_callback {
-                    drop(state);
-                    free_cb(top.p_user);
-                    state = pair.0.lock().unwrap();
-                }
-                continue;
-            }
-
-            let now_micros = SystemTime::now()
+        let now = || {
+            SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_micros() as u64;
-
-            if top.expire_time_micros <= now_micros {
-                // Fire timer
-                state.timers.pop(); // Remove from queue
-
-                // Drop lock while calling callback
-                drop(state);
-                (top.callback)(
-                    top.event_id,
-                    top.expire_time_micros,
-                    top.schedule_time_micros,
-                    now_micros, // fire_time
-                    top.arg,
-                    top.p_user,
-                );
-
-                // Re-acquire lock
-                state = pair.0.lock().unwrap();
-
-                // If interval > 0, re-schedule
-                if top.interval_micros > 0 && !state.cancelled.contains(&top.event_id) {
-                    top.schedule_time_micros = now_micros;
-                    top.expire_time_micros = now_micros + top.interval_micros;
-                    state.timers.push(top);
-                } else {
-                    state.cancelled.remove(&top.event_id);
-                    if let Some(free_cb) = top.free_callback {
-                        drop(state);
-                        free_cb(top.p_user);
-                        state = pair.0.lock().unwrap();
-                    }
-                }
-            } else {
-                // Wait until expiration
-                let wait_dur = Duration::from_micros(top.expire_time_micros - now_micros);
-                let (new_state, _timeout_result) = pair.1.wait_timeout(state, wait_dur).unwrap();
-                state = new_state;
-            }
-        } else {
-            // No timers, wait for new ones
+                .as_micros() as u64
+        };
+        let Some(top) = state.timers.peek() else {
             state = pair.1.wait(state).unwrap();
+            continue;
+        };
+        let collected_at = now();
+        if top.expire_time_micros > collected_at {
+            let wait = Duration::from_micros(top.expire_time_micros - collected_at);
+            state = pair.1.wait_timeout(state, wait).unwrap().0;
+            continue;
         }
+        // Snapshot all expired timers before rearming any periodic timer. The
+        // original scheduler runs this entire batch before collecting another.
+        let mut expired = Vec::new();
+        while state
+            .timers
+            .peek()
+            .is_some_and(|t| t.expire_time_micros <= collected_at)
+        {
+            expired.push(state.timers.pop().unwrap());
+        }
+        for timer in &expired {
+            if timer.interval_micros != 0 {
+                state.repeating_in_flight.insert(timer.event_id);
+                let mut next = timer.clone();
+                next.expire_time_micros =
+                    next.expire_time_micros.saturating_add(next.interval_micros);
+                next.schedule_time_micros = collected_at;
+                state.timers.push(next);
+            }
+        }
+        drop(state);
+        for timer in expired {
+            (timer.callback)(
+                timer.event_id,
+                timer.expire_time_micros,
+                timer.schedule_time_micros,
+                now(),
+                timer.arg,
+                timer.p_user,
+            );
+            state = pair.0.lock().unwrap();
+            state.repeating_in_flight.remove(&timer.event_id);
+            let release = timer.interval_micros == 0 || state.cancelled.remove(&timer.event_id);
+            drop(state);
+            if release {
+                if let Some(free) = timer.free_callback {
+                    free(timer.p_user);
+                }
+            }
+        }
+        state = pair.0.lock().unwrap();
     }
 }
 
@@ -208,10 +207,33 @@ pub extern "C" fn emane_rs_timer_cancel(event_id: usize) -> bool {
     let pair = get_timer_state();
     let mut state = pair.0.lock().unwrap();
 
-    state.cancelled.insert(event_id);
-    // Notify thread so that it can remove the cancelled timer immediately if it was the head
-    pair.1.notify_one();
-    true
+    // Cancelled far-future timers must release their owned callback data now,
+    // even when an earlier periodic timer remains at the head of the queue.
+    let mut removed = None;
+    state.timers.retain(|entry| {
+        if entry.event_id == event_id {
+            removed = Some(entry.clone());
+            false
+        } else {
+            true
+        }
+    });
+    if let Some(entry) = removed {
+        pair.1.notify_one();
+        // An expired callback still runs even if its next interval is cancelled.
+        // Keep its owned data alive until that callback has returned.
+        if state.repeating_in_flight.contains(&event_id) {
+            state.cancelled.insert(event_id);
+        } else {
+            drop(state);
+            if let Some(free) = entry.free_callback {
+                free(entry.p_user);
+            }
+        }
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -277,6 +299,35 @@ mod tests {
         unsafe {
             let _ = Box::from_raw(arg as *mut mpsc::Sender<usize>);
         }
+    }
+
+    #[test]
+    fn cancellation_releases_later_timers_and_rejects_unknown_ids() {
+        let early = emane_rs_timer_schedule(
+            now_micros() + 60_000_000,
+            1_000_000,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            test_callback,
+            None,
+        );
+        for _ in 0..1000 {
+            let flag = Arc::new(AtomicBool::new(false));
+            let user = Box::into_raw(Box::new(flag.clone()));
+            let later = emane_rs_timer_schedule(
+                now_micros() + 3_600_000_000,
+                0,
+                std::ptr::null(),
+                user.cast(),
+                test_callback,
+                Some(test_free_callback),
+            );
+            assert!(emane_rs_timer_cancel(later));
+            assert!(flag.load(Ordering::SeqCst));
+            assert!(!emane_rs_timer_cancel(later));
+        }
+        assert!(emane_rs_timer_cancel(early));
+        assert!(!emane_rs_timer_cancel(usize::MAX));
     }
 
     #[test]
@@ -403,5 +454,229 @@ mod tests {
         unsafe {
             let _ = Box::from_raw(arg as *mut mpsc::Sender<usize>);
         }
+    }
+}
+
+#[cfg(test)]
+mod schedule_regressions {
+    use super::*;
+    use std::sync::mpsc;
+    struct Probe {
+        sender: mpsc::Sender<u64>,
+        count: usize,
+    }
+    extern "C" fn callback(
+        id: usize,
+        expire: u64,
+        _: u64,
+        _: u64,
+        _: *const c_void,
+        user: *mut c_void,
+    ) {
+        let probe = unsafe { &mut *(user as *mut Probe) };
+        probe.count += 1;
+        if probe.count == 1 {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if probe.count == 3 {
+            emane_rs_timer_cancel(id);
+        }
+        let _ = probe.sender.send(expire);
+    }
+    extern "C" fn free(user: *mut c_void) {
+        unsafe {
+            drop(Box::from_raw(user as *mut Probe));
+        }
+    }
+    #[test]
+    fn late_callbacks_preserve_the_original_expiration_sequence() {
+        let (sender, receiver) = mpsc::channel();
+        let user = Box::into_raw(Box::new(Probe { sender, count: 0 }));
+        let start = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64
+            + 5_000;
+        emane_rs_timer_schedule(
+            start,
+            5_000,
+            std::ptr::null(),
+            user.cast(),
+            callback,
+            Some(free),
+        );
+        for n in 0..3 {
+            assert_eq!(
+                receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+                start + n * 5_000
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod batch_regressions {
+    use super as timer;
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    use std::sync::Mutex;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    static ENTERED: AtomicBool = AtomicBool::new(false);
+    static RELEASE: AtomicBool = AtomicBool::new(false);
+    static REPEATS: AtomicUsize = AtomicUsize::new(0);
+    static TRACE: Mutex<String> = Mutex::new(String::new());
+
+    extern "C" fn blocker(_: usize, _: u64, _: u64, _: u64, _: *const c_void, _: *mut c_void) {
+        ENTERED.store(true, SeqCst);
+        while !RELEASE.load(SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+
+    extern "C" fn a(id: usize, _: u64, _: u64, _: u64, _: *const c_void, _: *mut c_void) {
+        TRACE.lock().unwrap().push('A');
+        if REPEATS.fetch_add(1, SeqCst) == 2 {
+            timer::emane_rs_timer_cancel(id);
+        }
+    }
+
+    extern "C" fn b(_: usize, _: u64, _: u64, _: u64, _: *const c_void, _: *mut c_void) {
+        TRACE.lock().unwrap().push('B');
+    }
+
+    #[test]
+    fn overdue_callbacks_run_in_original_batch_order() {
+        let now = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64
+        };
+        let schedule = |time, interval, callback| {
+            timer::emane_rs_timer_schedule(
+                time,
+                interval,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                callback,
+                None,
+            )
+        };
+        schedule(now(), 0, blocker);
+        while !ENTERED.load(SeqCst) {
+            std::thread::yield_now();
+        }
+        let start = now();
+        schedule(start - 100_000, 10_000, a);
+        schedule(start - 50_000, 0, b);
+        RELEASE.store(true, SeqCst);
+        for _ in 0..1000 {
+            let trace = TRACE.lock().unwrap().clone();
+            if trace.len() == 4 {
+                assert_eq!(trace, "ABAA");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("timer probe timed out");
+    }
+}
+
+#[cfg(test)]
+mod batch_ownership_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    use std::sync::mpsc;
+
+    struct Context {
+        release: (Mutex<bool>, Condvar),
+        entered: mpsc::Sender<()>,
+        target: AtomicUsize,
+        cancelled: AtomicBool,
+        fired: AtomicBool,
+        freed: AtomicBool,
+    }
+    extern "C" fn block(_: usize, _: u64, _: u64, _: u64, arg: *const c_void, _: *mut c_void) {
+        let ctx = unsafe { &*(arg as *const Context) };
+        ctx.entered.send(()).unwrap();
+        let mut release = ctx.release.0.lock().unwrap();
+        while !*release {
+            release = ctx.release.1.wait(release).unwrap();
+        }
+    }
+    extern "C" fn cancel_next(
+        _: usize,
+        _: u64,
+        _: u64,
+        _: u64,
+        arg: *const c_void,
+        _: *mut c_void,
+    ) {
+        let ctx = unsafe { &*(arg as *const Context) };
+        ctx.cancelled
+            .store(emane_rs_timer_cancel(ctx.target.load(SeqCst)), SeqCst);
+    }
+    extern "C" fn target(_: usize, _: u64, _: u64, _: u64, _: *const c_void, user: *mut c_void) {
+        let ctx = unsafe { &*(user as *const Arc<Context>) };
+        assert!(
+            !ctx.freed.load(SeqCst),
+            "cancel must not free a callback already in the expired batch"
+        );
+        ctx.fired.store(true, SeqCst);
+    }
+    extern "C" fn free(user: *mut c_void) {
+        let ctx = unsafe { Box::from_raw(user as *mut Arc<Context>) };
+        assert!(ctx.fired.load(SeqCst));
+        ctx.freed.store(true, SeqCst);
+    }
+    #[test]
+    fn cancellation_keeps_expired_periodic_callback_data_alive() {
+        let (send, receive) = mpsc::channel();
+        let ctx = Arc::new(Context {
+            release: (Mutex::new(false), Condvar::new()),
+            entered: send,
+            target: AtomicUsize::new(0),
+            cancelled: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+            freed: AtomicBool::new(false),
+        });
+        let ptr = Arc::as_ptr(&ctx).cast();
+        let now = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64
+        };
+        emane_rs_timer_schedule(now(), 0, ptr, std::ptr::null_mut(), block, None);
+        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        let start = now();
+        emane_rs_timer_schedule(
+            start - 100_000,
+            0,
+            ptr,
+            std::ptr::null_mut(),
+            cancel_next,
+            None,
+        );
+        let owned = Box::into_raw(Box::new(ctx.clone())).cast();
+        let id = emane_rs_timer_schedule(
+            start - 50_000,
+            1_000_000,
+            std::ptr::null(),
+            owned,
+            target,
+            Some(free),
+        );
+        ctx.target.store(id, SeqCst);
+        *ctx.release.0.lock().unwrap() = true;
+        ctx.release.1.notify_one();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !ctx.freed.load(SeqCst) && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(ctx.freed.load(SeqCst));
+        assert!(ctx.cancelled.load(SeqCst));
+        assert!(!emane_rs_timer_cancel(id));
     }
 }

@@ -1,3 +1,4 @@
+use emane_plugin_api::numeric::LegacyParse;
 use prost::Message;
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -63,13 +64,13 @@ impl LocationLoader {
                 return Err("LoaderLocation gps expected 4 params".to_string());
             }
             let lat: f64 = params[0]
-                .parse()
+                .parse_legacy()
                 .map_err(|e| format!("EELEventGenerator: Parameter conversion error. {}", e))?;
             let lon: f64 = params[1]
-                .parse()
+                .parse_legacy()
                 .map_err(|e| format!("EELEventGenerator: Parameter conversion error. {}", e))?;
             let alt: f64 = params[2]
-                .parse()
+                .parse_legacy()
                 .map_err(|e| format!("EELEventGenerator: Parameter conversion error. {}", e))?;
             let alt_type = params[3];
             if alt_type != "msl" && alt_type != "agl" {
@@ -94,13 +95,13 @@ impl LocationLoader {
                 return Err("EELLoaderLocation orientation expects 4 params".to_string());
             }
             let pitch: f64 = params[0]
-                .parse()
+                .parse_legacy()
                 .map_err(|e| format!("EELEventGenerator: Parameter conversion error. {}", e))?;
             let roll: f64 = params[1]
-                .parse()
+                .parse_legacy()
                 .map_err(|e| format!("EELEventGenerator: Parameter conversion error. {}", e))?;
             let yaw: f64 = params[2]
-                .parse()
+                .parse_legacy()
                 .map_err(|e| format!("EELEventGenerator: Parameter conversion error. {}", e))?;
             let type_str = params[3];
             if type_str != "degrees" && type_str != "relative" {
@@ -125,13 +126,13 @@ impl LocationLoader {
                 return Err("EELLoaderLocation velocity expects 4 params".to_string());
             }
             let azimuth: f64 = params[0]
-                .parse()
+                .parse_legacy()
                 .map_err(|e| format!("EELEventGenerator: Parameter conversion error. {}", e))?;
             let elevation: f64 = params[1]
-                .parse()
+                .parse_legacy()
                 .map_err(|e| format!("EELEventGenerator: Parameter conversion error. {}", e))?;
             let magnitude: f64 = params[2]
-                .parse()
+                .parse_legacy()
                 .map_err(|e| format!("EELEventGenerator: Parameter conversion error. {}", e))?;
             let type_str = params[3];
             if type_str != "degrees"

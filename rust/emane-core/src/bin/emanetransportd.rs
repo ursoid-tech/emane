@@ -5,7 +5,6 @@ use emane_core::xml_parser::{parse_layer, parse_params, ParamMap};
 use roxmltree::Document;
 use std::collections::HashSet;
 use std::env;
-use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,11 +58,20 @@ fn run() -> Result<(), String> {
     }
     let config = config.ok_or_else(|| "missing CONFIG_URL".to_string())?;
     let config_path = Path::new(&config);
-    let content = fs::read_to_string(config_path)
+    let content = emane_plugin_api::xml_document::read(config_path)
         .map_err(|error| format!("failed to read {config}: {error}"))?;
-    let document =
-        Document::parse(&content).map_err(|error| format!("failed to parse {config}: {error}"))?;
+    let document = Document::parse_with_options(
+        &content,
+        roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|error| format!("failed to parse {config}: {error}"))?;
     let root = document.root_element();
+    if !emane_plugin_api::xml_document::has_doctype(&content) {
+        emane_core::xml_contract::validate(root, false)?;
+    }
     if !root.has_tag_name("transportdaemon") {
         return Err("configuration root must be transportdaemon".to_string());
     }

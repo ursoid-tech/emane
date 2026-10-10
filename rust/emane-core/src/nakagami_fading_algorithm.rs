@@ -1,9 +1,8 @@
-use rand::rngs::StdRng;
-use rand::SeedableRng;
-use rand_distr::{Distribution, Gamma};
+use emane_plugin_api::random::{LegacyNormal, LegacyRandom};
 
 pub struct NakagamiFadingAlgorithm {
-    rng: StdRng,
+    rng: LegacyRandom,
+    distribution: LegacyNormal,
 }
 
 impl Default for NakagamiFadingAlgorithm {
@@ -15,7 +14,8 @@ impl Default for NakagamiFadingAlgorithm {
 impl NakagamiFadingAlgorithm {
     pub fn new() -> Self {
         Self {
-            rng: StdRng::from_entropy(),
+            rng: LegacyRandom::seeded(5489),
+            distribution: LegacyNormal::default(),
         }
     }
 
@@ -41,8 +41,7 @@ impl NakagamiFadingAlgorithm {
         let mw = 10_f64.powf(power_dbm / 10.0);
         let scale = mw / m;
 
-        let gamma = Gamma::new(m, scale).unwrap();
-        gamma.sample(&mut self.rng)
+        self.distribution.gamma(&mut self.rng, m, scale)
     }
 }
 

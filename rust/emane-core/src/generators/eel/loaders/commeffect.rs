@@ -1,3 +1,4 @@
+use emane_plugin_api::numeric::LegacyParse;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
@@ -43,7 +44,7 @@ impl CommEffectLoader {
                 let dst_nem: u16;
                 if let Some(idx) = dst_nem_str.find(':') {
                     if &dst_nem_str[..idx] == "nem" {
-                        dst_nem = dst_nem_str[idx + 1..].parse::<u16>().map_err(|e| {
+                        dst_nem = dst_nem_str[idx + 1..].parse_legacy::<u16>().map_err(|e| {
                             format!("LoaderCommEffect loader: Parameter conversion error. {}", e)
                         })?;
                     } else {
@@ -56,22 +57,22 @@ impl CommEffectLoader {
                     );
                 }
 
-                let latency = params[1].parse::<f32>().map_err(|e| {
+                let latency = params[1].parse_legacy::<f32>().map_err(|e| {
                     format!("LoaderCommEffect loader: Parameter conversion error. {}", e)
                 })?;
-                let jitter = params[2].parse::<f32>().map_err(|e| {
+                let jitter = params[2].parse_legacy::<f32>().map_err(|e| {
                     format!("LoaderCommEffect loader: Parameter conversion error. {}", e)
                 })?;
-                let loss = params[3].parse::<f32>().map_err(|e| {
+                let loss = params[3].parse_legacy::<f32>().map_err(|e| {
                     format!("LoaderCommEffect loader: Parameter conversion error. {}", e)
                 })?;
-                let duplicates = params[4].parse::<f32>().map_err(|e| {
+                let duplicates = params[4].parse_legacy::<f32>().map_err(|e| {
                     format!("LoaderCommEffect loader: Parameter conversion error. {}", e)
                 })?;
-                let unicast = params[5].parse::<u64>().map_err(|e| {
+                let unicast = params[5].parse_legacy::<u64>().map_err(|e| {
                     format!("LoaderCommEffect loader: Parameter conversion error. {}", e)
                 })?;
-                let broadcast = params[6].parse::<u64>().map_err(|e| {
+                let broadcast = params[6].parse_legacy::<u64>().map_err(|e| {
                     format!("LoaderCommEffect loader: Parameter conversion error. {}", e)
                 })?;
 

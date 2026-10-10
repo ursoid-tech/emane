@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 emane-plugin-api = { path = "../emane-plugin-api" }
 rand = "0.8"
-rand_distr = "0.4"
 regex = "1.10"
 roxmltree = "0.19"
 prost = "0.12"

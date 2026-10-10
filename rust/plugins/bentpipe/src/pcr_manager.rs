@@ -1,6 +1,6 @@
+use emane_plugin_api::numeric::LegacyParse;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CStr;
-use std::fs;
 use std::os::raw::{c_char, c_void};
 
 pub struct PCRManager {
@@ -24,18 +24,29 @@ impl PCRManager {
 
     pub fn load(&mut self, file_name: &str) -> Result<(), String> {
         let file_name = file_name.strip_prefix("file://").unwrap_or(file_name);
-        let content =
-            fs::read_to_string(file_name).map_err(|e| format!("Failed to read file: {}", e))?;
-        let doc = roxmltree::Document::parse(&content)
-            .map_err(|e| format!("Failed to parse XML: {}", e))?;
+        let content = emane_plugin_api::xml_document::read(file_name)
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+        let doc = roxmltree::Document::parse_with_options(
+            &content,
+            roxmltree::ParsingOptions {
+                allow_dtd: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| format!("Failed to parse XML: {}", e))?;
 
         let root = doc.root_element();
         if root.tag_name().name() != "bentpipe-model-pcr" {
             return Err("Invalid root element, expected bentpipe-model-pcr".to_string());
         }
 
+        emane_plugin_api::pcr_validation::validate(root, "curve", "index")?;
+
         if let Some(packet_size) = root.attribute("packetsize") {
-            self.modifier_length_bytes = packet_size.parse().map_err(|_| "Invalid packetsize")?;
+            self.modifier_length_bytes = packet_size
+                .parse_legacy::<u16>()
+                .map_err(|_| "Invalid packetsize")?
+                as usize;
         } else {
             return Err("Missing packetsize attribute".to_string());
         }
@@ -44,7 +55,9 @@ impl PCRManager {
 
         for curve_node in root.children().filter(|n| n.has_tag_name("curve")) {
             let index_str = curve_node.attribute("index").ok_or("Missing curve index")?;
-            let index: u16 = index_str.parse().map_err(|_| "Invalid curve index")?;
+            let index: u16 = index_str
+                .parse_legacy()
+                .map_err(|_| "Invalid curve index")?;
 
             let mut curve = BTreeMap::new();
             let mut min_scaled_sinr = i32::MAX;
@@ -58,10 +71,10 @@ impl PCRManager {
 
                 let scaled_sinr = scale_float_to_integer(sinr_str)?;
                 let por: f32 = por_str
-                    .parse::<f32>()
+                    .parse_legacy::<f32>()
                     .map_err(|_| "Invalid por attribute")?;
-                if !por.is_finite() || !(0.0..=100.0).contains(&por) {
-                    return Err("POR must be finite and in the range 0 through 100".to_string());
+                if !por.is_finite() || por < 0.0 {
+                    return Err("POR must be finite and nonnegative".to_string());
                 }
                 let por = por / 100.0;
 
@@ -93,7 +106,7 @@ impl PCRManager {
             }
 
             for (k, v) in interpolation {
-                curve.insert(k, v);
+                curve.entry(k).or_insert(v);
             }
 
             if self
@@ -150,27 +163,7 @@ impl PCRManager {
 }
 
 fn scale_float_to_integer(value: &str) -> Result<i32, String> {
-    let scale_factor = 2;
-    let mut tmp = value.to_string();
-
-    if let Some(index_point) = tmp.find('.') {
-        let num_digits_after = tmp.len() - index_point - 1;
-        if num_digits_after > scale_factor {
-            let insert_pos = tmp.len() - (num_digits_after - scale_factor);
-            tmp.insert(insert_pos, '.');
-        } else {
-            tmp.push_str(&"0".repeat(scale_factor - num_digits_after));
-        }
-        tmp.remove(index_point);
-    } else {
-        tmp.push_str(&"0".repeat(scale_factor));
-    }
-
-    // Equivalent of strtol truncation in C++
-    let val_str = tmp.split('.').next().unwrap_or(&tmp);
-    val_str
-        .parse::<i32>()
-        .map_err(|_| format!("Invalid sinr value: {}", value))
+    emane_plugin_api::pcr_validation::scaled_sinr(value)
 }
 
 #[no_mangle]
