@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -98,8 +98,8 @@ impl NeighborData {
 
 pub struct NeighborMetricManager {
     _nem_id: u16,
-    r2ri_metric_table: HashMap<u16, Box<NeighborData>>,
-    neighbor_data_table: HashMap<u16, (Box<NeighborData>, Box<NeighborData>)>,
+    r2ri_metric_table: BTreeMap<u16, Box<NeighborData>>,
+    neighbor_data_table: BTreeMap<u16, (Box<NeighborData>, Box<NeighborData>)>,
     neighbor_delete_age_microseconds: Duration,
     last_neighbor_status_update_time: Duration,
 }
@@ -108,8 +108,8 @@ impl NeighborMetricManager {
     pub fn new(nem_id: u16) -> Self {
         Self {
             _nem_id: nem_id,
-            r2ri_metric_table: HashMap::new(),
-            neighbor_data_table: HashMap::new(),
+            r2ri_metric_table: BTreeMap::new(),
+            neighbor_data_table: BTreeMap::new(),
             neighbor_delete_age_microseconds: Duration::from_secs(60),
             last_neighbor_status_update_time: Duration::default(),
         }
@@ -171,7 +171,7 @@ impl NeighborMetricManager {
             if age > self.neighbor_delete_age_microseconds {
                 to_remove.push(nem_id);
             } else {
-                let (sinr_avg, sinr_std) =
+                let (sinr_avg, _) =
                     get_avg_and_std(data.sinr_sum, data.sinr_sum2, data.num_rx_frames);
                 let (nf_avg, nf_std) = get_avg_and_std(
                     data.noise_floor_sum,
@@ -186,7 +186,9 @@ impl NeighborMetricManager {
                     num_rx_missed_frames: data.num_rx_missed_frames,
                     rx_utilization_microseconds: data.rx_utilization_microseconds,
                     sinr_avg: sinr_avg as f32,
-                    sinr_std: sinr_std as f32,
+                    // The original R2RINeighborMetric::getSINRStddev accessor
+                    // returns the noise-floor deviation, including on the wire.
+                    sinr_std: nf_std as f32,
                     noise_floor_avg: nf_avg as f32,
                     noise_floor_stdv: nf_std as f32,
                     rx_data_rate_avg: data.rx_data_rate_avg,
@@ -409,7 +411,9 @@ fn update_running_average(avg: &mut u64, count: u64, val: u64) {
     if count == 1 {
         *avg = val;
     } else {
-        *avg = ((*avg * (count - 1)) + val) / count;
+        // Preserve the original manager's count weighting (count has already
+        // been incremented), including unsigned arithmetic semantics.
+        *avg = avg.wrapping_mul(count).wrapping_add(val) / count.wrapping_add(1);
     }
 }
 
@@ -429,9 +433,11 @@ fn get_avg_and_std(sum: f64, sum2: f64, count: u64) -> (f64, f64) {
     let avg = sum / (count as f64);
     let mut std = 0.0;
     if count > 1 {
-        let delta = sum2 - (sum * sum) / (count as f64);
+        // This intentionally matches the legacy statistic, rather than the
+        // conventional sample standard deviation.
+        let delta = sum2 - (sum * sum);
         if delta > 0.0 {
-            std = (delta / (count as f64 - 1.0)).sqrt();
+            std = (delta / count as f64).sqrt() / (count as f64 - 1.0);
         }
     }
     (avg, std)
@@ -697,6 +703,88 @@ pub extern "C" fn emane_rs_neighbor_metric_manager_free_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r2ri_sinr_deviation_matches_original_accessor_without_changing_statistics() {
+        let mut manager = NeighborMetricManager::new(1);
+        for (sequence, sinr, noise) in [(1, -10.0, -4.0), (2, 10.0, 4.0)] {
+            manager.handle_rx_activity(
+                2,
+                sequence,
+                &[1; 16],
+                sinr,
+                noise,
+                Duration::from_secs(sequence),
+                Duration::from_micros(100),
+                1_000_000,
+            );
+        }
+        let status = manager.get_neighbor_metric_status(2).unwrap();
+        assert_eq!(status.sinr_std, 10.0);
+        assert_eq!(status.noise_floor_stdv, 4.0);
+        let metrics = manager.get_neighbor_metrics(Duration::from_secs(3));
+        assert_eq!(metrics[0].sinr_std, 4.0);
+        assert_eq!(metrics[0].noise_floor_stdv, 4.0);
+    }
+
+    #[test]
+    fn neighbor_reports_preserve_original_id_order_across_intervals() {
+        let mut manager = NeighborMetricManager::new(1);
+        for id in [65535, 3, 19, 2] {
+            manager.handle_rx_activity(
+                id,
+                1,
+                &[1; 16],
+                40.0,
+                -110.0,
+                Duration::from_secs(1),
+                Duration::from_micros(100),
+                1_000_000,
+            );
+        }
+        for now in [2, 3] {
+            let ids: Vec<_> = manager
+                .get_neighbor_metrics(Duration::from_secs(now))
+                .iter()
+                .map(|v| v.neighbor_id)
+                .collect();
+            assert_eq!(ids, [2, 3, 19, 65535]);
+            let ids: Vec<_> = manager
+                .get_neighbor_statuses(Duration::from_secs(now))
+                .iter()
+                .map(|v| v.neighbor_id)
+                .collect();
+            assert_eq!(ids, [2, 3, 19, 65535]);
+        }
+    }
+
+    #[test]
+    fn varying_rates_and_sinr_preserve_original_neighbor_statistics() {
+        let mut manager = NeighborMetricManager::new(1);
+        for (sequence, rate, sinr) in [(0, 1_000_000, 40.0), (1, 2_000_000, 53.0)] {
+            manager.handle_rx_activity(
+                2,
+                sequence,
+                &[1; 16],
+                sinr,
+                -110.0,
+                Duration::from_secs(sequence + 1),
+                Duration::from_micros(100),
+                rate,
+            );
+            manager.handle_tx_activity(2, rate, Duration::from_secs(sequence + 1));
+        }
+        let status = manager.get_neighbor_metric_status(2).unwrap();
+        assert_eq!(status.rx_data_rate_avg, 1_333_333);
+        assert_eq!(status.tx_data_rate_avg, 1_333_333);
+        assert_eq!(status.sinr_avg, 46.5);
+        assert_eq!(status.sinr_std, 0.0);
+        let metrics = manager.get_neighbor_metrics(Duration::from_secs(3));
+        assert_eq!(metrics[0].rx_data_rate_avg, 1_333_333);
+        assert_eq!(metrics[0].sinr_std, 0.0);
+        // C++'s unusual deviation expression also has a nonzero branch.
+        assert_eq!(get_avg_and_std(0.0, 200.0, 2), (0.0, 10.0));
+    }
 
     #[test]
     fn neighbor_status_uses_interval_data_without_clearing_long_term_metrics() {

@@ -1,5 +1,6 @@
 use libc::{ifreq, IFF_NOARP, IFF_NO_PI, IFF_TAP, IFF_UP};
-use std::os::unix::io::RawFd;
+use std::net::IpAddr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 // TUNSETIFF is 0x400454ca on Linux
 const TUNSETIFF: u64 = 0x400454ca;
@@ -32,7 +33,7 @@ impl TunTap {
         }
         ifr.ifr_ifru.ifru_flags = (IFF_NO_PI | IFF_TAP) as libc::c_short;
 
-        if unsafe { libc::ioctl(fd, TUNSETIFF, &ifr) } < 0 {
+        if unsafe { libc::ioctl(fd, TUNSETIFF, &mut ifr) } < 0 {
             let err = std::io::Error::last_os_error();
             unsafe {
                 libc::close(fd);
@@ -46,7 +47,7 @@ impl TunTap {
             unsafe { libc::close(fd) };
             return Err(err);
         }
-        if unsafe { libc::ioctl(ctrl_sock, SIOCGIFINDEX, &ifr) } < 0 {
+        if unsafe { libc::ioctl(ctrl_sock, SIOCGIFINDEX, &mut ifr) } < 0 {
             let err = std::io::Error::last_os_error();
             unsafe {
                 libc::close(ctrl_sock);
@@ -78,6 +79,84 @@ impl TunTap {
         self.set_flags(IFF_UP, -1)
     }
 
+    pub fn set_addr(&self, address: IpAddr, mask: IpAddr) -> std::io::Result<()> {
+        let family = if address.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
+        let fd = unsafe { libc::socket(family, libc::SOCK_DGRAM, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+        match (address, mask) {
+            (IpAddr::V4(address), mask) => {
+                // The original reads the IPv4 mask from sockaddr offset 4.
+                // For an IPv6 configuration value this is its zero flowinfo.
+                let mask = match mask {
+                    IpAddr::V4(mask) => mask,
+                    IpAddr::V6(_) => std::net::Ipv4Addr::UNSPECIFIED,
+                };
+                for (request, value) in [(libc::SIOCSIFADDR, address), (libc::SIOCSIFNETMASK, mask)]
+                {
+                    let mut ifr: ifreq = unsafe { std::mem::zeroed() };
+                    for (index, byte) in self.name.bytes().take(libc::IFNAMSIZ - 1).enumerate() {
+                        ifr.ifr_name[index] = byte as libc::c_char;
+                    }
+                    let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                    sockaddr.sin_family = libc::AF_INET as libc::sa_family_t;
+                    sockaddr.sin_addr.s_addr = u32::from_ne_bytes(value.octets());
+                    // Linux ifreq stores sockaddr_in in its sockaddr union member.
+                    ifr.ifr_ifru.ifru_addr = unsafe {
+                        std::mem::transmute::<libc::sockaddr_in, libc::sockaddr>(sockaddr)
+                    };
+                    if unsafe { libc::ioctl(socket.as_raw_fd(), request, &ifr) } < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+            }
+            (IpAddr::V6(address), IpAddr::V6(mask)) => {
+                #[repr(C)]
+                struct In6Ifreq {
+                    address: libc::in6_addr,
+                    prefix_len: u32,
+                    index: i32,
+                }
+                // Match the original get_prefixlen, including noncontiguous masks:
+                // count full bytes, then through the final set bit of the next byte.
+                let mut prefix_len = 0;
+                for byte in mask.octets() {
+                    if byte == 255 {
+                        prefix_len += 8;
+                    } else {
+                        if byte != 0 {
+                            prefix_len += 8 - byte.trailing_zeros();
+                        }
+                        break;
+                    }
+                }
+                let request = In6Ifreq {
+                    address: libc::in6_addr {
+                        s6_addr: address.octets(),
+                    },
+                    prefix_len,
+                    index: self.index,
+                };
+                if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCSIFADDR, &request) } < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "address and mask families differ",
+                ))
+            }
+        }
+        Ok(())
+    }
+
     fn get_flags(&self) -> std::io::Result<i32> {
         let ctrl_sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
         if ctrl_sock < 0 {
@@ -89,7 +168,7 @@ impl TunTap {
         for (index, byte) in name_bytes.iter().copied().enumerate().take(len) {
             ifr.ifr_name[index] = byte as libc::c_char;
         }
-        if unsafe { libc::ioctl(ctrl_sock, SIOCGIFFLAGS, &ifr) } < 0 {
+        if unsafe { libc::ioctl(ctrl_sock, SIOCGIFFLAGS, &mut ifr) } < 0 {
             let err = std::io::Error::last_os_error();
             unsafe {
                 libc::close(ctrl_sock);

@@ -1,5 +1,5 @@
 use roxmltree::{Document, Node};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 #[cfg(test)]
 use std::fs;
 use std::path::Path;
@@ -9,7 +9,9 @@ pub struct ParamValues {
     pub values: Vec<String>,
 }
 
-pub type ParamMap = HashMap<String, ParamValues>;
+// Original XML configuration emits parameters in name order. Some component
+// setters normalize related values as they are applied, so order is observable.
+pub type ParamMap = BTreeMap<String, ParamValues>;
 
 #[derive(Debug, Clone)]
 pub struct LayerConfig {
@@ -365,6 +367,22 @@ pub fn parse_platform(file_path: &Path) -> Result<PlatformConfig, ConfigurationE
 #[cfg(test)]
 mod legacy_regressions {
     use super::*;
+    #[test]
+    fn configuration_parameters_follow_original_name_order() {
+        let doc = Document::parse(
+            "<phy><param name='fading.lognormal.minpathloss' value='45'/><param name='fading.lognormal.maxpathloss' value='-5'/></phy>",
+        )
+        .unwrap();
+        let parameters = parse_params(doc.root_element()).unwrap();
+        assert_eq!(
+            parameters.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "fading.lognormal.maxpathloss",
+                "fading.lognormal.minpathloss"
+            ]
+        );
+    }
+
     #[test]
     fn platform_accepts_legacy_doctype() {
         let path = std::env::temp_dir().join(format!("emane-doctype-{}.xml", std::process::id()));

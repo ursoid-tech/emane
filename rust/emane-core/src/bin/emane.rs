@@ -19,6 +19,7 @@ extern "C" fn handle_shutdown(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::Relaxed);
 }
 
+// Original Application::Main handles INT and QUIT; TERM retains its default action.
 fn install_signal_handlers() {
     unsafe {
         libc::signal(
@@ -26,7 +27,7 @@ fn install_signal_handlers() {
             handle_shutdown as *const () as libc::sighandler_t,
         );
         libc::signal(
-            libc::SIGTERM,
+            libc::SIGQUIT,
             handle_shutdown as *const () as libc::sighandler_t,
         );
     }

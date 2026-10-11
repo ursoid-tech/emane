@@ -1487,6 +1487,12 @@ mod tests {
             update_neighbor_tx: capture_neighbor_tx,
             update_neighbor_rx: capture_neighbor_rx,
             update_neighbor_status: capture_neighbor_status,
+            register_queue_metric: {
+                extern "C" fn register(_: *mut c_void, _: u16, _: u32) -> bool {
+                    true
+                }
+                register
+            },
             update_queue_metric: capture_queue,
             publish_r2ri: capture_publish,
             register_rf_signal_table: capture_register_rf,

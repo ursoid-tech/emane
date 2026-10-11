@@ -50,7 +50,7 @@ impl FlowControlClient {
         }
 
         if state.cancel {
-            (0, false)
+            (state.tokens_available, false)
         } else {
             state.tokens_available -= 1;
             (state.tokens_available, true)
@@ -129,5 +129,22 @@ pub extern "C" fn emane_rs_flow_control_client_process_message(
 ) {
     if let Some(client) = unsafe { ptr.as_ref() } {
         client.process_flow_control_message(tokens);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    extern "C" fn ignore(_: *mut std::ffi::c_void, _: u16) {}
+    #[test]
+    fn cancellation_preserves_available_count_across_restart() {
+        let client = FlowControlClient::new(std::ptr::null_mut(), ignore);
+        client.process_flow_control_message(3);
+        assert_eq!(client.remove_token(), (2, true));
+        client.stop();
+        assert_eq!(client.remove_token(), (2, false));
+        client.start();
+        client.process_flow_control_message(5);
+        assert_eq!(client.remove_token(), (5, false));
     }
 }

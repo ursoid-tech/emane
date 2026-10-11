@@ -341,10 +341,9 @@ fn pre_delay_matches_legacy_conditional_overhead_subtraction() {
 }
 
 #[test]
-fn queue_samples_transmission_delay_and_clears_discard_interval() {
+fn queue_samples_transmission_delay_with_original_zero_discard_metric() {
     let capture = Mutex::new(Capture::default());
     let mac = mac(&capture);
-    mac.state.lock().unwrap().queue_discards[0] = 3;
     let header = ModelHeader {
         registration_id: MAC_REGISTRATION_IEEE80211ABG,
         sequence: 1,
@@ -357,7 +356,7 @@ fn queue_samples_transmission_delay_and_clears_discard_interval() {
     send_downstream(&mac, &pending(now_us() - 20_000), header, 2, 100);
     let recorded = capture.lock().unwrap();
     assert_eq!(recorded.queue_metrics.len(), 2);
-    assert_eq!(recorded.queue_metrics[0].1, 3);
+    assert_eq!(recorded.queue_metrics[0].1, 0);
     assert_eq!(recorded.queue_metrics[1].1, 0);
     assert!(recorded.queue_metrics[0].2 >= 10_000);
     assert!(recorded.queue_metrics[1].2 >= 20_000);
@@ -371,4 +370,176 @@ fn airtime_and_distance_truncate_like_cpp() {
     assert_eq!(cts_duration(1, 12), 22);
     assert_eq!(slot_size_microseconds(1, 1000), 12);
     assert_eq!(slot_size_microseconds(1, 1), 9);
+}
+
+#[test]
+fn duration_matches_cpp_float_seconds_rounding() {
+    // Measured in a complete C++ mode-0 NEM with a 4096-byte unicast at 2 Mbps.
+    assert_eq!(packet_duration(0, 4096, 2, false, false), 16_969);
+}
+
+#[test]
+fn active_packet_bypasses_queue_limits_but_following_packets_do_not() {
+    let capture = Mutex::new(Capture::default());
+    let mut mac = mac(&capture);
+    {
+        let state = mac.state.get_mut().unwrap();
+        state.categories[0].queue_size = 0;
+        state.categories[0].max_entry_size = 1;
+    }
+    let data = [7; 64];
+    let packet = FfiPacket {
+        info: packet_info(1, 2),
+        payload: FfiSlice {
+            data: data.as_ptr(),
+            len: data.len(),
+        },
+    };
+    process_downstream(
+        &mut mac as *mut _ as *mut c_void,
+        &packet,
+        std::ptr::null(),
+        0,
+    );
+    assert_eq!(
+        mac.state
+            .lock()
+            .unwrap()
+            .active_tx
+            .as_ref()
+            .unwrap()
+            .packet
+            .payload,
+        data
+    );
+    process_downstream(
+        &mut mac as *mut _ as *mut c_void,
+        &packet,
+        std::ptr::null(),
+        0,
+    );
+    assert!(mac.state.lock().unwrap().queues[0].is_empty());
+    {
+        let state = mac.state.get_mut().unwrap();
+        state.categories[0].queue_size = 2;
+        state.categories[0].max_entry_size = 32;
+    }
+    process_downstream(
+        &mut mac as *mut _ as *mut c_void,
+        &packet,
+        std::ptr::null(),
+        0,
+    );
+    assert!(mac.state.lock().unwrap().queues[0].is_empty());
+    let small = FfiPacket {
+        info: packet.info,
+        payload: FfiSlice {
+            data: data.as_ptr(),
+            len: 32,
+        },
+    };
+    process_downstream(
+        &mut mac as *mut _ as *mut c_void,
+        &small,
+        std::ptr::null(),
+        0,
+    );
+    assert_eq!(mac.state.lock().unwrap().queues[0].len(), 1);
+    mac.state.get_mut().unwrap().categories[0].max_entry_size = 0;
+    process_downstream(
+        &mut mac as *mut _ as *mut c_void,
+        &packet,
+        std::ptr::null(),
+        0,
+    );
+    assert_eq!(mac.state.lock().unwrap().queues[0].len(), 2);
+}
+
+#[test]
+fn queued_txop_waits_for_activation_before_expiry_and_token_return() {
+    let capture = Mutex::new(Capture::default());
+    let mac = mac(&capture);
+    {
+        let mut state = mac.state.lock().unwrap();
+        state.flow_control = true;
+        state.flow_manager.start(2);
+        state.flow_manager.process_flow_control_message(2);
+        assert!(state.flow_manager.remove_token().1);
+        assert!(state.flow_manager.remove_token().1);
+        let mut active = pending(0);
+        active.phase = TxPhase::Post;
+        active.ready_at = 10000;
+        state.active_tx = Some(active);
+        let mut queued = pending(0);
+        queued.category = 1;
+        queued.txop_microseconds = 50;
+        state.queues[1].push_back(queued);
+    }
+    drive(&mac, 100);
+    {
+        let mut state = mac.state.lock().unwrap();
+        assert_eq!(state.queues[1].len(), 1);
+        assert_eq!(state.flow_manager.add_token(0).0, 0);
+    }
+    drive(&mac, 10000);
+    let mut state = mac.state.lock().unwrap();
+    assert!(state.queues[1].is_empty());
+    assert!(state.active_tx.is_none());
+    assert_eq!(state.flow_manager.add_token(0).0, 2);
+}
+
+#[test]
+fn startup_announcements_wait_for_post_start() {
+    extern "C" fn control(
+        ctx: *mut c_void,
+        _: u16,
+        messages: *const FfiControlMessage,
+        count: usize,
+    ) {
+        let counts = unsafe { &*(ctx as *const Mutex<[usize; 2]>) };
+        for message in unsafe { std::slice::from_raw_parts(messages, count) } {
+            if message.msg_type == CONTROL_FLOW_CONTROL_TOKEN {
+                counts.lock().unwrap()[0] += 1;
+            }
+        }
+    }
+    extern "C" fn timer(
+        ctx: *mut c_void,
+        _: u16,
+        _: u64,
+        _: u32,
+        _: u32,
+        _: *const u8,
+        _: usize,
+    ) -> u64 {
+        let counts = unsafe { &*(ctx as *const Mutex<[usize; 2]>) };
+        let mut counts = counts.lock().unwrap();
+        counts[1] += 1;
+        counts[1] as u64
+    }
+    let counts = Mutex::new([0usize; 2]);
+    let mut mac = super::tests::test_mac();
+    mac.framework.framework_ctx = &counts as *const _ as *mut c_void;
+    mac.framework.send_upstream_control = control;
+    mac.framework.schedule_timed_event = timer;
+    {
+        let mut state = mac.state.lock().unwrap();
+        state.pcr_uri = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ieee80211abg-pcr.xml"
+        )
+        .into();
+        state.unicast_rate_index = 12;
+        state.multicast_rate_index = 12;
+        state.mode = 1;
+        state.flow_control = true;
+        state.flow_tokens = 3;
+    }
+    let plugin = &mut mac as *mut _ as *mut c_void;
+    // Original models announce grants and arm recurring timers in postStart.
+    assert!(start(plugin));
+    assert_eq!(*counts.lock().unwrap(), [0, 0]);
+    post_start(plugin);
+    assert_eq!(*counts.lock().unwrap(), [1, 2]);
+    stop(plugin);
 }

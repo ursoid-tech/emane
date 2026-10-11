@@ -111,11 +111,18 @@ pub(crate) fn decode(id: u16, data: &[u8]) -> Option<(u32, Vec<u8>)> {
     }
     Some(match id {
         104 => {
-            let v = wire::FlowControlControlMessage::decode(data).ok()?;
+            // prost's scalar `required` decoding supplies zero for an absent
+            // field. Track presence to match C++ proto2 ParseFromString.
+            #[derive(prost::Message)]
+            struct Tokens {
+                #[prost(uint32, optional, tag = "1")]
+                tokens: Option<u32>,
+            }
+            let v = Tokens::decode(data).ok()?;
             (
                 CONTROL_FLOW_CONTROL_TOKEN,
                 FlowControlToken {
-                    tokens: v.tokens.try_into().ok()?,
+                    tokens: v.tokens? as u16,
                 }
                 .encode()
                 .to_vec(),
@@ -204,7 +211,23 @@ mod tests {
             decode(104, &[8, 10]),
             Some((CONTROL_FLOW_CONTROL_TOKEN, native.to_vec()))
         );
-        assert!(decode(104, &[8, 0xff, 0xff, 0xff, 0x7f]).is_none());
+        assert_eq!(
+            decode(104, &[8, 0xff, 0xff, 0xff, 0x7f]),
+            Some((
+                CONTROL_FLOW_CONTROL_TOKEN,
+                FlowControlToken { tokens: u16::MAX }.encode().to_vec()
+            ))
+        );
+        assert!(decode(104, &[]).is_none());
+        assert!(decode(104, &[16, 2]).is_none());
+        assert!(decode(104, &[8, 128]).is_none());
+        assert_eq!(
+            decode(104, &[8, 0]),
+            Some((
+                CONTROL_FLOW_CONTROL_TOKEN,
+                FlowControlToken { tokens: 0 }.encode().to_vec()
+            ))
+        );
         assert!(encode(CONTROL_MODEL_HEADER, &[]).unwrap().is_none());
     }
     #[test]

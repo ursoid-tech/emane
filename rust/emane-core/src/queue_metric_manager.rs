@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct R2RIQueueMetric {
@@ -36,14 +36,14 @@ impl QueueData {
 
 pub struct QueueMetricManager {
     _nem_id: u16,
-    queue_data_map: HashMap<u16, QueueData>,
+    queue_data_map: BTreeMap<u16, QueueData>,
 }
 
 impl QueueMetricManager {
     pub fn new(nem_id: u16) -> Self {
         Self {
             _nem_id: nem_id,
-            queue_data_map: HashMap::new(),
+            queue_data_map: BTreeMap::new(),
         }
     }
 
@@ -105,7 +105,7 @@ impl QueueMetricManager {
     }
 
     pub fn add_queue_metric(&mut self, queue_id: u16, max_queue_size: u32) -> bool {
-        if let std::collections::hash_map::Entry::Vacant(e) = self.queue_data_map.entry(queue_id) {
+        if let std::collections::btree_map::Entry::Vacant(e) = self.queue_data_map.entry(queue_id) {
             e.insert(QueueData::new(max_queue_size));
             true
         } else {
@@ -231,6 +231,24 @@ pub extern "C" fn emane_rs_queue_metric_manager_remove(
 #[cfg(test)]
 mod parity_tests {
     use super::*;
+    #[test]
+    fn report_order_survives_removal_reinsertion_and_interval_reset() {
+        let mut queue = QueueMetricManager::new(1);
+        for id in [65535, 3, 0, 19, 2] {
+            queue.add_queue_metric(id, 100);
+        }
+        queue.remove_queue_metric(3);
+        queue.update_queue_metric(3, 100, 1, 0, 10);
+        for _ in 0..2 {
+            let ids: Vec<_> = queue
+                .get_queue_metrics()
+                .iter()
+                .map(|v| v.queue_id)
+                .collect();
+            assert_eq!(ids, [0, 2, 3, 19, 65535]);
+        }
+    }
+
     #[test]
     fn legacy_report_rounding_and_interval_reset() {
         let mut queue = QueueMetricManager::new(1);

@@ -12,6 +12,7 @@ unsafe impl Send for VirtualTransport {}
 unsafe impl Sync for VirtualTransport {}
 pub struct VirtualTransport {
     id: u16,
+    address: Option<(std::net::IpAddr, std::net::IpAddr)>,
     tun_tap: Option<Arc<TunTap>>,
     thread: Option<thread::JoinHandle<()>>,
     canceled: Arc<AtomicBool>,
@@ -27,6 +28,7 @@ pub extern "C" fn emane_rs_virtual_transport_new(
 ) -> *mut VirtualTransport {
     let vt = Box::new(VirtualTransport {
         id,
+        address: None,
         tun_tap: None,
         thread: None,
         canceled: Arc::new(AtomicBool::new(false)),
@@ -74,6 +76,11 @@ pub extern "C" fn emane_rs_virtual_transport_start(
             }
             if tun.activate(arp_mode).is_err() {
                 return -1;
+            }
+            if let Some((address, mask)) = vt.address {
+                if !address.is_unspecified() && tun.set_addr(address, mask).is_err() {
+                    return -1;
+                }
             }
             vt.canceled.store(false, Ordering::SeqCst);
             let tun_arc = Arc::new(tun);
@@ -128,6 +135,10 @@ pub extern "C" fn emane_rs_virtual_transport_stop(ptr: *mut VirtualTransport) {
 }
 
 impl VirtualTransport {
+    pub fn set_address(&mut self, address: std::net::IpAddr, mask: std::net::IpAddr) {
+        self.address = Some((address, mask));
+    }
+
     fn stop(&mut self) {
         self.canceled.store(true, Ordering::SeqCst);
         if let Some(tun) = &self.tun_tap {

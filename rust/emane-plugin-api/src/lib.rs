@@ -1,3 +1,4 @@
+pub mod flow_control;
 pub mod numeric;
 pub mod random;
 pub mod spectrum;
@@ -45,7 +46,7 @@ pub const CONTROL_SELF_INTERFERENCE: u32 = 0x454D_0018;
 
 const PROPERTIES_VERSION: u8 = 1;
 const MIMO_TX_PROPERTIES_VERSION: u8 = 3;
-const MIMO_RX_PROPERTIES_VERSION: u8 = 2;
+const MIMO_RX_PROPERTIES_VERSION: u8 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlowControlToken {
@@ -306,7 +307,7 @@ pub struct FrequencyOfInterest {
 impl FrequencyOfInterest {
     pub fn encode(&self) -> Option<Vec<u8>> {
         let count = u16::try_from(self.frequencies_hz.len()).ok()?;
-        if self.bandwidth_hz == 0 || count == 0 || self.frequencies_hz.contains(&0) {
+        if self.frequencies_hz.contains(&0) {
             return None;
         }
         let mut data = Vec::with_capacity(11 + self.frequencies_hz.len() * 8);
@@ -320,11 +321,11 @@ impl FrequencyOfInterest {
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
-        if data.len() < 19 || data[0] != PROPERTIES_VERSION {
+        if data.len() < 11 || data[0] != PROPERTIES_VERSION {
             return None;
         }
         let count = get_u16(data, 1) as usize;
-        if count == 0 || data.len() != 11usize.checked_add(count.checked_mul(8)?)? {
+        if data.len() != 11usize.checked_add(count.checked_mul(8)?)? {
             return None;
         }
         let bandwidth_hz = get_u64(data, 3);
@@ -853,7 +854,7 @@ pub struct MimoRxProperties {
     pub tx_time_microseconds: i64,
     pub propagation_microseconds: u64,
     pub antenna_infos: Vec<MimoRxAntennaInfo>,
-    pub doppler_shifts_hz: Vec<(u64, i64)>,
+    pub doppler_shifts_hz: Vec<(u64, f64)>,
 }
 
 impl MimoRxProperties {
@@ -865,6 +866,10 @@ impl MimoRxProperties {
         let info_count = u16::try_from(self.antenna_infos.len()).ok()?;
         let doppler_count = u16::try_from(self.doppler_shifts_hz.len()).ok()?;
         if info_count == 0
+            || self
+                .doppler_shifts_hz
+                .iter()
+                .any(|(_, shift)| !shift.is_finite())
             || self.antenna_infos.iter().any(|info| {
                 info.segments.is_empty()
                     || info.segments.len() > usize::from(u16::MAX)
@@ -913,7 +918,7 @@ impl MimoRxProperties {
         data.extend_from_slice(&doppler_count.to_be_bytes());
         for (frequency_hz, shift_hz) in &self.doppler_shifts_hz {
             data.extend_from_slice(&frequency_hz.to_be_bytes());
-            data.extend_from_slice(&(*shift_hz as u64).to_be_bytes());
+            data.extend_from_slice(&shift_hz.to_bits().to_be_bytes());
         }
         Some(data)
     }
@@ -966,7 +971,7 @@ impl MimoRxProperties {
         for _ in 0..doppler_count {
             doppler_shifts_hz.push((
                 read_u64(data, &mut offset)?,
-                read_u64(data, &mut offset)? as i64,
+                f64::from_bits(read_u64(data, &mut offset)?),
             ));
         }
         let result = Self {
@@ -1157,12 +1162,19 @@ fn read_u64(data: &[u8], offset: &mut usize) -> Option<u64> {
 // version 12 adds removal of individual table rows.
 // Version 15 preserves packet UUIDs through reception and neighbor metrics.
 // Version 16 exposes spectrum filter windows.
-// Version 17 preserves optional MIMO segment powers. Rebuild core and plugins together.
-pub const PLUGIN_ABI_VERSION: u32 = 17;
+// Version 17 preserves optional MIMO segment powers.
+// Version 18 preserves narrow integer table cells.
+// Version 19 preserves fractional Doppler shifts. Rebuild core and plugins together.
+pub const PLUGIN_ABI_VERSION: u32 = 20;
 
 pub const STATISTIC_VALUE_U64: u32 = 1;
 pub const STATISTIC_VALUE_F64: u32 = 2;
 pub const STATISTIC_VALUE_STRING: u32 = 3;
+pub const STATISTIC_VALUE_U16: u32 = 4;
+// Signed values use the two's-complement representation in u64_value.
+pub const STATISTIC_VALUE_I64: u32 = 5;
+pub const STATISTIC_VALUE_U8: u32 = 6;
+pub const STATISTIC_VALUE_U32: u32 = 7;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1351,6 +1363,8 @@ pub struct FfiFrameworkService {
         data_rate_bps: u64,
     ),
     pub update_neighbor_status: extern "C" fn(ctx: *mut c_void),
+    pub register_queue_metric:
+        extern "C" fn(ctx: *mut c_void, queue_id: u16, max_size: u32) -> bool,
     pub update_queue_metric: extern "C" fn(
         ctx: *mut c_void,
         queue_id: u16,
@@ -1810,7 +1824,7 @@ impl CommonLayerCounters {
         }
         let key = [u64::from(source)];
         let values = [
-            statistic_u64(u64::from(source)),
+            statistic_u16(source),
             statistic_u64(counts.tx_packets),
             statistic_u64(counts.tx_bytes),
             statistic_u64(counts.rx_packets),
@@ -1856,7 +1870,7 @@ impl CommonLayerCounters {
         counts[drop_code - 1] = counts[drop_code - 1].saturating_add(1);
         let key = [u64::from(peer)];
         let mut values = Vec::with_capacity(columns + 1);
-        values.push(statistic_u64(u64::from(peer)));
+        values.push(statistic_u16(peer));
         values.extend(counts.iter().copied().map(statistic_u64));
         (framework.set_table_row)(
             framework.framework_ctx,
@@ -1956,6 +1970,13 @@ fn statistic_u64(value: u64) -> FfiStatisticValue {
         u64_value: value,
         f64_value: 0.0,
         string_value: std::ptr::null(),
+    }
+}
+
+fn statistic_u16(value: u16) -> FfiStatisticValue {
+    FfiStatisticValue {
+        value_type: STATISTIC_VALUE_U16,
+        ..statistic_u64(u64::from(value))
     }
 }
 
@@ -2116,6 +2137,27 @@ mod tests {
             FrequencyOfInterest::decode(&foi.encode().unwrap()),
             Some(foi)
         );
+        // Empty interest disables reception; zero bandwidth preserves the
+        // receiver's current bandwidth. Both are emitted by TDMA schedules.
+        for foi in [
+            FrequencyOfInterest {
+                bandwidth_hz: 0,
+                frequencies_hz: vec![],
+            },
+            FrequencyOfInterest {
+                bandwidth_hz: 0,
+                frequencies_hz: vec![100],
+            },
+            FrequencyOfInterest {
+                bandwidth_hz: 2_000_000,
+                frequencies_hz: vec![],
+            },
+        ] {
+            assert_eq!(
+                FrequencyOfInterest::decode(&foi.encode().unwrap()),
+                Some(foi)
+            );
+        }
 
         let segments = TxFrequencySegments {
             segments: vec![
@@ -2267,12 +2309,20 @@ mod tests {
                 noise_floor_dbm: -95.0,
                 segments: received_segments.segments.clone(),
             }],
-            doppler_shifts_hz: vec![(2_400_000_000, -12)],
+            doppler_shifts_hz: vec![(2_400_000_000, -12.125), (2_410_000_000, 0.25)],
         };
         assert_eq!(
             MimoRxProperties::decode(&mimo_rx.encode().unwrap()),
-            Some(mimo_rx)
+            Some(mimo_rx.clone())
         );
+        let mut invalid = mimo_rx;
+        let mut bytes = invalid.encode().unwrap();
+        bytes[0] = 2;
+        assert!(MimoRxProperties::decode(&bytes).is_none());
+        for shift in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            invalid.doppler_shifts_hz[0].1 = shift;
+            assert!(invalid.encode().is_none());
+        }
     }
 }
 

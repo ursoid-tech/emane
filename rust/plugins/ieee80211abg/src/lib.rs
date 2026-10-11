@@ -1,3 +1,4 @@
+use emane_plugin_api::flow_control::FlowControlManager;
 use emane_plugin_api::random::LegacyRandom;
 mod pcr_manager;
 
@@ -6,7 +7,7 @@ use emane_plugin_api::{
     FfiPacketInfo, FfiSlice, FfiSpectrumQuery, FfiStatisticValue, FlowControlToken, ModelHeader,
     PluginApi, RxFrequencySegments, RxProperties, TxProperties, CONTROL_FLOW_CONTROL_TOKEN,
     CONTROL_MODEL_HEADER, CONTROL_RX_FREQUENCY_SEGMENTS, CONTROL_RX_PROPERTIES,
-    CONTROL_TX_PROPERTIES, MAC_REGISTRATION_IEEE80211ABG, PLUGIN_ABI_VERSION, STATISTIC_VALUE_U64,
+    CONTROL_TX_PROPERTIES, MAC_REGISTRATION_IEEE80211ABG, PLUGIN_ABI_VERSION, STATISTIC_VALUE_U16,
 };
 use pcr_manager::PCRManager;
 use prost::Message;
@@ -151,17 +152,6 @@ struct PendingRx {
     acquired_at: i64,
 }
 
-#[derive(Clone, Default)]
-struct PacketAcceptInfo {
-    tx_bytes: u64,
-    rx_bytes: u64,
-}
-
-#[derive(Clone, Default)]
-struct PacketDropInfo {
-    bytes: [u64; 10],
-}
-
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum PacketDropReason {
@@ -199,7 +189,7 @@ struct State {
     max_distance_meters: u32,
     flow_control: bool,
     flow_tokens: u16,
-    available_tokens: u16,
+    flow_manager: FlowControlManager,
     categories: [CategoryConfig; 4],
     queues: [VecDeque<PendingTx>; 4],
     active_tx: Option<PendingTx>,
@@ -225,12 +215,6 @@ struct State {
     radiometric_enabled: bool,
     radiometric_report_interval_microseconds: u64,
     neighbor_metric_delete_microseconds: u64,
-    queue_discards: [u32; 4],
-    broadcast_accept: [HashMap<u16, PacketAcceptInfo>; 4],
-    broadcast_drop: [HashMap<u16, PacketDropInfo>; 4],
-    unicast_accept: [HashMap<u16, PacketAcceptInfo>; 4],
-    unicast_drop: [HashMap<u16, PacketDropInfo>; 4],
-    table_generations: HashMap<String, u64>,
     duplicate_history: HashMap<u16, VecDeque<(u64, i64)>>,
     timers: HashSet<u64>,
     random_state: LegacyRandom,
@@ -244,7 +228,6 @@ struct Ieee80211Mac {
     model_counters: HashMap<String, u64>,
     one_hop_neighbor_table: u64,
     two_hop_neighbor_table: u64,
-    packet_tables: HashMap<String, u64>,
     state: Mutex<State>,
 }
 
@@ -317,73 +300,6 @@ impl Ieee80211Mac {
             c"Current Two Hop Neighbors".as_ptr(),
             false,
         );
-        let mut packet_tables = HashMap::new();
-        for category in 0..4 {
-            for (prefix, labels) in [
-                (
-                    "BroadcastByteAcceptTable",
-                    &["NEM", "Num Bytes Tx", "Num Bytes Rx"][..],
-                ),
-                (
-                    "UnicastByteAcceptTable",
-                    &["NEM", "Num Bytes Tx", "Num Bytes Rx"][..],
-                ),
-                (
-                    "BroadcastByteDropTable",
-                    &[
-                        "NEM",
-                        "SINR",
-                        "Reg Id",
-                        "Dst MAC",
-                        "Queue Overflow",
-                        "Bad Control",
-                        "Bad Spectrum Query",
-                        "Flow Control",
-                        "Duplicate",
-                        "Rx During Tx",
-                        "Hidden Busy",
-                    ][..],
-                ),
-                (
-                    "UnicastByteDropTable",
-                    &[
-                        "NEM",
-                        "SINR",
-                        "Reg Id",
-                        "Dst MAC",
-                        "Queue Overflow",
-                        "Bad Control",
-                        "Bad Spectrum Query",
-                        "Flow Control",
-                        "Duplicate",
-                        "Rx During Tx",
-                        "Hidden Busy",
-                    ][..],
-                ),
-            ] {
-                let name = format!("{prefix}{category}");
-                let name_value = CString::new(name.as_str()).unwrap();
-                let labels = labels
-                    .iter()
-                    .map(|label| CString::new(*label).unwrap())
-                    .collect::<Vec<_>>();
-                let pointers = labels
-                    .iter()
-                    .map(|label| label.as_ptr())
-                    .collect::<Vec<_>>();
-                let handle = (framework.register_table)(
-                    framework.framework_ctx,
-                    name_value.as_ptr(),
-                    pointers.as_ptr(),
-                    pointers.len(),
-                    c"IEEE 802.11 packet status".as_ptr(),
-                    true,
-                );
-                if handle != 0 {
-                    packet_tables.insert(name, handle);
-                }
-            }
-        }
         let categories = [
             CategoryConfig {
                 queue_size: 255,
@@ -447,7 +363,6 @@ impl Ieee80211Mac {
             model_counters,
             one_hop_neighbor_table,
             two_hop_neighbor_table,
-            packet_tables,
             state: Mutex::new(State {
                 local_id: id,
                 promiscuous: false,
@@ -459,7 +374,7 @@ impl Ieee80211Mac {
                 max_distance_meters: 1_000,
                 flow_control: false,
                 flow_tokens: 10,
-                available_tokens: 10,
+                flow_manager: FlowControlManager::new(),
                 categories,
                 queues: std::array::from_fn(|_| VecDeque::new()),
                 active_tx: None,
@@ -485,12 +400,6 @@ impl Ieee80211Mac {
                 radiometric_enabled: false,
                 radiometric_report_interval_microseconds: 1_000_000,
                 neighbor_metric_delete_microseconds: 60_000_000,
-                queue_discards: [0; 4],
-                broadcast_accept: std::array::from_fn(|_| HashMap::new()),
-                broadcast_drop: std::array::from_fn(|_| HashMap::new()),
-                unicast_accept: std::array::from_fn(|_| HashMap::new()),
-                unicast_drop: std::array::from_fn(|_| HashMap::new()),
-                table_generations: HashMap::new(),
                 duplicate_history: HashMap::new(),
                 timers: HashSet::new(),
                 random_state: LegacyRandom::from_clock(),
@@ -514,7 +423,7 @@ impl Ieee80211Mac {
     fn set_neighbor_row(&self, table: u64, nem_id: u16) {
         let key = [u64::from(nem_id)];
         let values = [FfiStatisticValue {
-            value_type: STATISTIC_VALUE_U64,
+            value_type: STATISTIC_VALUE_U16,
             u64_value: u64::from(nem_id),
             f64_value: 0.0,
             string_value: std::ptr::null(),
@@ -538,119 +447,19 @@ impl Ieee80211Mac {
             key.len(),
         );
     }
-
-    fn set_packet_table_row(&self, name: &str, key: &[u64], values: &[FfiStatisticValue]) {
-        if let Some(handle) = self.packet_tables.get(name).copied() {
-            (self.framework.set_table_row)(
-                self.framework.framework_ctx,
-                handle,
-                key.as_ptr(),
-                key.len(),
-                values.as_ptr(),
-                values.len(),
-            );
-        }
-    }
-
-    fn packet_table_generation(&self, name: &str) -> u64 {
-        self.packet_tables.get(name).copied().map_or(0, |handle| {
-            (self.framework.table_generation)(self.framework.framework_ctx, handle)
-        })
-    }
-}
-
-fn statistic_u64(value: u64) -> FfiStatisticValue {
-    FfiStatisticValue {
-        value_type: STATISTIC_VALUE_U64,
-        u64_value: value,
-        f64_value: 0.0,
-        string_value: std::ptr::null(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_packet_accept(
-    mac: &Ieee80211Mac,
-    state: &mut State,
-    category: usize,
-    source: u16,
-    destination: u16,
-    size: usize,
-    inbound: bool,
-    processing_delay_microseconds: u64,
-) {
-    let broadcast = destination == BROADCAST_NEM;
-    let name = format!(
-        "{}ByteAcceptTable{category}",
-        if broadcast { "Broadcast" } else { "Unicast" }
-    );
-    let generation = mac.packet_table_generation(&name);
-    let reset = state
-        .table_generations
-        .insert(name.clone(), generation)
-        .is_some_and(|previous| previous != generation);
-    let infos = if broadcast {
-        &mut state.broadcast_accept[category]
-    } else {
-        &mut state.unicast_accept[category]
-    };
-    if reset {
-        infos.clear();
-    }
-    let info = infos.entry(source).or_default();
-    if inbound {
-        info.rx_bytes = info.rx_bytes.saturating_add(size as u64);
-    } else {
-        info.tx_bytes = info.tx_bytes.saturating_add(size as u64);
-    }
-    mac.set_packet_table_row(
-        &name,
-        &[u64::from(source)],
-        &[
-            statistic_u64(u64::from(source)),
-            statistic_u64(info.tx_bytes),
-            statistic_u64(info.rx_bytes),
-        ],
-    );
-    let _ = processing_delay_microseconds;
 }
 
 #[allow(clippy::too_many_arguments)]
 fn record_packet_drop(
     mac: &Ieee80211Mac,
-    state: &mut State,
+    _state: &mut State,
     category: usize,
     source: u16,
     destination: u16,
-    size: usize,
+    _size: usize,
     reason: PacketDropReason,
     inbound: bool,
 ) {
-    let broadcast = destination == BROADCAST_NEM;
-    let name = format!(
-        "{}ByteDropTable{category}",
-        if broadcast { "Broadcast" } else { "Unicast" }
-    );
-    let generation = mac.packet_table_generation(&name);
-    let reset = state
-        .table_generations
-        .insert(name.clone(), generation)
-        .is_some_and(|previous| previous != generation);
-    let infos = if broadcast {
-        &mut state.broadcast_drop[category]
-    } else {
-        &mut state.unicast_drop[category]
-    };
-    if reset {
-        infos.clear();
-    }
-    let nem_id = if inbound { source } else { destination };
-    let info = infos.entry(nem_id).or_default();
-    info.bytes[reason as usize] = info.bytes[reason as usize].saturating_add(size as u64);
-    let mut row = Vec::with_capacity(11);
-    row.push(statistic_u64(u64::from(nem_id)));
-    row.extend(info.bytes.iter().copied().map(statistic_u64));
-    mac.set_packet_table_row(&name, &[u64::from(nem_id)], &row);
     if inbound {
         mac.counters[category].upstream_drop_packet(
             mac.framework,
@@ -844,21 +653,20 @@ fn dscp_to_category(dscp: u8, wmm: bool) -> usize {
 
 fn packet_duration(mode: u8, length: usize, rate_index: u8, broadcast: bool, rts_cts: bool) -> u64 {
     let (_, sifs, preamble) = mode_parameters(mode);
-    let rate = DATA_RATES_KBPS[rate_index as usize] as u64;
+    let rate_mbps = DATA_RATES_KBPS[rate_index as usize] as f32 / 1000.0;
     let acknowledgement_bits = if broadcast { 0 } else { 112 };
-    let data = ((length as u64)
+    let bits = (length as u64)
         .saturating_mul(8)
-        .saturating_add(272 + acknowledgement_bits))
-    .saturating_mul(1_000)
-        / rate;
-    let mut duration = if broadcast {
-        preamble.saturating_add(data)
+        .saturating_add(272 + acknowledgement_bits);
+    let overhead = if broadcast {
+        preamble
     } else {
-        2_u64
-            .saturating_mul(preamble)
-            .saturating_add(sifs)
-            .saturating_add(data)
+        2 * preamble + sifs
     };
+    // Original ModeTimingParameters does its arithmetic in float seconds,
+    // then duration_cast truncates DoubleSeconds to integer microseconds.
+    let seconds = (overhead as f32 + bits as f32 / rate_mbps) / 1_000_000.0_f32;
+    let mut duration = (f64::from(seconds) * 1_000_000.0) as u64;
     if rts_cts {
         // C++ truncates each RTS and CTS duration separately.
         duration = duration.saturating_add(2 * cts_duration(mode, rate_index));
@@ -868,8 +676,9 @@ fn packet_duration(mode: u8, length: usize, rate_index: u8, broadcast: bool, rts
 
 fn cts_duration(mode: u8, rate_index: u8) -> u64 {
     let (_, _, preamble) = mode_parameters(mode);
-    let rate = u64::from(DATA_RATES_KBPS[usize::from(rate_index)]);
-    preamble.saturating_add(160_000_u64 / rate)
+    let rate_mbps = DATA_RATES_KBPS[usize::from(rate_index)] as f32 / 1000.0;
+    let seconds = (preamble as f32 + 160.0 / rate_mbps) / 1_000_000.0_f32;
+    (f64::from(seconds) * 1_000_000.0) as u64
 }
 
 fn encode_flags(rate_index: u8, retries: u8) -> u16 {
@@ -1520,12 +1329,13 @@ fn send_downstream(
         },
     };
     let (capacity, depth, discards) = {
-        let mut state = mac.state.lock().unwrap();
+        let state = mac.state.lock().unwrap();
         let category = pending.category;
         (
             state.categories[category].queue_size,
             state.queues[category].len(),
-            std::mem::take(&mut state.queue_discards[category]),
+            // Original AccessCategory::numPacketOverFlow_ is never incremented.
+            0,
         )
     };
     (mac.framework.update_queue_metric)(
@@ -1628,36 +1438,7 @@ fn drive(mac: &Ieee80211Mac, now: i64) {
         if !state.started {
             return;
         }
-        let mut flow_update = None;
-        for category in 0..state.queues.len() {
-            loop {
-                let expired = state.queues[category].front().is_some_and(|entry| {
-                    txop_expired(entry.acquired_at, entry.txop_microseconds, now)
-                });
-                if !expired {
-                    break;
-                }
-                if let Some(expired) = state.queues[category].pop_front() {
-                    mac.increment(
-                        if expired.packet.info.destination == BROADCAST_NEM {
-                            "numDownstreamBroadcastDataDiscardDueToTxop"
-                        } else {
-                            "numDownstreamUnicastDataDiscardDueToTxop"
-                        },
-                        1,
-                    );
-                    state.queue_discards[category] =
-                        state.queue_discards[category].saturating_add(1);
-                    if state.flow_control {
-                        state.available_tokens = state
-                            .available_tokens
-                            .saturating_add(1)
-                            .min(state.flow_tokens);
-                        flow_update = Some(state.available_tokens);
-                    }
-                }
-            }
-        }
+        let mut flow_update = Vec::new();
         let mut transmission = None;
         loop {
             if state.active_tx.is_none() {
@@ -1682,14 +1463,10 @@ fn drive(mac: &Ieee80211Mac, now: i64) {
                             },
                             1,
                         );
-                        state.queue_discards[pending.category] =
-                            state.queue_discards[pending.category].saturating_add(1);
                         if state.flow_control {
-                            state.available_tokens = state
-                                .available_tokens
-                                .saturating_add(1)
-                                .min(state.flow_tokens);
-                            flow_update = Some(state.available_tokens);
+                            if let Some(tokens) = state.flow_manager.add_token(1).2 {
+                                flow_update.push(tokens);
+                            }
                         }
                         continue;
                     }
@@ -1761,16 +1538,7 @@ fn drive(mac: &Ieee80211Mac, now: i64) {
                         );
                         publish_one_hop_neighbors(mac, &state);
                     }
-                    record_packet_accept(
-                        mac,
-                        &mut state,
-                        pending.category,
-                        mac.id,
-                        pending.packet.info.destination,
-                        pending.packet.payload.len(),
-                        false,
-                        now.saturating_sub(pending.acquired_at).max(0) as u64,
-                    );
+
                     pending.ready_at = state.current_eot.saturating_add(
                         i64::try_from(pending.post_delay_microseconds).unwrap_or(i64::MAX),
                     );
@@ -1807,11 +1575,9 @@ fn drive(mac: &Ieee80211Mac, now: i64) {
                         }
                     }
                     if state.flow_control {
-                        state.available_tokens = state
-                            .available_tokens
-                            .saturating_add(1)
-                            .min(state.flow_tokens);
-                        flow_update = Some(state.available_tokens);
+                        if let Some(tokens) = state.flow_manager.add_token(1).2 {
+                            flow_update.push(tokens);
+                        }
                     }
                 }
             }
@@ -1829,11 +1595,11 @@ fn drive(mac: &Ieee80211Mac, now: i64) {
             });
         (transmission, next, flow_update)
     };
+    for tokens in flow_update {
+        send_flow_update(mac, tokens);
+    }
     if let Some((pending, header, destination, duration)) = transmission {
         send_downstream(mac, &pending, header, destination, duration);
-    }
-    if let Some(tokens) = flow_update {
-        send_flow_update(mac, tokens);
     }
     if let Some(next) = next {
         schedule_transmit(mac, next);
@@ -2066,18 +1832,7 @@ fn complete_receive(mac: &Ieee80211Mac, id: u64) {
             }
         }
         let accepted = !duplicate && reception_ok && pending.deliverable;
-        if accepted {
-            record_packet_accept(
-                mac,
-                &mut state,
-                pending.category,
-                pending.source,
-                pending.packet.info.destination,
-                pending.packet.payload.len(),
-                true,
-                now_us().saturating_sub(pending.acquired_at).max(0) as u64,
-            );
-        } else {
+        if !accepted {
             record_packet_drop(
                 mac,
                 &mut state,
@@ -2199,7 +1954,6 @@ extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
                     Ok(value) if value != 0 => value,
                     _ => return false,
                 };
-                state.available_tokens = state.flow_tokens;
             }
             "pcrcurveuri" => state.pcr_uri = value,
             "channelactivityestimationtimer" => {
@@ -2254,7 +2008,7 @@ extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
                     }
                     "msdu" => {
                         state.categories[index].max_entry_size = match value.parse::<usize>() {
-                            Ok(value @ 1..=65_535) => value,
+                            Ok(value @ ..=65_535) => value,
                             _ => return false,
                         }
                     }
@@ -2316,7 +2070,7 @@ extern "C" fn start(plugin: *mut c_void) -> bool {
     let Some(mac) = (unsafe { (plugin as *mut Ieee80211Mac).as_ref() }) else {
         return false;
     };
-    let (flow_update, report, channel_interval) = {
+    {
         let mut state = mac.state.lock().unwrap();
         if state.pcr_uri.is_empty() {
             return false;
@@ -2329,40 +2083,53 @@ extern "C" fn start(plugin: *mut c_void) -> bool {
             return false;
         }
         state.pcr = Some(pcr);
-        state.available_tokens = state.flow_tokens;
+        for category in 0..if state.wmm { 4 } else { 1 } {
+            (mac.framework.register_queue_metric)(
+                mac.framework.framework_ctx,
+                category as u16,
+                state.categories[category].queue_size as u32,
+            );
+        }
         state.channel_activity.clear();
         state.neighbor_lists.clear();
         state.estimated_one_hop_neighbors = 0.0;
         state.estimated_two_hop_neighbors = 0.0;
         state.channel_utilization = 0.0;
         state.started = true;
+    }
+    true
+}
+
+extern "C" fn post_start(plugin: *mut c_void) {
+    let Some(mac) = (unsafe { (plugin as *mut Ieee80211Mac).as_ref() }) else {
+        return;
+    };
+    let time_now = now_us();
+    let (flow_update, report, channel_interval) = {
+        let mut state = mac.state.lock().unwrap();
         (
-            state.flow_control.then_some(state.available_tokens),
-            state
-                .radiometric_enabled
-                .then_some(state.radiometric_report_interval_microseconds),
+            state.flow_control.then(|| {
+                let total = state.flow_tokens;
+                state.flow_manager.start(total)
+            }),
+            state.radiometric_report_interval_microseconds,
             state.channel_activity_interval_microseconds,
         )
     };
     if let Some(tokens) = flow_update {
         send_flow_update(mac, tokens);
     }
-    if let Some(interval) = report {
-        let when = now_us().saturating_add(interval as i64);
-        let timer = schedule(mac, when, EVENT_R2RI_REPORT, &when.to_be_bytes());
-        if timer != 0 {
-            mac.state.lock().unwrap().timers.insert(timer);
-        }
-    }
-    let when = now_us().saturating_add(channel_interval as i64);
+    let when = time_now.saturating_add(channel_interval as i64);
     let timer = schedule(mac, when, EVENT_CHANNEL_ESTIMATE, &when.to_be_bytes());
     if timer != 0 {
         mac.state.lock().unwrap().timers.insert(timer);
     }
-    true
+    let when = time_now.saturating_add(report as i64);
+    let timer = schedule(mac, when, EVENT_R2RI_REPORT, &when.to_be_bytes());
+    if timer != 0 {
+        mac.state.lock().unwrap().timers.insert(timer);
+    }
 }
-
-extern "C" fn lifecycle(_: *mut c_void) {}
 
 extern "C" fn stop(plugin: *mut c_void) {
     let Some(mac) = (unsafe { (plugin as *mut Ieee80211Mac).as_ref() }) else {
@@ -2371,6 +2138,7 @@ extern "C" fn stop(plugin: *mut c_void) {
     let timers = {
         let mut state = mac.state.lock().unwrap();
         state.started = false;
+        state.flow_manager.stop();
         for queue in &mut state.queues {
             queue.clear();
         }
@@ -2400,14 +2168,35 @@ extern "C" fn process_downstream(
         return;
     };
     if packet.is_null() {
-        (mac.framework.send_downstream_control)(
-            mac.framework.framework_ctx,
-            mac.id,
-            messages,
-            count,
-        );
+        if count != 0 && !messages.is_null() {
+            for message in unsafe { std::slice::from_raw_parts(messages, count) } {
+                if message.msg_type != CONTROL_FLOW_CONTROL_TOKEN || message.payload.data.is_null()
+                {
+                    continue;
+                }
+                let data = unsafe {
+                    std::slice::from_raw_parts(message.payload.data, message.payload.len)
+                };
+                if let Some(token) = FlowControlToken::decode(data) {
+                    let update = {
+                        let mut state = mac.state.lock().unwrap();
+                        if state.flow_control {
+                            state
+                                .flow_manager
+                                .process_flow_control_message(token.tokens)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(tokens) = update {
+                        send_flow_update(mac, tokens);
+                    }
+                }
+            }
+        }
         return;
     }
+
     let Some(packet) = own_packet(packet, messages, count) else {
         return;
     };
@@ -2421,7 +2210,7 @@ extern "C" fn process_downstream(
             packet.info.destination,
             packet.payload.len(),
         );
-        if !state.started || (state.flow_control && state.available_tokens == 0) {
+        if !state.started || (state.flow_control && !state.flow_manager.remove_token().1) {
             record_packet_drop(
                 mac,
                 &mut state,
@@ -2435,87 +2224,91 @@ extern "C" fn process_downstream(
             return;
         }
         let config = state.categories[category];
-        if packet.payload.len() > config.max_entry_size {
-            let broadcast = packet.info.destination == BROADCAST_NEM;
-            mac.increment(
-                &format!(
-                    "num{}PacketsTooLarge{category}",
-                    if broadcast { "Broadcast" } else { "Unicast" }
-                ),
-                1,
-            );
-            mac.increment(
-                &format!(
-                    "num{}BytesTooLarge{category}",
-                    if broadcast { "Broadcast" } else { "Unicast" }
-                ),
-                packet.payload.len() as u64,
-            );
-            record_packet_drop(
-                mac,
-                &mut state,
-                category,
-                packet.info.source,
-                packet.info.destination,
-                packet.payload.len(),
-                PacketDropReason::QueueOverflow,
-                false,
-            );
-            let update = state.flow_control.then_some(state.available_tokens);
-            drop(state);
-            if let Some(tokens) = update {
-                send_flow_update(mac, tokens);
-            }
-            return;
-        }
-        if config.queue_size == 0 {
-            record_packet_drop(
-                mac,
-                &mut state,
-                category,
-                packet.info.source,
-                packet.info.destination,
-                packet.payload.len(),
-                PacketDropReason::QueueOverflow,
-                false,
-            );
-            state.queue_discards[category] = state.queue_discards[category].saturating_add(1);
-            let update = state.flow_control.then_some(state.available_tokens);
-            drop(state);
-            if let Some(tokens) = update {
-                send_flow_update(mac, tokens);
-            }
-            return;
-        }
-        if state.flow_control {
-            state.available_tokens -= 1;
-        }
-        while state.queues[category].len() >= config.queue_size {
-            if let Some(dropped) = state.queues[category].pop_front() {
+        if state.active_tx.is_some() {
+            if config.queue_size == 0 {
                 record_packet_drop(
                     mac,
                     &mut state,
                     category,
-                    dropped.packet.info.source,
-                    dropped.packet.info.destination,
-                    dropped.packet.payload.len(),
+                    packet.info.source,
+                    packet.info.destination,
+                    packet.payload.len(),
                     PacketDropReason::QueueOverflow,
                     false,
                 );
+                let update = if state.flow_control {
+                    state.flow_manager.add_token(1).2
+                } else {
+                    None
+                };
+                drop(state);
+                if let Some(tokens) = update {
+                    send_flow_update(mac, tokens);
+                }
+                return;
             }
-            state.queue_discards[category] = state.queue_discards[category].saturating_add(1);
-            if state.flow_control {
-                state.available_tokens = state
-                    .available_tokens
-                    .saturating_add(1)
-                    .min(state.flow_tokens);
+            if config.max_entry_size != 0 && packet.payload.len() > config.max_entry_size {
+                let broadcast = packet.info.destination == BROADCAST_NEM;
+                mac.increment(
+                    &format!(
+                        "num{}PacketsTooLarge{category}",
+                        if broadcast { "Broadcast" } else { "Unicast" }
+                    ),
+                    1,
+                );
+                mac.increment(
+                    &format!(
+                        "num{}BytesTooLarge{category}",
+                        if broadcast { "Broadcast" } else { "Unicast" }
+                    ),
+                    packet.payload.len() as u64,
+                );
+                record_packet_drop(
+                    mac,
+                    &mut state,
+                    category,
+                    packet.info.source,
+                    packet.info.destination,
+                    packet.payload.len(),
+                    PacketDropReason::QueueOverflow,
+                    false,
+                );
+                let update = if state.flow_control {
+                    state.flow_manager.add_token(1).2
+                } else {
+                    None
+                };
+                drop(state);
+                if let Some(tokens) = update {
+                    send_flow_update(mac, tokens);
+                }
+                return;
+            }
+            while state.queues[category].len() >= config.queue_size {
+                if let Some(dropped) = state.queues[category].pop_front() {
+                    record_packet_drop(
+                        mac,
+                        &mut state,
+                        category,
+                        dropped.packet.info.source,
+                        dropped.packet.info.destination,
+                        dropped.packet.payload.len(),
+                        PacketDropReason::QueueOverflow,
+                        false,
+                    );
+                }
+                if state.flow_control {
+                    if let Some(tokens) = state.flow_manager.add_token(1).2 {
+                        send_flow_update(mac, tokens);
+                    }
+                }
             }
         }
         let broadcast = packet.info.destination == BROADCAST_NEM;
         let rts_cts = !broadcast
             && state.rts_threshold != 0
             && packet.payload.len() >= usize::from(state.rts_threshold);
-        state.queues[category].push_back(PendingTx {
+        let entry = PendingTx {
             packet,
             category,
             acquired_at: now,
@@ -2528,15 +2321,20 @@ extern "C" fn process_downstream(
             rts_cts,
             sequence: None,
             phase: TxPhase::Idle,
-        });
-        mac.maximize(
-            &format!("numHighWaterMark{category}"),
-            state.queues[category].len() as u64,
-        );
-        mac.maximize(
-            &format!("numHighWaterMax{category}"),
-            config.queue_size as u64,
-        );
+        };
+        if state.active_tx.is_none() {
+            state.active_tx = Some(entry);
+        } else {
+            state.queues[category].push_back(entry);
+            mac.maximize(
+                &format!("numHighWaterMark{category}"),
+                state.queues[category].len() as u64,
+            );
+            mac.maximize(
+                &format!("numHighWaterMax{category}"),
+                config.queue_size as u64,
+            );
+        }
     }
     drive(mac, now);
 }
@@ -2715,7 +2513,8 @@ extern "C" fn timed(plugin: *mut c_void, timer_id: u64, event: u32, data: *const
         EVENT_R2RI_REPORT => {
             let report = {
                 let state = mac.state.lock().unwrap();
-                (state.started && state.radiometric_enabled).then_some((
+                state.started.then_some((
+                    state.radiometric_enabled,
                     u64::from(DATA_RATES_KBPS[state.multicast_rate_index as usize]) * 1_000,
                     u64::from(
                         DATA_RATES_KBPS[state.unicast_rate_index as usize]
@@ -2725,14 +2524,18 @@ extern "C" fn timed(plugin: *mut c_void, timer_id: u64, event: u32, data: *const
                     state.neighbor_metric_delete_microseconds,
                 ))
             };
-            if let Some((broadcast_rate, max_rate, interval, delete_time)) = report {
-                (mac.framework.publish_r2ri)(
-                    mac.framework.framework_ctx,
-                    broadcast_rate,
-                    max_rate,
-                    interval,
-                    delete_time,
-                );
+            if let Some((enabled, broadcast_rate, max_rate, interval, delete_time)) = report {
+                if enabled {
+                    (mac.framework.publish_r2ri)(
+                        mac.framework.framework_ctx,
+                        broadcast_rate,
+                        max_rate,
+                        interval,
+                        delete_time,
+                    );
+                } else {
+                    (mac.framework.update_neighbor_status)(mac.framework.framework_ctx);
+                }
                 let when = now_us().saturating_add(interval as i64);
                 let timer = schedule(mac, when, EVENT_R2RI_REPORT, &when.to_be_bytes());
                 if timer != 0 {
@@ -2825,7 +2628,7 @@ pub extern "C" fn emane_plugin_create() -> *const PluginApi {
         init,
         configure,
         start,
-        post_start: lifecycle,
+        post_start,
         stop,
         destroy,
         process_upstream,
@@ -3026,6 +2829,12 @@ mod tests {
                 update_neighbor_tx: neighbor_tx_callback,
                 update_neighbor_rx: neighbor_rx_callback,
                 update_neighbor_status: neighbor_status_callback,
+                register_queue_metric: {
+                    extern "C" fn register(_: *mut c_void, _: u16, _: u32) -> bool {
+                        true
+                    }
+                    register
+                },
                 update_queue_metric: queue_callback,
                 publish_r2ri: publish_callback,
                 register_rf_signal_table: register_rf_callback,
@@ -3121,7 +2930,6 @@ mod tests {
         drive(&mac, 1_501);
         let state = mac.state.lock().unwrap();
         assert!(state.queues[0].is_empty());
-        assert_eq!(state.queue_discards[0], 1);
     }
 
     #[test]

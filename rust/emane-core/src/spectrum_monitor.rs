@@ -121,15 +121,6 @@ pub struct SpectrumMonitor {
         HashMap<u64, (HashMap<u64, Vec<FilterRecord>>, HashSet<u64>)>,
 }
 
-fn doppler_shift(freq: u64, doppler_factor: f64) -> i64 {
-    let shift = (freq as f64 * doppler_factor).round();
-    if !shift.is_finite() {
-        0
-    } else {
-        shift.clamp(i64::MIN as f64, i64::MAX as f64) as i64
-    }
-}
-
 fn milliwatt_to_dbm(mw: f64) -> f64 {
     10.0 * mw.log10()
 }
@@ -282,7 +273,7 @@ impl SpectrumMonitor {
         query: &emane_plugin_api::FfiSpectrumQuery,
     ) -> Option<emane_plugin_api::FfiSpectrumResult> {
         let duration = i64::try_from(query.duration_microseconds).ok()?;
-        if duration <= 0 || duration > self.max_duration || !query.rx_power_dbm.is_finite() {
+        if duration > self.max_duration || !query.rx_power_dbm.is_finite() {
             return None;
         }
         let recorder = self.noise_recorder_map.get(&query.frequency_hz)?;
@@ -937,8 +928,11 @@ fn clamp_value(value: i64, maximum: i64, clamp: bool) -> Option<i64> {
 }
 
 fn apply_doppler(frequency: u64, factor: f64) -> u64 {
-    let shifted = i128::from(frequency) + i128::from(doppler_shift(frequency, factor));
-    shifted.clamp(0, i128::from(u64::MAX)) as u64
+    // The C++ monitor converts the shifted frequency to uint64, truncating
+    // the complete frequency rather than rounding the signed shift.
+    let frequency = frequency as f64;
+    let shift = frequency * (1.0 + factor) - frequency;
+    (frequency + shift) as u64
 }
 
 fn overlap_power_mw(overlap: &MaskOverlap, rx_power_mw: f64) -> f64 {
@@ -1399,6 +1393,19 @@ mod tests {
         assert_eq!(span, 10_000);
         assert_eq!(report[0].offset_microsec, 1_000);
         assert_eq!(report[0].duration_microsec, 10_000);
+    }
+
+    #[test]
+    fn doppler_truncates_complete_frequency_in_both_directions() {
+        assert_eq!(apply_doppler(2_400_000_000, 0.0), 2_400_000_000);
+        assert_eq!(
+            apply_doppler(2_400_000_000, 320.75 / 2_400_000_000.0),
+            2_400_000_320
+        );
+        assert_eq!(
+            apply_doppler(2_400_000_000, -320.25 / 2_400_000_000.0),
+            2_399_999_679
+        );
     }
 
     #[test]
@@ -2063,6 +2070,21 @@ mod tests {
         assert_eq!(before.noise_floor_dbm, -30.0);
         assert_eq!(after.noise_floor_dbm, 0.0);
         assert!(!after.signal_in_noise);
+        // The original recorder interprets zero duration as a window ending now.
+        // RF Pipe can legitimately generate it for sub-microsecond airtimes.
+        assert_eq!(
+            monitor
+                .reception_noise(
+                    2_000,
+                    &FfiSpectrumQuery {
+                        duration_microseconds: 0,
+                        ..query
+                    }
+                )
+                .unwrap()
+                .noise_floor_dbm,
+            0.0
+        );
         for query in [
             FfiSpectrumQuery {
                 frequency_hz: 0,
@@ -2070,10 +2092,6 @@ mod tests {
             },
             FfiSpectrumQuery {
                 duration_microseconds: u64::MAX,
-                ..query
-            },
-            FfiSpectrumQuery {
-                duration_microseconds: 0,
                 ..query
             },
             FfiSpectrumQuery {

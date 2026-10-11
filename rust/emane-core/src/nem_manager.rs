@@ -33,7 +33,8 @@ use crate::plugin_interface::{
     CONTROL_RX_ANTENNA_REMOVE, CONTROL_RX_ANTENNA_UPDATE, CONTROL_RX_FREQUENCY_SEGMENTS,
     CONTROL_RX_PROPERTIES, CONTROL_TX_ANTENNA_PROFILE, CONTROL_TX_FREQUENCY_SEGMENTS,
     CONTROL_TX_PROPERTIES, CONTROL_TX_TRANSMITTERS, MAC_REGISTRATION_BENTPIPE, PLUGIN_ABI_VERSION,
-    STATISTIC_VALUE_F64, STATISTIC_VALUE_STRING, STATISTIC_VALUE_U64,
+    STATISTIC_VALUE_F64, STATISTIC_VALUE_I64, STATISTIC_VALUE_STRING, STATISTIC_VALUE_U16,
+    STATISTIC_VALUE_U32, STATISTIC_VALUE_U64, STATISTIC_VALUE_U8,
 };
 use crate::protobufs::emane_message::{
     common_phy_header, CommEffectShimHeader, CommonMacHeader, CommonPhyHeader,
@@ -69,11 +70,11 @@ use crate::{LognormalFadingParameters, LognormalFadingState};
 use libloading::{Library, Symbol};
 use prost::Message;
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{c_void, CStr, CString};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use emane_plugin_api::{
@@ -150,6 +151,9 @@ impl QueuedCall {
     }
 
     fn run(self, invocation: Invocation, downstream: bool) {
+        if !invocation.model_running() {
+            return;
+        }
         let messages = self
             .controls
             .iter()
@@ -203,6 +207,50 @@ impl Invocation {
         (self.queue != 0).then(|| unsafe { &*(self.queue as *const NemQueuedLayer) })
     }
 
+    fn configure_running(self, values: Vec<(String, Vec<String>)>) -> Result<(), String> {
+        let configure = move || {
+            if !self.model_running() {
+                return true;
+            }
+            let guard = ConfigGuard::new(&values);
+            self.call(|api, context| {
+                (api.configure)(
+                    context,
+                    &guard.request as *const FfiConfigRequest as *const c_void,
+                )
+            })
+        };
+        let configured = if let Some(queue) = self.queue() {
+            let wait = queue.is_running();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            queue
+                .enqueue(
+                    QueueTaskKind::Configuration,
+                    Box::new(move || {
+                        let _ = sender.send(configure());
+                    }),
+                )
+                .map_err(|_| "layer configuration queue unavailable".to_string())?;
+            // Before startup or after shutdown, the original accepts and
+            // queues the update without executing a model callback.
+            if !wait {
+                return Ok(());
+            }
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| "layer configuration queue stopped or timed out".to_string())?
+        } else {
+            configure()
+        };
+        configured
+            .then_some(())
+            .ok_or_else(|| "plugin rejected runtime configuration update".to_string())
+    }
+
+    fn model_running(self) -> bool {
+        self.queue().is_none_or(NemQueuedLayer::is_model_running)
+    }
+
     fn process(
         self,
         downstream: bool,
@@ -242,6 +290,9 @@ impl Invocation {
             unsafe { std::slice::from_raw_parts(data, data_len).to_vec() }
         };
         let operation = move || {
+            if !self.model_running() {
+                return;
+            }
             self.call(|api, context| {
                 (api.process_event)(context, event_id, data.as_ptr(), data.len())
             });
@@ -271,6 +322,9 @@ impl Invocation {
     ) {
         let data = data.to_vec();
         let operation = move || {
+            if !self.model_running() {
+                return;
+            }
             self.call(|api, context| {
                 (api.process_timed_event)(context, timer_id, event_id, data.as_ptr(), data.len())
             });
@@ -442,10 +496,11 @@ impl Runtime {
             .unwrap_or_default();
         let legacy_payload =
             encode_legacy_ota_payload(packet_ref, messages, message_count, phy_sequence);
-        let private_controls = legacy_payload
-            .is_none()
-            .then(|| encode_controls(messages, message_count))
-            .flatten();
+        let serialized_controls = if legacy_payload.is_some() {
+            incoming.and_then(encode_legacy_ota_controls)
+        } else {
+            encode_controls(messages, message_count)
+        };
         let private_payload = if packet_ref.payload.len == 0 {
             Some(&[][..])
         } else if packet_ref.payload.data.is_null() {
@@ -455,14 +510,12 @@ impl Runtime {
                 std::slice::from_raw_parts(packet_ref.payload.data, packet_ref.payload.len)
             })
         };
-        if legacy_payload.is_some() || (private_controls.is_some() && private_payload.is_some()) {
-            let payload = legacy_payload
-                .as_deref()
-                .unwrap_or_else(|| private_payload.unwrap());
-            let empty_controls = 0u16.to_be_bytes();
-            let controls = private_controls.as_deref().unwrap_or(&empty_controls);
+        if let (Some(payload), Some(controls)) = (
+            legacy_payload.as_deref().or(private_payload),
+            serialized_controls.as_deref(),
+        ) {
             let _ = emane_rs_ota_manager_send_ota_packet(
-                nem_id,
+                packet_ref.info.source,
                 packet_ref.info.destination,
                 payload.as_ptr(),
                 payload.len(),
@@ -476,16 +529,24 @@ impl Runtime {
         // OTA is a shared medium: every other local PHY must observe the
         // transmission. Packet destination filtering happens in the MAC, not
         // here, so that promiscuous reception and interference remain correct.
-        let ota_transmitters = ffi_control_messages(messages, message_count)
-            .and_then(find_tx_transmitters)
-            .map(|transmitters| {
-                transmitters
-                    .transmitters
-                    .into_iter()
-                    .map(|transmitter| transmitter.nem_id)
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
+        let ota_transmitters = if legacy_payload.is_some() {
+            incoming
+                .and_then(|messages| control_payload(messages, CONTROL_OTA_TRANSMITTERS))
+                .and_then(|bytes| LegacyOtaTransmitterSet::decode(bytes).ok())
+                .map(|set| set.nem_ids.into_iter().map(|id| id as u16).collect())
+                .unwrap_or_default()
+        } else {
+            incoming
+                .and_then(find_tx_transmitters)
+                .map(|transmitters| {
+                    transmitters
+                        .transmitters
+                        .into_iter()
+                        .map(|transmitter| transmitter.nem_id)
+                        .collect::<HashSet<_>>()
+                })
+                .unwrap_or_default()
+        };
         let targets: Vec<Invocation> = {
             let Ok(layers) = self.invocations.read() else {
                 return;
@@ -660,12 +721,20 @@ extern "C" fn ota_packet(
             decoded.messages.as_slice(),
         )
     };
-    if find_tx_transmitters(decoded).is_some_and(|transmitters| {
-        transmitters
-            .transmitters
-            .iter()
-            .any(|transmitter| transmitter.nem_id == context.nem_id)
-    }) {
+    let excluded = if decoded_legacy.is_some() {
+        let Some(transmitters) = decode_legacy_ota_transmitters(control_bytes) else {
+            return;
+        };
+        transmitters.contains(&context.nem_id)
+    } else {
+        find_tx_transmitters(decoded).is_some_and(|transmitters| {
+            transmitters
+                .transmitters
+                .iter()
+                .any(|transmitter| transmitter.nem_id == context.nem_id)
+        })
+    };
+    if excluded {
         return;
     }
     let now = SystemTime::now()
@@ -764,9 +833,94 @@ extern "C" fn unregister_file_descriptor(context_ptr: *mut c_void, handle: u64) 
 }
 
 const MAX_CONTROL_WIRE_SIZE: usize = 16 * 1024 * 1024;
+
+// Serialized OTATransmitterControlMessage, kept separate from the PHY's full
+// transmitter list: only explicitly supplied collaborators belong in this set.
+const CONTROL_OTA_TRANSMITTERS: u32 = 108;
+
+#[derive(Clone, PartialEq, Message)]
+struct LegacyOtaTransmitterSet {
+    #[prost(uint32, repeated, tag = "1")]
+    nem_ids: Vec<u32>,
+}
+
+fn explicit_ota_transmitters(messages: &[FfiControlMessage]) -> LegacyOtaTransmitterSet {
+    let mut nem_ids: Vec<_> = messages
+        .iter()
+        .filter_map(|message| {
+            control_payload(std::slice::from_ref(message), CONTROL_TX_TRANSMITTERS)
+                .and_then(TxTransmitters::decode)
+        })
+        .flat_map(|transmitters| transmitters.transmitters)
+        .map(|transmitter| u32::from(transmitter.nem_id))
+        .collect();
+    // Original FrameworkPHY accumulates a set across every Transmitter control,
+    // while the last such control supplies the PHY header's transmitter vector.
+    nem_ids.sort_unstable();
+    nem_ids.dedup();
+    LegacyOtaTransmitterSet { nem_ids }
+}
+
+fn encode_legacy_ota_controls(messages: &[FfiControlMessage]) -> Option<Vec<u8>> {
+    let Some(payload) = control_payload(messages, CONTROL_OTA_TRANSMITTERS) else {
+        return Some(vec![0, 0]);
+    };
+    let mut result = vec![0, 1];
+    result.extend_from_slice(&(CONTROL_OTA_TRANSMITTERS as u16).to_be_bytes());
+    result.extend_from_slice(&u16::try_from(payload.len()).ok()?.to_be_bytes());
+    result.extend_from_slice(payload);
+    Some(result)
+}
+
+fn decode_legacy_ota_transmitters(data: &[u8]) -> Option<HashSet<u16>> {
+    if data.is_empty() {
+        return Some(HashSet::new());
+    }
+    if data.len() > MAX_CONTROL_WIRE_SIZE {
+        return None;
+    }
+    let count = u16::from_be_bytes(data.get(..2)?.try_into().ok()?);
+    let mut remaining = &data[2..];
+    let mut transmitters = HashSet::new();
+    for _ in 0..count {
+        let header = remaining.get(..4)?;
+        let kind = u16::from_be_bytes(header[..2].try_into().ok()?);
+        let length = usize::from(u16::from_be_bytes(header[2..].try_into().ok()?));
+        let payload = remaining.get(4..4 + length)?;
+        if u32::from(kind) == CONTROL_OTA_TRANSMITTERS {
+            // The receiving OTAManager replaces the set for each control.
+            // Protobuf accepts packed and unpacked repeated uint32 values.
+            transmitters = LegacyOtaTransmitterSet::decode(payload)
+                .ok()?
+                .nem_ids
+                .into_iter()
+                .map(|id| id as u16)
+                .collect();
+        }
+        remaining = &remaining[4 + length..];
+    }
+    Some(transmitters)
+}
 const PHY_BYPASS_REGISTRATION: u32 = 1;
 const PHY_FRAMEWORK_REGISTRATION: u32 = 0x0007;
 const PHY_COMM_EFFECT_REGISTRATION: u32 = 0x0005;
+
+// Native MAC headers travel as controls until OTA serialization, whereas C++
+// prepends its CommonMACHeader before entering FrameworkPHY. Include that wire
+// framing in PHY accounting without exposing it as application payload.
+fn phy_accounted_packet_len(packet: &FfiPacket, messages: &[FfiControlMessage]) -> usize {
+    let header_len = control_payload(messages, CONTROL_MODEL_HEADER)
+        .and_then(ModelHeader::decode)
+        .map(|model| {
+            2 + CommonMacHeader {
+                registration_id: u32::from(model.registration_id),
+                sequence_number: model.sequence,
+            }
+            .encoded_len()
+        })
+        .unwrap_or(0);
+    packet.payload.len.saturating_add(header_len)
+}
 
 fn encode_legacy_ota_payload(
     packet: &FfiPacket,
@@ -1122,6 +1276,7 @@ fn decode_legacy_ota_payload(data: &[u8], source: u16) -> Option<DecodedLegacyOt
         .transmitters
         .iter()
         .find(|transmitter| transmitter.nem_id == u32::from(source))
+        .or_else(|| phy.transmitters.first())
         .map(|transmitter| transmitter.powerd_bm)?;
     let first_antenna = phy.transmit_antennas.first()?;
     let first_group = phy
@@ -1640,7 +1795,17 @@ extern "C" fn set_table_row(
     let Some(values) = values
         .iter()
         .map(|value| match value.value_type {
+            STATISTIC_VALUE_U16 => u16::try_from(value.u64_value)
+                .ok()
+                .map(NativeTableValue::UInt16),
             STATISTIC_VALUE_U64 => Some(NativeTableValue::UInt64(value.u64_value)),
+            STATISTIC_VALUE_U8 => u8::try_from(value.u64_value)
+                .ok()
+                .map(NativeTableValue::UInt8),
+            STATISTIC_VALUE_U32 => u32::try_from(value.u64_value)
+                .ok()
+                .map(NativeTableValue::UInt32),
+            STATISTIC_VALUE_I64 => Some(NativeTableValue::Int64(value.u64_value as i64)),
             STATISTIC_VALUE_F64 if value.f64_value.is_finite() => {
                 Some(NativeTableValue::Double(value.f64_value))
             }
@@ -1739,7 +1904,9 @@ extern "C" fn publish_event(
     if data_len > 16 * 1024 * 1024 || (data_len != 0 && data.is_null()) {
         return false;
     }
-    emane_rs_event_service_send_event(ctx.build_id, ctx.nem_id, event_id, data.cast(), data_len);
+    // Native publication is a broadcast. The event payload identifies its
+    // source; the routing NEM id is the destination selector, not the source.
+    emane_rs_event_service_send_event(ctx.build_id, 0, event_id, data.cast(), data_len);
     true
 }
 
@@ -1753,6 +1920,9 @@ extern "C" fn update_neighbor_tx(
         return;
     };
     if let Ok(mut metrics) = context.neighbor_metrics.lock() {
+        if metrics.get_neighbor_metric_status(destination).is_none() {
+            initialize_neighbor_status_row(context, destination);
+        }
         metrics.handle_tx_activity(
             destination,
             data_rate_bps,
@@ -1783,6 +1953,9 @@ extern "C" fn update_neighbor_rx(
     }
     let uuid: &[u8; 16] = unsafe { &*(uuid.cast()) };
     if let Ok(mut metrics) = context.neighbor_metrics.lock() {
+        if metrics.get_neighbor_metric_status(source).is_none() {
+            initialize_neighbor_status_row(context, source);
+        }
         metrics.handle_rx_activity(
             source,
             sequence,
@@ -1796,6 +1969,32 @@ extern "C" fn update_neighbor_rx(
         if let Some(status) = metrics.get_neighbor_metric_status(source) {
             update_neighbor_metric_table(context, status);
         }
+    }
+}
+
+fn initialize_neighbor_status_row(context: &FrameworkContext, neighbor: u16) {
+    let handle = context
+        .compatibility_tables
+        .lock()
+        .ok()
+        .and_then(|tables| tables.get("NeighborStatusTable").copied());
+    if let Some(handle) = handle {
+        // C++ lookupNeighborData creates both public rows immediately; interval
+        // status remains zero until the first explicit status update.
+        let _ = set_native_table_row(
+            handle,
+            vec![u64::from(neighbor)],
+            vec![
+                NativeTableValue::UInt16(neighbor),
+                NativeTableValue::UInt64(0),
+                NativeTableValue::UInt64(0),
+                NativeTableValue::UInt64(0),
+                NativeTableValue::Double(0.0),
+                NativeTableValue::Double(0.0),
+                NativeTableValue::Double(0.0),
+                NativeTableValue::Double(0.0),
+            ],
+        );
     }
 }
 
@@ -1823,7 +2022,7 @@ extern "C" fn update_neighbor_status(ctx: *mut c_void) {
             handle,
             vec![u64::from(status.neighbor_id)],
             vec![
-                NativeTableValue::UInt64(u64::from(status.neighbor_id)),
+                NativeTableValue::UInt16(status.neighbor_id),
                 NativeTableValue::UInt64(status.num_rx_frames),
                 NativeTableValue::UInt64(status.num_tx_frames),
                 NativeTableValue::UInt64(status.num_rx_missed_frames),
@@ -1850,19 +2049,31 @@ fn update_neighbor_metric_table(
         handle,
         vec![u64::from(status.neighbor_id)],
         vec![
-            NativeTableValue::UInt64(u64::from(status.neighbor_id)),
+            NativeTableValue::UInt16(status.neighbor_id),
             NativeTableValue::UInt64(status.num_rx_frames),
             NativeTableValue::UInt64(status.num_tx_frames),
             NativeTableValue::UInt64(status.num_rx_missed_frames),
-            NativeTableValue::UInt64(status.rx_utilization_microseconds),
+            if status.num_rx_frames == 0 {
+                NativeTableValue::UInt64(0)
+            } else {
+                NativeTableValue::Int64(status.rx_utilization_microseconds as i64)
+            },
             NativeTableValue::Double(status.last_rx_time_seconds),
             NativeTableValue::Double(status.last_tx_time_seconds),
             NativeTableValue::Double(status.sinr_avg),
             NativeTableValue::Double(status.sinr_std),
             NativeTableValue::Double(status.noise_floor_avg),
             NativeTableValue::Double(status.noise_floor_stdv),
-            NativeTableValue::UInt64(status.rx_data_rate_avg),
-            NativeTableValue::UInt64(status.tx_data_rate_avg),
+            if status.num_rx_frames == 0 {
+                NativeTableValue::Double(0.0)
+            } else {
+                NativeTableValue::UInt64(status.rx_data_rate_avg)
+            },
+            if status.num_tx_frames == 0 {
+                NativeTableValue::Double(0.0)
+            } else {
+                NativeTableValue::UInt64(status.tx_data_rate_avg)
+            },
         ],
     );
 }
@@ -1878,7 +2089,9 @@ fn register_spectrum_monitors(state: &BuiltinState) {
         return;
     };
     monitors.retain(|(nem, _), _| *nem != state.id);
-    monitors.insert((state.id, 0), Arc::downgrade(&state.phy.monitor));
+    if state.phy.compatibility_mode == 1 {
+        monitors.insert((state.id, 0), Arc::downgrade(&state.phy.monitor));
+    }
     for (index, antenna) in &state.phy.receive_antennas {
         monitors.insert((state.id, *index), Arc::downgrade(&antenna.monitor));
     }
@@ -1978,6 +2191,17 @@ fn filter_data(messages: &[FfiControlMessage]) -> Option<Vec<u8>> {
                 Some(unsafe { std::slice::from_raw_parts(m.payload.data, m.payload.len) }.to_vec())
             }
         })
+}
+
+extern "C" fn register_queue_metric(ctx: *mut c_void, queue_id: u16, max_size: u32) -> bool {
+    let Some(context) = (unsafe { (ctx as *const FrameworkContext).as_ref() }) else {
+        return false;
+    };
+    context
+        .queue_metrics
+        .lock()
+        .map(|mut metrics| metrics.add_queue_metric(queue_id, max_size))
+        .unwrap_or(false)
 }
 
 extern "C" fn update_queue_metric(
@@ -2604,17 +2828,26 @@ struct BuiltinState {
     ethernet: Box<EthernetTransportState>,
     device_path: String,
     device_name: String,
+    address: IpAddr,
+    mask: IpAddr,
     arp_mode: bool,
     broadcast_mode: bool,
     arp_cache_mode: bool,
     arp_priority: u8,
     unknown_priorities: HashMap<u16, u8>,
     flow_control_enabled: bool,
-    flow_control_tokens: u16,
-    pending_transport_frames: VecDeque<PendingTransportFrame>,
+    transport_flow: Mutex<TransportFlow>,
+    transport_flow_changed: Condvar,
     bitrate_bps: u64,
+    bit_pool: crate::bit_pool::BitPool,
     counters: CommonLayerCounters,
     phy: PhyState,
+}
+
+#[derive(Default)]
+struct TransportFlow {
+    tokens: u16,
+    stopped: bool,
 }
 
 struct PendingTransportFrame {
@@ -2648,6 +2881,7 @@ struct PhyState {
     gain_cache_hit_counter: u64,
     gain_cache_miss_counter: u64,
     gain_cache: HashMap<Vec<u64>, (f64, f64)>,
+    gain_antennas: HashMap<(u16, u16), MimoTxAntenna>,
     frequency_hz: u64,
     frequencies_of_interest: Vec<u64>,
     bandwidth_hz: u64,
@@ -2664,6 +2898,7 @@ struct PhyState {
     nakagami_parameters: NakagamiParameters,
     lognormal_states: HashMap<u16, LognormalFadingState>,
     lognormal_parameters: LognormalFadingParameters,
+    lognormal_configured: bool,
     doppler_shift_enabled: bool,
     spectral_mask_index: u16,
     radio_silence_enabled: bool,
@@ -2702,14 +2937,14 @@ struct Location {
     orientation: Orientation,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct Velocity {
     azimuth_degrees: f64,
     elevation_degrees: f64,
     magnitude_meters_per_second: f64,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct Orientation {
     roll_degrees: f64,
     pitch_degrees: f64,
@@ -2785,6 +3020,7 @@ impl PhyState {
             gain_cache_hit_counter: 0,
             gain_cache_miss_counter: 0,
             gain_cache: HashMap::new(),
+            gain_antennas: HashMap::new(),
             frequency_hz: 2_347_000_000,
             frequencies_of_interest: vec![2_347_000_000],
             bandwidth_hz: 1_000_000,
@@ -2817,6 +3053,7 @@ impl PhyState {
                 lstddev: 0.001,
                 counter: 1,
             },
+            lognormal_configured: false,
             doppler_shift_enabled: true,
             spectral_mask_index: 0,
             radio_silence_enabled: false,
@@ -2845,6 +3082,15 @@ impl PhyState {
         velocity: Option<Velocity>,
     ) {
         let previous = self.locations.get(&nem_id).copied();
+        if previous.is_some_and(|old| {
+            old.latitude_degrees == latitude_degrees
+                && old.longitude_degrees == longitude_degrees
+                && old.altitude_meters == altitude_meters
+                && orientation.is_none_or(|value| value == old.orientation)
+                && velocity.is_none_or(|value| value == old.velocity.unwrap_or_default())
+        }) {
+            return;
+        }
         self.locations.insert(
             nem_id,
             Location {
@@ -2857,6 +3103,13 @@ impl PhyState {
                 velocity: velocity.or_else(|| previous.and_then(|location| location.velocity)),
             },
         );
+        // Preserve every change, including A -> B -> A before the next packet.
+        // Incomplete location pairs still share the original invalid sequence.
+        self.gain_cache.retain(|key, _| {
+            !((key[0] == u64::from(nem_id) || key[1] == u64::from(nem_id))
+                && self.locations.contains_key(&(key[0] as u16))
+                && self.locations.contains_key(&(key[1] as u16)))
+        });
     }
 
     fn receiver_sensitivity_dbm(&self) -> f64 {
@@ -2891,9 +3144,9 @@ impl PhyState {
                     frequency_hz,
                 ],
                 vec![
-                    NativeTableValue::UInt64(u64::from(source)),
-                    NativeTableValue::UInt64(u64::from(receive_antenna)),
-                    NativeTableValue::UInt64(u64::from(transmit_antenna)),
+                    NativeTableValue::UInt16(source),
+                    NativeTableValue::UInt16(receive_antenna),
+                    NativeTableValue::UInt16(transmit_antenna),
                     NativeTableValue::UInt64(frequency_hz),
                     NativeTableValue::Double(receive_power_dbm),
                     NativeTableValue::Double(transmit_gain_db),
@@ -2930,11 +3183,11 @@ impl PhyState {
                     frequency_hz,
                 ],
                 vec![
-                    NativeTableValue::UInt64(u64::from(source)),
-                    NativeTableValue::UInt64(u64::from(receive_antenna)),
-                    NativeTableValue::UInt64(u64::from(transmit_antenna)),
+                    NativeTableValue::UInt16(source),
+                    NativeTableValue::UInt16(receive_antenna),
+                    NativeTableValue::UInt16(transmit_antenna),
                     NativeTableValue::UInt64(frequency_hz),
-                    NativeTableValue::UInt64(u64::from(spectral_mask_index)),
+                    NativeTableValue::UInt16(spectral_mask_index),
                     NativeTableValue::Double(receive_power_dbm),
                     NativeTableValue::Double(packet_time_seconds),
                 ],
@@ -3036,6 +3289,36 @@ impl PhyState {
         self.antenna_pair_gains_for(local_id, source, 0, 0, local_pattern, remote_pattern)
     }
 
+    fn update_gain_antenna(&mut self, nem_id: u16, antenna: MimoTxAntenna) {
+        let key = (nem_id, antenna.antenna_index);
+        if self.gain_antennas.get(&key).is_some_and(|previous| {
+            let same_pattern = match (previous.pattern, antenna.pattern) {
+                (AntennaPattern::Default, AntennaPattern::Default) => true,
+                (
+                    AntennaPattern::IdealOmni { gain_db: a },
+                    AntennaPattern::IdealOmni { gain_db: b },
+                ) => (a - b).abs() < 0.00001,
+                (AntennaPattern::Profile(a), AntennaPattern::Profile(b)) => {
+                    a.profile_id == b.profile_id
+                        && (a.azimuth_degrees - b.azimuth_degrees).abs() < 0.00001
+                        && (a.elevation_degrees - b.elevation_degrees).abs() < 0.00001
+                }
+                _ => false,
+            };
+            previous.bandwidth_hz == antenna.bandwidth_hz && same_pattern
+        }) {
+            return;
+        }
+        // AntennaManager changes its sequence on bandwidth or pattern changes,
+        // even if no gain calculation occurs between updates. Group and mask
+        // indices are not part of the original Antenna equality comparison.
+        self.gain_antennas.insert(key, antenna);
+        self.gain_cache.retain(|pair, _| {
+            !(pair[0] == u64::from(nem_id) && pair[2] == u64::from(antenna.antenna_index)
+                || pair[1] == u64::from(nem_id) && pair[3] == u64::from(antenna.antenna_index))
+        });
+    }
+
     fn antenna_pair_gains_for(
         &mut self,
         local_id: u16,
@@ -3045,6 +3328,14 @@ impl PhyState {
         local_pattern: AntennaPattern,
         remote_pattern: AntennaPattern,
     ) -> Result<(f64, f64, bool), PhyPathError> {
+        let local_pattern = self
+            .gain_antennas
+            .get(&(local_id, receive_index))
+            .map_or(local_pattern, |a| a.pattern);
+        let remote_pattern = self
+            .gain_antennas
+            .get(&(source, transmit_index))
+            .map_or(remote_pattern, |a| a.pattern);
         let local_pattern = match local_pattern {
             AntennaPattern::Default => self
                 .default_antenna_pattern(local_id)
@@ -3097,7 +3388,11 @@ impl PhyState {
                 placement.2.to_bits(),
             ]);
         }
+        let valid_pair =
+            self.locations.contains_key(&local_id) && self.locations.contains_key(&source);
+        key.push(u64::from(valid_pair));
         for location in [self.locations.get(&local_id), self.locations.get(&source)] {
+            let location = location.filter(|_| valid_pair);
             if let Some(location) = location {
                 key.extend([
                     location.latitude_degrees.to_bits(),
@@ -3107,8 +3402,15 @@ impl PhyState {
                     location.orientation.pitch_degrees.to_bits(),
                     location.orientation.yaw_degrees.to_bits(),
                 ]);
+                // LocationManager invalidates pair information on velocity changes too.
+                let velocity = location.velocity.unwrap_or_default();
+                key.extend([
+                    velocity.azimuth_degrees.to_bits(),
+                    velocity.elevation_degrees.to_bits(),
+                    velocity.magnitude_meters_per_second.to_bits(),
+                ]);
             } else {
-                key.extend([0; 6]);
+                key.extend([0; 9]);
             }
         }
         if let Some((receive_gain, transmit_gain)) = self.gain_cache.get(&key).copied() {
@@ -3155,6 +3457,11 @@ impl PhyState {
                 },
             )
             .ok_or(PhyPathError::GainProfile)?;
+        // GainManager retains only the latest result for each antenna pair.
+        // Keeping historical configurations incorrectly turns A -> B -> A
+        // updates into cache hits and grows the cache without a bound.
+        self.gain_cache
+            .retain(|previous, _| previous[..4] != key[..4]);
         self.gain_cache.insert(key, (receive_gain, transmit_gain));
         Ok((receive_gain, transmit_gain, false))
     }
@@ -3372,10 +3679,10 @@ impl PhyState {
             remote_position.1 - local_position.1,
             remote_position.2 - local_position.2,
         );
-        let distance = position_delta
-            .0
-            .hypot(position_delta.1)
-            .hypot(position_delta.2);
+        let distance = (position_delta.0 * position_delta.0
+            + position_delta.1 * position_delta.1
+            + position_delta.2 * position_delta.2)
+            .sqrt();
         if distance <= f64::EPSILON || !distance.is_finite() {
             return 0.0;
         }
@@ -3386,10 +3693,20 @@ impl PhyState {
             local_velocity.1 - remote_velocity.1,
             local_velocity.2 - remote_velocity.2,
         );
-        let radial_velocity = (position_delta.0 * velocity_delta.0
+        let dot_product = position_delta.0 * velocity_delta.0
             + position_delta.1 * velocity_delta.1
-            + position_delta.2 * velocity_delta.2)
-            / distance;
+            + position_delta.2 * velocity_delta.2;
+        let magnitude = (velocity_delta.0 * velocity_delta.0
+            + velocity_delta.1 * velocity_delta.1
+            + velocity_delta.2 * velocity_delta.2)
+            .sqrt();
+        if magnitude == 0.0 {
+            return 0.0;
+        }
+        // Preserve the original operation order: simplifying this projection
+        // changes the last bit of the published double-precision Doppler shift.
+        let cos_theta = dot_product / (distance * magnitude);
+        let radial_velocity = magnitude * cos_theta;
         const SPEED_OF_LIGHT: f64 = 299_792_458.0;
         let denominator = SPEED_OF_LIGHT - radial_velocity;
         if denominator <= 0.0 || !denominator.is_finite() {
@@ -3528,9 +3845,9 @@ fn adjusted_orientation(location: Location) -> Orientation {
 
 fn rotate_neu(vector: (f64, f64, f64), orientation: Orientation) -> (f64, f64, f64) {
     let (north, east, up) = vector;
-    let yaw = orientation.yaw_degrees.to_radians();
-    let pitch = orientation.pitch_degrees.to_radians();
-    let roll = orientation.roll_degrees.to_radians();
+    let yaw = degrees_to_radians(orientation.yaw_degrees);
+    let pitch = degrees_to_radians(orientation.pitch_degrees);
+    let roll = degrees_to_radians(orientation.roll_degrees);
     (
         north * yaw.cos() * pitch.cos() + east * yaw.sin() * pitch.cos() + up * pitch.sin(),
         north * (yaw.cos() * pitch.sin() * roll.sin() - yaw.sin() * roll.cos())
@@ -3557,8 +3874,8 @@ fn relative_neu(local: Location, remote: Location) -> (f64, f64, f64) {
     let x = remote_ecef.0 - local_ecef.0;
     let y = remote_ecef.1 - local_ecef.1;
     let z = remote_ecef.2 - local_ecef.2;
-    let latitude = local.latitude_degrees.to_radians();
-    let longitude = local.longitude_degrees.to_radians();
+    let latitude = degrees_to_radians(local.latitude_degrees);
+    let longitude = degrees_to_radians(local.longitude_degrees);
     let north = -x * latitude.sin() * longitude.cos() - y * latitude.sin() * longitude.sin()
         + z * latitude.cos();
     let east = -x * longitude.sin() + y * longitude.cos();
@@ -3573,8 +3890,8 @@ fn position_ecef(location: Location) -> (f64, f64, f64) {
     const SEMI_MINOR: f64 = 6_356_752.314_2;
     const ECCENTRICITY_SQUARED: f64 =
         (SEMI_MAJOR * SEMI_MAJOR - SEMI_MINOR * SEMI_MINOR) / (SEMI_MAJOR * SEMI_MAJOR);
-    let latitude = location.latitude_degrees.to_radians();
-    let longitude = location.longitude_degrees.to_radians();
+    let latitude = degrees_to_radians(location.latitude_degrees);
+    let longitude = degrees_to_radians(location.longitude_degrees);
     let radius = SEMI_MAJOR / (1.0 - ECCENTRICITY_SQUARED * latitude.sin().powi(2)).sqrt();
     (
         (radius + location.altitude_meters) * latitude.cos() * longitude.cos(),
@@ -3584,8 +3901,8 @@ fn position_ecef(location: Location) -> (f64, f64, f64) {
 }
 
 fn velocity_neu(velocity: Velocity) -> (f64, f64, f64) {
-    let azimuth = velocity.azimuth_degrees.to_radians();
-    let elevation = velocity.elevation_degrees.to_radians();
+    let azimuth = degrees_to_radians(velocity.azimuth_degrees);
+    let elevation = degrees_to_radians(velocity.elevation_degrees);
     let horizontal = velocity.magnitude_meters_per_second * elevation.cos();
     (
         horizontal * azimuth.cos(),
@@ -3596,8 +3913,8 @@ fn velocity_neu(velocity: Velocity) -> (f64, f64, f64) {
 
 fn velocity_ecef(velocity: Velocity, location: Location) -> (f64, f64, f64) {
     let velocity = velocity_neu(velocity);
-    let latitude = location.latitude_degrees.to_radians();
-    let longitude = location.longitude_degrees.to_radians();
+    let latitude = degrees_to_radians(location.latitude_degrees);
+    let longitude = degrees_to_radians(location.longitude_degrees);
     // Preserve the legacy EMANE transform exactly, including its historical
     // longitude terms, because these values are part of the published Doppler
     // and receive-power contracts.
@@ -3610,6 +3927,14 @@ fn velocity_ecef(velocity: Velocity, location: Location) -> (f64, f64, f64) {
     )
 }
 
+// The original conversion multiplies in extended precision before returning a
+// double. A compensated product retains that precision without a C++ runtime.
+fn degrees_to_radians(degrees: f64) -> f64 {
+    const HIGH: f64 = std::f64::consts::PI / 180.0;
+    const LOW: f64 = 2.947_674_656_444_965e-19;
+    degrees.mul_add(HIGH, degrees * LOW)
+}
+
 fn normalize_azimuth(value: f64) -> f64 {
     value.rem_euclid(360.0)
 }
@@ -3617,8 +3942,8 @@ fn normalize_azimuth(value: f64) -> f64 {
 fn normalize_elevation(value: f64) -> f64 {
     let value = value.rem_euclid(360.0);
     match value {
-        value if value > 270.0 => value - 360.0,
-        value if value > 90.0 => 180.0 - value,
+        value if value >= 270.0 => value - 360.0,
+        value if value > 90.0 => value - 180.0,
         value => value,
     }
 }
@@ -3637,15 +3962,18 @@ fn builtin_init(id: u16, framework: *const FfiFrameworkService, kind: BuiltinKin
         ethernet: Box::new(EthernetTransportState::new()),
         device_path: "/dev/net/tun".to_string(),
         device_name: "emane0".to_string(),
+        address: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        mask: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
         arp_mode: true,
         broadcast_mode: false,
         arp_cache_mode: true,
         arp_priority: 0,
         unknown_priorities: HashMap::new(),
         flow_control_enabled: false,
-        flow_control_tokens: 0,
-        pending_transport_frames: VecDeque::new(),
+        transport_flow: Mutex::new(TransportFlow::default()),
+        transport_flow_changed: Condvar::new(),
         bitrate_bps: 0,
+        bit_pool: crate::bit_pool::BitPool::default(),
         counters: match kind {
             BuiltinKind::Phy => CommonLayerCounters::register_with_drop_labels(
                 framework,
@@ -3914,9 +4242,31 @@ extern "C" fn builtin_configure(state: *mut c_void, request: *const c_void) -> b
     let Some(state) = (unsafe { (state as *mut BuiltinState).as_mut() }) else {
         return false;
     };
-    let Some(items) = (unsafe { config_items(request) }) else {
+    let Some(mut items) = (unsafe { config_items(request) }) else {
         return false;
     };
+    if matches!(state.kind, BuiltinKind::Phy) && !state.phy.lognormal_configured {
+        // C++ starts the manager at zero, applies explicit values first, then
+        // missing defaults in name order. Applying preloaded defaults instead
+        // changes the result of the interdependent threshold/loss setters.
+        state.phy.lognormal_parameters = LognormalFadingParameters {
+            dmu: 0.0,
+            dsigma: 0.0,
+            dlthresh: 0.0,
+            maxpathloss: 0.0,
+            duthresh: 0.0,
+            minpathloss: 0.0,
+            lmean: 0.0,
+            lstddev: 0.0,
+            counter: 0,
+        };
+        for (name, values) in component_configuration_defaults("emanephy") {
+            if name.starts_with("fading.lognormal.") && !items.iter().any(|(key, _)| *key == name) {
+                items.push((name, values.iter().map(ConfigurationValue::text).collect()));
+            }
+        }
+        state.phy.lognormal_configured = true;
+    }
     // Runtime power/gain/fading changes must not destroy pending noise windows.
     let reset_monitor = items.iter().any(|(name, _)| {
         matches!(
@@ -4095,6 +4445,10 @@ extern "C" fn builtin_configure(state: *mut c_void, request: *const c_void) -> b
                 };
                 if !value.is_finite() {
                     return false;
+                }
+                if state.phy.fixed_antenna_gain_db != value && state.phy.fixed_antenna_gain_enabled
+                {
+                    state.phy.gain_cache.retain(|key, _| key[2] != 0);
                 }
                 state.phy.fixed_antenna_gain_db = value;
             }
@@ -4282,9 +4636,7 @@ extern "C" fn builtin_configure(state: *mut c_void, request: *const c_void) -> b
                 if !parsed.is_finite()
                     || (matches!(
                         name.as_str(),
-                        "fading.lognormal.dsigma"
-                            | "fading.lognormal.lmean"
-                            | "fading.lognormal.lstddev"
+                        "fading.lognormal.lmean" | "fading.lognormal.lstddev"
                     ) && parsed < 0.0)
                 {
                     return false;
@@ -4292,13 +4644,29 @@ extern "C" fn builtin_configure(state: *mut c_void, request: *const c_void) -> b
                 match name.as_str() {
                     "fading.lognormal.dmu" => state.phy.lognormal_parameters.dmu = parsed,
                     "fading.lognormal.dsigma" => state.phy.lognormal_parameters.dsigma = parsed,
-                    "fading.lognormal.dlthresh" => state.phy.lognormal_parameters.dlthresh = parsed,
-                    "fading.lognormal.duthresh" => state.phy.lognormal_parameters.duthresh = parsed,
+                    "fading.lognormal.dlthresh" => {
+                        state.phy.lognormal_parameters.dlthresh = parsed;
+                        if parsed > state.phy.lognormal_parameters.duthresh {
+                            state.phy.lognormal_parameters.duthresh = parsed;
+                        }
+                    }
+                    "fading.lognormal.duthresh" => {
+                        state.phy.lognormal_parameters.duthresh = parsed;
+                        if parsed < state.phy.lognormal_parameters.dlthresh {
+                            state.phy.lognormal_parameters.dlthresh = parsed;
+                        }
+                    }
                     "fading.lognormal.maxpathloss" => {
-                        state.phy.lognormal_parameters.maxpathloss = parsed
+                        state.phy.lognormal_parameters.maxpathloss = parsed;
+                        if parsed <= state.phy.lognormal_parameters.minpathloss {
+                            state.phy.lognormal_parameters.minpathloss = parsed - 0.001;
+                        }
                     }
                     "fading.lognormal.minpathloss" => {
-                        state.phy.lognormal_parameters.minpathloss = parsed
+                        state.phy.lognormal_parameters.minpathloss = parsed;
+                        if parsed >= state.phy.lognormal_parameters.maxpathloss {
+                            state.phy.lognormal_parameters.maxpathloss = parsed + 0.001;
+                        }
                     }
                     "fading.lognormal.lmean" => state.phy.lognormal_parameters.lmean = parsed,
                     _ => state.phy.lognormal_parameters.lstddev = parsed,
@@ -4318,11 +4686,14 @@ extern "C" fn builtin_configure(state: *mut c_void, request: *const c_void) -> b
                     None => return false,
                 };
             }
-            // These were retained for configuration compatibility by the
-            // historical virtual transport but were not applied to the TUN.
             "address" | "mask" => {
-                if value.parse::<IpAddr>().is_err() {
+                let Ok(address) = value.parse::<IpAddr>() else {
                     return false;
+                };
+                if name == "address" {
+                    state.address = address;
+                } else {
+                    state.mask = address;
                 }
             }
             _ => return false,
@@ -4339,9 +4710,6 @@ extern "C" fn builtin_configure(state: *mut c_void, request: *const c_void) -> b
                 != 0
             || state.phy.nakagami_parameters.distance0_meters
                 >= state.phy.nakagami_parameters.distance1_meters
-            || state.phy.lognormal_parameters.dlthresh > state.phy.lognormal_parameters.duthresh
-            || state.phy.lognormal_parameters.minpathloss
-                >= state.phy.lognormal_parameters.maxpathloss
         {
             return false;
         }
@@ -4374,6 +4742,11 @@ extern "C" fn builtin_start(state: *mut c_void) -> bool {
             let Ok(path) = CString::new(state.device_path.as_str()) else {
                 return false;
             };
+            let Some(transport) = (unsafe { state.virtual_transport.as_mut() }) else {
+                return false;
+            };
+            transport.set_address(state.address, state.mask);
+            state.bit_pool.start(state.bitrate_bps);
             emane_rs_virtual_transport_start(
                 state.virtual_transport,
                 path.as_ptr(),
@@ -4387,26 +4760,67 @@ extern "C" fn builtin_start(state: *mut c_void) -> bool {
     }
 }
 
-extern "C" fn builtin_post_start(_: *mut c_void) {}
+fn transport_flow_ack(state: &BuiltinState, token: FlowControlToken) {
+    let bytes = token.encode();
+    let message = FfiControlMessage {
+        msg_type: CONTROL_FLOW_CONTROL_TOKEN,
+        payload: FfiSlice {
+            data: bytes.as_ptr(),
+            len: bytes.len(),
+        },
+    };
+    (state.framework.send_downstream_control)(state.framework.framework_ctx, state.id, &message, 1);
+}
 
-extern "C" fn builtin_stop(state: *mut c_void) {
-    if let Some(state) = unsafe { (state as *mut BuiltinState).as_mut() } {
-        state.flow_control_tokens = 0;
-        state.pending_transport_frames.clear();
+extern "C" fn builtin_post_start(state: *mut c_void) {
+    let Some(state) = (unsafe { (state as *mut BuiltinState).as_ref() }) else {
+        return;
+    };
+    if state.flow_control_enabled
+        && matches!(
+            state.kind,
+            BuiltinKind::VirtualTransport | BuiltinKind::RawTransport
+        )
+    {
+        transport_flow_ack(
+            state,
+            FlowControlToken {
+                tokens: state.transport_flow.lock().unwrap().tokens,
+            },
+        );
+    }
+}
+
+extern "C" fn builtin_stop(context: *mut c_void) {
+    if let Some(state) = unsafe { (context as *const BuiltinState).as_ref() } {
+        state.bit_pool.cancel();
+        // Wake a reader waiting for credit before joining its device thread.
+        state.transport_flow.lock().unwrap().stopped = true;
+        state.transport_flow_changed.notify_all();
         match state.kind {
             BuiltinKind::VirtualTransport => {
                 emane_rs_virtual_transport_stop(state.virtual_transport)
             }
             BuiltinKind::RawTransport => emane_rs_raw_transport_stop(state.raw_transport),
             BuiltinKind::Phy => {
-                state.phy.processing_pool.take();
+                // PHY has no device reader borrowing this state.
+                unsafe { &mut *(context as *mut BuiltinState) }
+                    .phy
+                    .processing_pool
+                    .take();
+                return;
             }
         }
+        // Join the device reader before clearing its pending frame.
+        *state.transport_flow.lock().unwrap() = TransportFlow::default();
     }
 }
 
 extern "C" fn builtin_destroy(state: *mut c_void) {
     if !state.is_null() {
+        if unsafe { (*(state as *const BuiltinState)).kind } != BuiltinKind::Phy {
+            builtin_stop(state);
+        }
         let state = unsafe { Box::from_raw(state as *mut BuiltinState) };
         match state.kind {
             BuiltinKind::VirtualTransport => {
@@ -4438,28 +4852,10 @@ extern "C" fn builtin_query_unknown(
     }
 }
 
-fn pacing_duration(payload_len: usize, bitrate_bps: u64) -> Duration {
-    if bitrate_bps == 0 || payload_len == 0 {
-        return Duration::ZERO;
-    }
-    let nanos = (payload_len as u128)
-        .saturating_mul(8_000_000_000)
-        .div_ceil(u128::from(bitrate_bps))
-        .min(u128::from(u64::MAX)) as u64;
-    Duration::from_nanos(nanos)
-}
-
-fn pace_transport(payload_len: usize, bitrate_bps: u64) {
-    let duration = pacing_duration(payload_len, bitrate_bps);
-    if !duration.is_zero() {
-        std::thread::sleep(duration);
-    }
-}
-
 fn send_transport_frame(
     framework: FfiFrameworkService,
     id: u16,
-    bitrate_bps: u64,
+    bit_pool: &crate::bit_pool::BitPool,
     counters: CommonLayerCounters,
     frame: &PendingTransportFrame,
 ) {
@@ -4490,32 +4886,11 @@ fn send_transport_frame(
         false,
     );
     (framework.send_downstream_packet)(framework.framework_ctx, id, &packet, std::ptr::null(), 0);
-    pace_transport(frame.payload.len(), bitrate_bps);
-}
-
-fn release_transport_frames(
-    enabled: bool,
-    available_tokens: &mut u16,
-    pending: &mut VecDeque<PendingTransportFrame>,
-    update: FlowControlToken,
-) -> Vec<PendingTransportFrame> {
-    if !enabled {
-        return Vec::new();
-    }
-    *available_tokens = update.tokens;
-    let mut frames = Vec::new();
-    while *available_tokens != 0 {
-        let Some(frame) = pending.pop_front() else {
-            break;
-        };
-        *available_tokens -= 1;
-        frames.push(frame);
-    }
-    frames
+    bit_pool.get((frame.payload.len() as u64).saturating_mul(8));
 }
 
 extern "C" fn builtin_ethernet_downstream(context: *mut c_void, data: *const u8, len: usize) {
-    let Some(state) = (unsafe { (context as *mut BuiltinState).as_mut() }) else {
+    let Some(state) = (unsafe { (context as *const BuiltinState).as_ref() }) else {
         return;
     };
     if (len != 0 && data.is_null())
@@ -4562,25 +4937,30 @@ extern "C" fn builtin_ethernet_downstream(context: *mut c_void, data: *const u8,
         frame.payload.len(),
     );
     if state.flow_control_enabled {
-        if state.flow_control_tokens == 0 {
-            state.pending_transport_frames.push_back(frame);
+        let mut flow = state.transport_flow.lock().unwrap();
+        // Match FlowControlClient::removeToken: retain one parsed frame on
+        // the device thread, leaving further traffic in the kernel TAP queue.
+        // Releasing this lock while waiting lets grants and stop wake us.
+        while flow.tokens == 0 && !flow.stopped {
+            flow = state.transport_flow_changed.wait(flow).unwrap();
+        }
+        if flow.stopped {
             return;
         }
-        state.flow_control_tokens -= 1;
+        flow.tokens -= 1;
     }
     let framework = state.framework;
     let id = state.id;
-    let bitrate_bps = state.bitrate_bps;
-    send_transport_frame(framework, id, bitrate_bps, state.counters, &frame);
+    send_transport_frame(framework, id, &state.bit_pool, state.counters, &frame);
 }
 
 extern "C" fn builtin_upstream(
-    state: *mut c_void,
+    context: *mut c_void,
     packet: *const FfiPacket,
     messages: *const FfiControlMessage,
     count: usize,
 ) {
-    let Some(state) = (unsafe { (state as *mut BuiltinState).as_mut() }) else {
+    let Some(state) = (unsafe { (context as *const BuiltinState).as_ref() }) else {
         return;
     };
     if packet.is_null()
@@ -4592,28 +4972,31 @@ extern "C" fn builtin_upstream(
         let Some(incoming) = ffi_control_messages(messages, count) else {
             return;
         };
-        let Some(token) = control_payload(incoming, CONTROL_FLOW_CONTROL_TOKEN)
-            .and_then(FlowControlToken::decode)
-        else {
+        if !state.flow_control_enabled {
             return;
-        };
-        let frames = release_transport_frames(
-            state.flow_control_enabled,
-            &mut state.flow_control_tokens,
-            &mut state.pending_transport_frames,
-            token,
-        );
-        let framework = state.framework;
-        let id = state.id;
-        let bitrate_bps = state.bitrate_bps;
-        for frame in &frames {
-            send_transport_frame(framework, id, bitrate_bps, state.counters, frame);
+        }
+        for message in incoming {
+            if message.msg_type != CONTROL_FLOW_CONTROL_TOKEN {
+                continue;
+            }
+            let Some(token) =
+                control_payload(std::slice::from_ref(message), CONTROL_FLOW_CONTROL_TOKEN)
+                    .and_then(FlowControlToken::decode)
+            else {
+                continue;
+            };
+            let mut flow = state.transport_flow.lock().unwrap();
+            // Publish the ACK before the device reader can consume the grant.
+            transport_flow_ack(state, token);
+            flow.tokens = token.tokens;
+            state.transport_flow_changed.notify_all();
         }
         return;
     }
     let received_at = unix_time_microseconds();
     match state.kind {
         BuiltinKind::Phy => {
+            let state = unsafe { &mut *(context as *mut BuiltinState) };
             let Some(packet) = (unsafe { packet.as_ref() }) else {
                 (state.framework.send_upstream_control)(
                     state.framework.framework_ctx,
@@ -4623,11 +5006,15 @@ extern "C" fn builtin_upstream(
                 );
                 return;
             };
+            let accounted_len = phy_accounted_packet_len(
+                packet,
+                ffi_control_messages(messages, count).unwrap_or_default(),
+            );
             state.counters.upstream_rx_packet(
                 state.framework,
                 packet.info.source,
                 packet.info.destination,
-                packet.payload.len,
+                accounted_len,
             );
             let Some(incoming) = ffi_control_messages(messages, count) else {
                 state.counters.upstream_drop_packet(
@@ -4651,7 +5038,7 @@ extern "C" fn builtin_upstream(
                     state.framework,
                     packet.info.source,
                     packet.info.destination,
-                    packet.payload.len,
+                    accounted_len,
                     unix_time_microseconds().saturating_sub(received_at).max(0) as u64,
                 );
                 return;
@@ -4790,7 +5177,7 @@ extern "C" fn builtin_upstream(
                 state.framework,
                 packet.info.source,
                 packet.info.destination,
-                packet.payload.len,
+                accounted_len,
                 unix_time_microseconds().saturating_sub(received_at).max(0) as u64,
             );
             (state.framework.send_upstream_packet)(
@@ -4857,7 +5244,9 @@ extern "C" fn builtin_upstream(
                 packet.payload.len,
                 unix_time_microseconds().saturating_sub(received_at).max(0) as u64,
             );
-            pace_transport(packet.payload.len, state.bitrate_bps);
+            state
+                .bit_pool
+                .get((packet.payload.len as u64).saturating_mul(8));
         }
         _ => {}
     }
@@ -4885,9 +5274,15 @@ extern "C" fn builtin_downstream(
                 std::slice::from_raw_parts(message.payload.data, message.payload.len)
             })
         }) {
-            state.phy.bandwidth_hz = foi.bandwidth_hz;
-            state.phy.frequencies_of_interest = foi.frequencies_hz;
-            state.phy.initialize_monitor();
+            if state.phy.compatibility_mode == 1 {
+                // A zero bandwidth preserves the current bandwidth; an empty
+                // frequency set clears reception (for example a TDMA flush).
+                if foi.bandwidth_hz != 0 {
+                    state.phy.bandwidth_hz = foi.bandwidth_hz;
+                }
+                state.phy.frequencies_of_interest = foi.frequencies_hz;
+                state.phy.initialize_monitor();
+            }
         }
         for message in incoming {
             let payload = if message.payload.len == 0 || message.payload.data.is_null() {
@@ -4942,6 +5337,7 @@ extern "C" fn builtin_downstream(
                             .default_antenna_pattern(state.id)
                             .unwrap_or(AntennaPattern::Default);
                     }
+                    state.phy.update_gain_antenna(state.id, add.antenna);
                     if message.msg_type == CONTROL_RX_ANTENNA_UPDATE {
                         // Pointing/gain changes leave the antenna's spectrum history,
                         // filters, configured bandwidth and FOI intact.
@@ -4984,6 +5380,14 @@ extern "C" fn builtin_downstream(
                 CONTROL_RX_ANTENNA_REMOVE => {
                     if let Some(remove) = RxAntennaRemove::decode(payload) {
                         state.phy.receive_antennas.remove(&remove.antenna_index);
+                        state
+                            .phy
+                            .gain_antennas
+                            .remove(&(state.id, remove.antenna_index));
+                        state
+                            .phy
+                            .gain_cache
+                            .retain(|key, _| key[2] != u64::from(remove.antenna_index));
                         state.phy.nakagami.remove(&remove.antenna_index);
                         state.phy.lognormal_states.remove(&remove.antenna_index);
                     }
@@ -5004,11 +5408,12 @@ extern "C" fn builtin_downstream(
             );
             return;
         }
+        let accounted_len = phy_accounted_packet_len(packet, incoming);
         state.counters.downstream_rx_packet(
             state.framework,
             packet.info.source,
             packet.info.destination,
-            packet.payload.len,
+            accounted_len,
         );
         let now = unix_time_microseconds();
         let mut tx = find_tx_properties(incoming).unwrap_or(TxProperties {
@@ -5031,9 +5436,6 @@ extern "C" fn builtin_downstream(
         if !tx.tx_power_dbm.is_finite() {
             tx.tx_power_dbm = state.phy.tx_power_dbm;
         }
-        if tx.duration_microseconds == 0 {
-            tx.duration_microseconds = 1;
-        }
         if tx.tx_time_microseconds == 0 {
             tx.tx_time_microseconds = now;
         }
@@ -5053,7 +5455,7 @@ extern "C" fn builtin_downstream(
                         } else {
                             segment.frequency_hz
                         },
-                        duration_microseconds: segment.duration_microseconds.max(1),
+                        duration_microseconds: segment.duration_microseconds,
                         offset_microseconds: segment.offset_microseconds,
                     })
                     .collect(),
@@ -5077,8 +5479,7 @@ extern "C" fn builtin_downstream(
                 })
                 .max()
                 .unwrap_or(1)
-                .saturating_sub(tx.offset_microseconds)
-                .max(1);
+                .saturating_sub(tx.offset_microseconds);
         }
 
         let default_mimo = || {
@@ -5126,7 +5527,6 @@ extern "C" fn builtin_downstream(
                             if segment.frequency_hz == 0 {
                                 segment.frequency_hz = tx.frequency_hz;
                             }
-                            segment.duration_microseconds = segment.duration_microseconds.max(1);
                         }
                     }
                     for antenna in &mut mimo.transmit_antennas {
@@ -5179,8 +5579,13 @@ extern "C" fn builtin_downstream(
             }
         }
 
-        let normalized_transmitters = find_tx_transmitters(incoming).map(|transmitters| {
-            let mut transmitters = transmitters.transmitters;
+        let ota_transmitters = explicit_ota_transmitters(incoming);
+        let ota_transmitter_bytes =
+            (!ota_transmitters.nem_ids.is_empty()).then(|| ota_transmitters.encode_to_vec());
+        let normalized_transmitters = {
+            let mut transmitters = find_tx_transmitters(incoming)
+                .map(|transmitters| transmitters.transmitters)
+                .unwrap_or_default();
             if !transmitters
                 .iter()
                 .any(|transmitter| transmitter.nem_id == state.id)
@@ -5191,15 +5596,13 @@ extern "C" fn builtin_downstream(
                 });
             }
             TxTransmitters { transmitters }
-        });
+        };
 
         let tx_bytes = tx.encode();
         let segment_bytes = normalized_segments
             .as_ref()
             .and_then(TxFrequencySegments::encode);
-        let transmitter_bytes = normalized_transmitters
-            .as_ref()
-            .and_then(TxTransmitters::encode);
+        let transmitter_bytes = normalized_transmitters.encode();
         let mimo_bytes = normalized_mimo.as_ref().and_then(MimoTxProperties::encode);
         let mut outgoing: Vec<_> = incoming
             .iter()
@@ -5208,6 +5611,7 @@ extern "C" fn builtin_downstream(
                 message.msg_type != CONTROL_TX_PROPERTIES
                     && message.msg_type != CONTROL_TX_FREQUENCY_SEGMENTS
                     && message.msg_type != CONTROL_TX_TRANSMITTERS
+                    && message.msg_type != CONTROL_OTA_TRANSMITTERS
                     && message.msg_type != CONTROL_MIMO_TX_PROPERTIES
             })
             .collect();
@@ -5236,6 +5640,15 @@ extern "C" fn builtin_downstream(
                 },
             });
         }
+        if let Some(bytes) = &ota_transmitter_bytes {
+            outgoing.push(FfiControlMessage {
+                msg_type: CONTROL_OTA_TRANSMITTERS,
+                payload: FfiSlice {
+                    data: bytes.as_ptr(),
+                    len: bytes.len(),
+                },
+            });
+        }
         if let Some(bytes) = &mimo_bytes {
             outgoing.push(FfiControlMessage {
                 msg_type: CONTROL_MIMO_TX_PROPERTIES,
@@ -5249,7 +5662,7 @@ extern "C" fn builtin_downstream(
             state.framework,
             packet.info.source,
             packet.info.destination,
-            packet.payload.len,
+            accounted_len,
             unix_time_microseconds().saturating_sub(began_at).max(0) as u64,
             false,
         );
@@ -5421,7 +5834,12 @@ fn find_tx_frequency_segments(messages: &[FfiControlMessage]) -> Option<TxFreque
 }
 
 fn find_tx_transmitters(messages: &[FfiControlMessage]) -> Option<TxTransmitters> {
-    control_payload(messages, CONTROL_TX_TRANSMITTERS).and_then(TxTransmitters::decode)
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.msg_type == CONTROL_TX_TRANSMITTERS)
+        .and_then(|message| control_payload(std::slice::from_ref(message), CONTROL_TX_TRANSMITTERS))
+        .and_then(TxTransmitters::decode)
 }
 
 fn find_tx_antenna_profile(messages: &[FfiControlMessage]) -> Option<TxAntennaProfile> {
@@ -5539,7 +5957,7 @@ extern "C" fn builtin_event(state: *mut c_void, event_id: u16, data: *const u8, 
                             handle,
                             vec![u64::from(nem_id)],
                             vec![
-                                NativeTableValue::UInt64(u64::from(nem_id)),
+                                NativeTableValue::UInt16(nem_id),
                                 NativeTableValue::Double(location.latitude_degrees),
                                 NativeTableValue::Double(location.longitude_degrees),
                                 NativeTableValue::Double(location.altitude_meters),
@@ -5576,9 +5994,9 @@ extern "C" fn builtin_event(state: *mut c_void, event_id: u16, data: *const u8, 
                             handle,
                             vec![u64::from(nem_id)],
                             vec![
-                                NativeTableValue::UInt64(u64::from(nem_id)),
-                                NativeTableValue::Double(value),
-                                NativeTableValue::Double(f64::from(pathloss.reverse_pathlossd_b)),
+                                NativeTableValue::UInt16(nem_id),
+                                NativeTableValue::Float(pathloss.forward_pathlossd_b),
+                                NativeTableValue::Float(pathloss.reverse_pathlossd_b),
                             ],
                         );
                     }
@@ -5603,9 +6021,9 @@ extern "C" fn builtin_event(state: *mut c_void, event_id: u16, data: *const u8, 
                                 handle,
                                 vec![u64::from(nem_id), entry.frequency_hz],
                                 vec![
-                                    NativeTableValue::UInt64(u64::from(nem_id)),
+                                    NativeTableValue::UInt16(nem_id),
                                     NativeTableValue::UInt64(entry.frequency_hz),
-                                    NativeTableValue::Double(value),
+                                    NativeTableValue::Float(entry.pathlossd_b),
                                 ],
                             );
                         }
@@ -5640,8 +6058,8 @@ extern "C" fn builtin_event(state: *mut c_void, event_id: u16, data: *const u8, 
                             handle,
                             vec![u64::from(nem_id)],
                             vec![
-                                NativeTableValue::UInt64(u64::from(nem_id)),
-                                NativeTableValue::UInt64(u64::from(profile_id)),
+                                NativeTableValue::UInt16(nem_id),
+                                NativeTableValue::UInt16(profile_id),
                                 NativeTableValue::Double(profile.antenna_azimuth_degrees),
                                 NativeTableValue::Double(profile.antenna_elevation_degrees),
                             ],
@@ -5675,7 +6093,7 @@ extern "C" fn builtin_event(state: *mut c_void, event_id: u16, data: *const u8, 
                         handle,
                         vec![u64::from(nem_id)],
                         vec![
-                            NativeTableValue::UInt64(u64::from(nem_id)),
+                            NativeTableValue::UInt16(nem_id),
                             NativeTableValue::String(name.to_string()),
                         ],
                     );
@@ -5779,6 +6197,7 @@ pub struct NemManager {
     boundary_definitions: BTreeMap<u16, BoundaryDefinition>,
     boundary_endpoints: BTreeMap<u16, Arc<Mutex<BoundaryMessageManager>>>,
     stopped: bool,
+    stopped_after_start: bool,
 }
 
 #[derive(Clone)]
@@ -5804,6 +6223,7 @@ impl NemManager {
             boundary_definitions: BTreeMap::new(),
             boundary_endpoints: BTreeMap::new(),
             stopped: true,
+            stopped_after_start: false,
         }
     }
 
@@ -5989,6 +6409,7 @@ impl NemManager {
             update_neighbor_tx,
             update_neighbor_rx,
             update_neighbor_status,
+            register_queue_metric,
             update_queue_metric,
             publish_r2ri,
             register_rf_signal_table,
@@ -6044,48 +6465,7 @@ impl NemManager {
                         )
                     })
                     .collect::<Vec<_>>();
-                if let Some(queue) = update_invocation.queue() {
-                    if queue.is_running() {
-                        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-                        queue
-                            .enqueue(
-                                QueueTaskKind::Configuration,
-                                Box::new(move || {
-                                    let guard = ConfigGuard::new(&values);
-                                    let configured = update_invocation.call(|api, context| {
-                                        (api.configure)(
-                                            context,
-                                            &guard.request as *const FfiConfigRequest
-                                                as *const c_void,
-                                        )
-                                    });
-                                    let _ = sender.send(configured);
-                                }),
-                            )
-                            .map_err(|_| "layer configuration queue stopped".to_string())?;
-                        return receiver
-                            .recv_timeout(Duration::from_secs(5))
-                            .map_err(|_| {
-                                "layer configuration queue stopped or timed out".to_string()
-                            })?
-                            .then_some(())
-                            .ok_or_else(|| {
-                                "plugin rejected runtime configuration update".to_string()
-                            });
-                    } else if !queue.accepts_direct_calls() {
-                        return Err("layer configuration queue is stopped".to_string());
-                    }
-                }
-                let guard = ConfigGuard::new(&values);
-                update_invocation
-                    .call(|api, context| {
-                        (api.configure)(
-                            context,
-                            &guard.request as *const FfiConfigRequest as *const c_void,
-                        )
-                    })
-                    .then_some(())
-                    .ok_or_else(|| "plugin rejected runtime configuration update".to_string())
+                update_invocation.configure_running(values)
             },
         ) {
             with_component_execution(|| unsafe { ((*api).destroy)(plugin_context) });
@@ -6146,6 +6526,11 @@ impl NemManager {
     }
 
     pub fn start(&mut self) -> Result<(), String> {
+        // Original NEMLayerStateStopped is terminal: only destroy is valid.
+        // A failed first start stays configurable and may still be retried.
+        if self.stopped_after_start {
+            return Err("NEM layers cannot restart after stop".to_string());
+        }
         if !self.stopped {
             return Err("NEM manager is already started".to_string());
         }
@@ -6199,6 +6584,7 @@ impl NemManager {
                     ));
                     break;
                 }
+                layer.queue.set_model_running(true);
                 layer.started = true;
             }
             if failure.is_some() {
@@ -6214,7 +6600,7 @@ impl NemManager {
 
     pub fn post_start(&self) {
         for layers in self.layers.values() {
-            for layer in layers {
+            for layer in layers.iter().filter(|layer| layer.started) {
                 layer
                     .invocation
                     .call(|api, context| (api.post_start)(context));
@@ -6238,7 +6624,9 @@ impl NemManager {
         for layers in self.layers.values_mut() {
             for layer in layers {
                 if layer.started {
+                    self.stopped_after_start = true;
                     layer.invocation.call(|api, context| (api.stop)(context));
+                    layer.queue.set_model_running(false);
                     if let Ok(mut handles) = layer._framework_context.descriptor_handles.lock() {
                         for handle in handles.drain(..) {
                             let _ = file_descriptor_service::unregister(handle);
@@ -6653,6 +7041,20 @@ mod tests {
         })
     }
 
+    fn flush_test_layer(manager: &NemManager, id: u16, index: usize) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(manager.layers[&id][index]
+            .queue
+            .enqueue(
+                QueueTaskKind::FileDescriptor,
+                Box::new(move || {
+                    tx.send(()).unwrap();
+                })
+            )
+            .is_ok());
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
     fn add_capture_transport(manager: &mut NemManager, nem_id: u16) {
         let mut framework_context = Box::new(FrameworkContext {
             runtime: Arc::downgrade(&manager.runtime),
@@ -6689,6 +7091,7 @@ mod tests {
             update_neighbor_tx,
             update_neighbor_rx,
             update_neighbor_status,
+            register_queue_metric,
             update_queue_metric,
             publish_r2ri,
             register_rf_signal_table,
@@ -6753,40 +7156,105 @@ mod tests {
         assert_eq!(parse_scaled_u64("500k"), Some(500_000));
         assert_eq!(parse_scaled_u64("-1M"), None);
         assert_eq!(parse_scaled_u64("garbage"), None);
-        assert_eq!(pacing_duration(100, 800), Duration::from_secs(1));
-        assert_eq!(pacing_duration(100, 0), Duration::ZERO);
     }
 
     #[test]
-    fn transport_flow_control_releases_only_available_frames() {
-        let frame = |value| PendingTransportFrame {
-            payload: vec![value],
-            destination: 2,
-            priority: 0,
-            creation_time_sec: 0,
-            creation_time_usec: 0,
-            received_at: Instant::now(),
+    fn builtin_transport_acknowledges_before_waking_blocked_reader() {
+        struct Events {
+            values: Mutex<Vec<(char, u16)>>,
+            packets: std::sync::mpsc::Sender<u16>,
+        }
+        extern "C" fn control(
+            ctx: *mut c_void,
+            _: u16,
+            messages: *const FfiControlMessage,
+            count: usize,
+        ) {
+            let events = unsafe { &*(ctx as *const Events) };
+            let incoming = ffi_control_messages(messages, count).unwrap();
+            let token = control_payload(incoming, CONTROL_FLOW_CONTROL_TOKEN)
+                .and_then(FlowControlToken::decode)
+                .unwrap();
+            events.values.lock().unwrap().push(('C', token.tokens));
+        }
+        extern "C" fn packet(
+            ctx: *mut c_void,
+            _: u16,
+            packet: *const FfiPacket,
+            _: *const FfiControlMessage,
+            _: usize,
+        ) {
+            let events = unsafe { &*(ctx as *const Events) };
+            let destination = unsafe { (*packet).info.destination };
+            events.values.lock().unwrap().push(('P', destination));
+            events.packets.send(destination).unwrap();
+        }
+        let mut manager = NemManager::new([21; 16]);
+        manager
+            .add_layer_configured(
+                601,
+                "virtualtransport",
+                4,
+                &[
+                    ("flowcontrolenable".into(), vec!["true".into()]),
+                    ("arpcacheenable".into(), vec!["false".into()]),
+                ],
+            )
+            .unwrap();
+        let context = manager.layers[&601][0].invocation.context();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut events = Events {
+            values: Mutex::new(Vec::new()),
+            packets: tx,
         };
-        let mut pending = VecDeque::from([frame(1), frame(2), frame(3)]);
-        let mut available = 0;
-        let released = release_transport_frames(
-            true,
-            &mut available,
-            &mut pending,
-            FlowControlToken { tokens: 2 },
+        let framework = unsafe { (*(context as *const BuiltinState)).framework };
+        {
+            let state = unsafe { &mut *(context as *mut BuiltinState) };
+            state.framework.framework_ctx = (&mut events as *mut Events).cast();
+            state.framework.send_downstream_control = control;
+            state.framework.send_downstream_packet = packet;
+            state.counters = CommonLayerCounters::default();
+        }
+        builtin_post_start(context);
+        let reader_context = context as usize;
+        let reader = std::thread::spawn(move || {
+            for destination in [2, 3] {
+                let mut frame = [0; 96];
+                frame[..6].copy_from_slice(&[2, 2, 0, 0, 0, destination]);
+                frame[12..14].copy_from_slice(&[0x88, 0xb5]);
+                builtin_ethernet_downstream(
+                    reader_context as *mut c_void,
+                    frame.as_ptr(),
+                    frame.len(),
+                );
+            }
+        });
+        let grant = |tokens| {
+            let payload = FlowControlToken { tokens }.encode();
+            let message = FfiControlMessage {
+                msg_type: CONTROL_FLOW_CONTROL_TOKEN,
+                payload: FfiSlice {
+                    data: payload.as_ptr(),
+                    len: payload.len(),
+                },
+            };
+            builtin_upstream(context, std::ptr::null(), &message, 1);
+        };
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+        grant(1);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+        grant(0);
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+        grant(1);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 3);
+        reader.join().unwrap();
+        assert_eq!(
+            *events.values.lock().unwrap(),
+            vec![('C', 0), ('C', 1), ('P', 2), ('C', 0), ('C', 1), ('P', 3)]
         );
-        assert_eq!(released.len(), 2);
-        assert_eq!(pending.len(), 1);
-        assert_eq!(available, 0);
-
-        assert!(release_transport_frames(
-            false,
-            &mut available,
-            &mut pending,
-            FlowControlToken { tokens: 5 },
-        )
-        .is_empty());
-        assert_eq!(pending.len(), 1);
+        unsafe {
+            (*(context as *mut BuiltinState)).framework = framework;
+        }
     }
 
     #[test]
@@ -6942,6 +7410,140 @@ mod tests {
     }
 
     #[test]
+    fn doppler_preserves_cpp_fractional_motion_values() {
+        // Full-process profile-generated-360 reported these shifts in C++.
+        let mut phy = PhyState::new();
+        phy.update_location(
+            1,
+            40.000419820556274,
+            -74.00019347043154,
+            92.49956838433974,
+            None,
+            Some(Velocity {
+                azimuth_degrees: 325.70177038704094,
+                elevation_degrees: -37.921917976672745,
+                magnitude_meters_per_second: 82.2564827258599,
+            }),
+        );
+        phy.update_location(
+            2,
+            39.99956562175388,
+            -74.00138103547113,
+            79.59987818697655,
+            None,
+            Some(Velocity {
+                azimuth_degrees: 138.03991623141204,
+                elevation_degrees: -1.6545137412508737,
+                magnitude_meters_per_second: 99.6619698790654,
+            }),
+        );
+        let factor = 1.0 + phy.doppler_fraction(1, 2);
+        assert_eq!(
+            2_400_000_000.0 * factor - 2_400_000_000.0,
+            -445.5124797821045
+        );
+        assert_eq!(
+            2_410_000_000.0 * factor - 2_410_000_000.0,
+            -447.3687815666199
+        );
+    }
+
+    #[test]
+    fn antenna_gain_cache_tracks_bandwidth_updates_before_path_processing() {
+        let mut phy = PhyState::new();
+        let mut antenna = MimoTxAntenna {
+            antenna_index: 0,
+            frequency_group_index: 0,
+            spectral_mask_index: 0,
+            bandwidth_hz: 1_000_000,
+            pattern: AntennaPattern::IdealOmni { gain_db: 0.0 },
+        };
+        let gain = |phy: &mut PhyState| {
+            phy.antenna_pair_gains(
+                1,
+                2,
+                AntennaPattern::IdealOmni { gain_db: 0.0 },
+                AntennaPattern::IdealOmni { gain_db: 0.0 },
+            )
+            .unwrap()
+        };
+        phy.update_gain_antenna(2, antenna);
+        assert!(!gain(&mut phy).2);
+        antenna.frequency_group_index = 2;
+        antenna.spectral_mask_index = 3;
+        phy.update_gain_antenna(2, antenna);
+        assert!(gain(&mut phy).2);
+        antenna.bandwidth_hz = 2_000_000;
+        phy.update_gain_antenna(2, antenna);
+        antenna.bandwidth_hz = 1_000_000;
+        phy.update_gain_antenna(2, antenna);
+        assert!(!gain(&mut phy).2);
+        antenna.pattern = AntennaPattern::IdealOmni { gain_db: 0.000001 };
+        phy.update_gain_antenna(2, antenna);
+        assert_eq!(gain(&mut phy), (0.0, 0.0, true));
+        phy.update_gain_antenna(1, antenna);
+        assert!(!gain(&mut phy).2);
+    }
+
+    #[test]
+    fn velocity_changes_invalidate_gain_pairs_even_for_omni_antennas() {
+        let mut phy = PhyState::new();
+        let gain = |phy: &mut PhyState| {
+            phy.antenna_pair_gains(
+                1,
+                2,
+                AntennaPattern::IdealOmni { gain_db: 3.0 },
+                AntennaPattern::IdealOmni { gain_db: 0.0 },
+            )
+            .unwrap()
+        };
+        assert_eq!(gain(&mut phy), (3.0, 0.0, false));
+        phy.update_location(1, 40.0, -74.0, 10.0, None, None);
+        assert_eq!(gain(&mut phy), (3.0, 0.0, true));
+        phy.update_location(2, 40.0, -74.001, 10.0, None, None);
+        assert_eq!(gain(&mut phy), (3.0, 0.0, false));
+        assert_eq!(gain(&mut phy), (3.0, 0.0, true));
+        for speed in [0.0, 20.0, 0.0] {
+            phy.update_location(
+                2,
+                40.0,
+                -74.001,
+                10.0,
+                None,
+                Some(Velocity {
+                    azimuth_degrees: 90.0,
+                    elevation_degrees: 0.0,
+                    magnitude_meters_per_second: speed,
+                }),
+            );
+            assert_eq!(gain(&mut phy), (3.0, 0.0, false));
+            assert_eq!(gain(&mut phy), (3.0, 0.0, true));
+        }
+        phy.update_location(2, 40.0, -74.002, 10.0, None, None);
+        phy.update_location(2, 40.0, -74.001, 10.0, None, None);
+        assert_eq!(gain(&mut phy), (3.0, 0.0, false));
+    }
+
+    #[test]
+    fn antenna_gain_cache_does_not_reuse_historical_pair_configurations() {
+        let mut phy = PhyState::new();
+        for (remote_gain, hit) in [(0.0, false), (0.0, true), (3.0, false), (0.0, false)] {
+            assert_eq!(
+                phy.antenna_pair_gains(
+                    1,
+                    2,
+                    AntennaPattern::IdealOmni { gain_db: 0.0 },
+                    AntennaPattern::IdealOmni {
+                        gain_db: remote_gain
+                    }
+                ),
+                Some((0.0, remote_gain, hit)),
+            );
+            assert_eq!(phy.gain_cache.len(), 1);
+        }
+    }
+
+    #[test]
     fn explicit_mimo_omni_antennas_combine_both_endpoint_gains() {
         let mut phy = PhyState::new();
         assert_eq!(
@@ -6993,6 +7595,7 @@ mod tests {
             update_neighbor_tx,
             update_neighbor_rx,
             update_neighbor_status,
+            register_queue_metric,
             update_queue_metric,
             publish_r2ri,
             register_rf_signal_table,
@@ -7037,6 +7640,24 @@ mod tests {
             6.0
         );
         builtin_destroy(context);
+    }
+
+    #[test]
+    fn profile_elevation_wraps_like_cpp_lookup_and_adjusted_orientation() {
+        for (input, expected) in [
+            (-360.0, 0.0),
+            (-270.0, 90.0),
+            (-120.0, 60.0),
+            (-90.0, -90.0),
+            (90.0, 90.0),
+            (100.0, -80.0),
+            (180.0, 0.0),
+            (260.0, 80.0),
+            (270.0, -90.0),
+            (360.0, 0.0),
+        ] {
+            assert_eq!(normalize_elevation(input), expected);
+        }
     }
 
     #[test]
@@ -7355,6 +7976,7 @@ mod tests {
             update_neighbor_tx,
             update_neighbor_rx,
             update_neighbor_status,
+            register_queue_metric,
             update_queue_metric,
             publish_r2ri,
             register_rf_signal_table,
@@ -7702,6 +8324,61 @@ mod tests {
     }
 
     #[test]
+    fn native_neighbor_event_publication_reaches_other_nems() {
+        extern "C" fn receive(context: *mut c_void, event: u16, _: *const u8, _: usize) {
+            assert_eq!(event, 104);
+            unsafe { &*(context as *const std::sync::atomic::AtomicUsize) }
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let mut manager = NemManager::new([31; 16]);
+        manager
+            .add_layer_configured(
+                120,
+                "emanephy",
+                2,
+                &[("subid".to_string(), vec!["1".to_string()])],
+            )
+            .unwrap();
+        let context = manager.layers[&120][0]._framework_context.as_ref() as *const FrameworkContext
+            as *mut c_void;
+        let received = std::sync::atomic::AtomicUsize::new(0);
+        crate::event_service::register_native_user(
+            65001,
+            121,
+            &received as *const _ as *mut c_void,
+            receive,
+        );
+        assert!(emane_rs_event_service_register_event(65001, 104));
+        let payload = [0x08, 120];
+        assert!(publish_event(context, 104, payload.as_ptr(), payload.len()));
+        crate::event_service::unregister_user(65001);
+        assert_eq!(received.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn queue_metric_registration_preserves_idle_rows_without_delay_samples() {
+        let mut manager = NemManager::new([35; 16]);
+        manager
+            .add_layer_configured(611, "emanephy", 2, &[("subid".into(), vec!["1".into()])])
+            .unwrap();
+        let framework = manager.layers[&611][0]._framework_context.as_ref();
+        let ctx = framework as *const FrameworkContext as *mut c_void;
+        assert!(register_queue_metric(ctx, 0, 3));
+        assert!(!register_queue_metric(ctx, 0, 99));
+        let idle = framework.queue_metrics.lock().unwrap().get_queue_metrics();
+        assert_eq!(idle.len(), 1);
+        assert_eq!(idle[0].queue_max_size, 3);
+        assert_eq!(idle[0].avg_delay_microseconds, 0);
+        update_queue_metric(ctx, 0, 3, 1, 0, 30);
+        let sampled = framework.queue_metrics.lock().unwrap().get_queue_metrics();
+        assert_eq!(sampled[0].avg_delay_microseconds, 30);
+        let idle = framework.queue_metrics.lock().unwrap().get_queue_metrics();
+        assert_eq!(idle.len(), 1);
+        assert_eq!(idle[0].queue_current_depth_high_water, 0);
+        assert_eq!(idle[0].avg_delay_microseconds, 0);
+    }
+
+    #[test]
     fn native_r2ri_service_publishes_self_queue_and_neighbor_controls() {
         R2RI_CAPTURE_COUNT.store(0, Ordering::Relaxed);
         let mut manager = NemManager::new([13; 16]);
@@ -7714,6 +8391,7 @@ mod tests {
                 &[("subid".to_string(), vec!["1".to_string()])],
             )
             .unwrap();
+        manager.start().unwrap();
         let context = manager.layers[&20][1]._framework_context.as_ref() as *const FrameworkContext
             as *mut c_void;
         let now = unix_time_microseconds().max(0) as u64;
@@ -7731,6 +8409,7 @@ mod tests {
             2_000_000,
         );
         publish_r2ri(context, 1_000_000, 2_000_000, 500_000, 60_000_000);
+        flush_test_layer(&manager, 20, 0);
         assert_eq!(R2RI_CAPTURE_COUNT.load(Ordering::Relaxed), 3);
     }
 
@@ -7751,6 +8430,7 @@ mod tests {
                 &[("subid".to_string(), vec!["1".to_string()])],
             )
             .unwrap();
+        manager.start().unwrap();
         let build_id = manager.layers[&30][0].event_build_id;
         let manifest = emane_rs_statistic_get_manifest(build_id);
         // Legacy CommonLayerStatistics publishes 26 scalar values (including
@@ -7776,6 +8456,7 @@ mod tests {
             },
         };
         manager.process_downstream(30, &packet, &[]).unwrap();
+        flush_test_layer(&manager, 30, 0);
 
         let name = CString::new("numDownstreamPacketsUnicastRx0").unwrap();
         let names = [name.as_ptr()];
@@ -7852,6 +8533,45 @@ mod tests {
         assert_eq!(values[0].u64_value, 31);
         assert_eq!(values[14].u64_value, 1);
         emane_rs_statistic_free_table_query_result(tables);
+        let model = ModelHeader {
+            registration_id: emane_plugin_api::MAC_REGISTRATION_RFPIPE,
+            sequence: 128,
+            data_rate_bps: 1_000_000,
+            category: 0,
+            message_type: 0,
+            flags: 0,
+        }
+        .encode();
+        let controls = [FfiControlMessage {
+            msg_type: CONTROL_MODEL_HEADER,
+            payload: FfiSlice {
+                data: model.as_ptr(),
+                len: model.len(),
+            },
+        }];
+        manager.process_downstream(30, &packet, &controls).unwrap();
+        flush_test_layer(&manager, 30, 0);
+        // First packet was four bytes without a MAC header. The second adds
+        // seven bytes of CommonMAC framing (two-byte sequence varint).
+        for statistic in [
+            "numDownstreamBytesUnicastRx0",
+            "numDownstreamBytesUnicastTx0",
+        ] {
+            let name = CString::new(statistic).unwrap();
+            let names = [name.as_ptr()];
+            let query = emane_rs_statistic_query(
+                build_id,
+                FfiStringArray {
+                    data: names.as_ptr(),
+                    len: names.len(),
+                },
+                error.as_mut_ptr(),
+                error.len(),
+            );
+            assert_eq!(query.len, 1);
+            assert_eq!(unsafe { &*query.data }.value.u64_value, 15);
+            emane_rs_statistic_free_query_result(query);
+        }
     }
 
     #[test]
@@ -8011,7 +8731,11 @@ mod tests {
                 )],
             )],
         )
-        .is_err());
+        .is_ok());
+        // The original queue accepts this update after stop, but its model
+        // state stays unchanged because the worker no longer executes it.
+        let state = unsafe { &*(invocation.context() as *const BuiltinState) };
+        assert!(state.phy.radio_silence_enabled);
     }
 
     #[test]
@@ -8253,6 +8977,86 @@ mod tests {
         LOCAL_OTA_HITS.store(0, Ordering::Relaxed);
         runtime.route_downstream(1, 0, &packet, &control, 1);
         assert_eq!(LOCAL_OTA_HITS.load(Ordering::Relaxed), 1);
+
+        let model = ModelHeader {
+            registration_id: emane_plugin_api::MAC_REGISTRATION_RFPIPE,
+            sequence: 1,
+            data_rate_bps: 1_000_000,
+            category: 0,
+            message_type: 1,
+            flags: 0,
+        }
+        .encode();
+        let tx = TxProperties {
+            frequency_hz: 2_400_000_000,
+            bandwidth_hz: 1_000_000,
+            tx_power_dbm: 0.0,
+            duration_microseconds: 100,
+            offset_microseconds: 0,
+            tx_time_microseconds: 1,
+            antenna_index: 0,
+            spectral_mask_index: 0,
+            sub_id: 1,
+        }
+        .encode();
+        let mut controls = vec![control];
+        for (kind, bytes) in [
+            (CONTROL_MODEL_HEADER, model.as_slice()),
+            (CONTROL_TX_PROPERTIES, tx.as_slice()),
+        ] {
+            controls.push(FfiControlMessage {
+                msg_type: kind,
+                payload: FfiSlice {
+                    data: bytes.as_ptr(),
+                    len: bytes.len(),
+                },
+            });
+        }
+        LOCAL_OTA_HITS.store(0, Ordering::Relaxed);
+        runtime.route_downstream(1, 0, &packet, controls.as_ptr(), controls.len());
+        assert_eq!(
+            LOCAL_OTA_HITS.load(Ordering::Relaxed),
+            2,
+            "The full PHY transmitter list alone must not exclude local receivers"
+        );
+        let ats = LegacyOtaTransmitterSet {
+            nem_ids: vec![2, 3],
+        }
+        .encode_to_vec();
+        controls.push(FfiControlMessage {
+            msg_type: CONTROL_OTA_TRANSMITTERS,
+            payload: FfiSlice {
+                data: ats.as_ptr(),
+                len: ats.len(),
+            },
+        });
+        LOCAL_OTA_HITS.store(0, Ordering::Relaxed);
+        runtime.route_downstream(1, 0, &packet, controls.as_ptr(), controls.len());
+        assert_eq!(LOCAL_OTA_HITS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn ota_transmitter_controls_accept_original_encoding_and_reject_truncation() {
+        // Original protobuf serializes the set {2,3} as packed uint32 values.
+        let wire = [0, 1, 0, 108, 0, 4, 10, 2, 2, 3];
+        assert_eq!(
+            decode_legacy_ota_transmitters(&wire),
+            Some(HashSet::from([2, 3]))
+        );
+        for length in 1..wire.len() {
+            assert!(decode_legacy_ota_transmitters(&wire[..length]).is_none());
+        }
+        assert_eq!(decode_legacy_ota_transmitters(&[]), Some(HashSet::new()));
+        assert_eq!(
+            decode_legacy_ota_transmitters(&[0, 1, 0, 108, 0, 1, 10]),
+            None,
+            "A truncated protobuf length is rejected"
+        );
+        assert_eq!(
+            decode_legacy_ota_transmitters(&[0, 1, 0, 109, 0, 1, 10]),
+            Some(HashSet::new()),
+            "Unknown control payloads are opaque to the OTA manager"
+        );
     }
 
     #[test]
@@ -8328,6 +9132,17 @@ mod tests {
         assert_eq!(tx.frequency_hz, 2_400_000_000);
         assert_eq!(tx.bandwidth_hz, 1_000_000);
         assert_eq!(tx.tx_time_microseconds, 123_456);
+
+        // OTA logical sources need not appear in the physical transmitter list.
+        let decoded = decode_legacy_ota_payload(&wire, 19).unwrap();
+        assert_eq!(decoded.payload, payload);
+        assert_eq!(
+            find_tx_transmitters(decoded.controls())
+                .unwrap()
+                .transmitters[0]
+                .nem_id,
+            1
+        );
 
         let python_publisher_wire = &wire[..2 + phy_length];
         let decoded = decode_legacy_ota_payload(python_publisher_wire, 1).unwrap();
@@ -8508,6 +9323,54 @@ mod tests {
         manager.stop();
     }
     #[test]
+    fn frequency_interest_zero_bandwidth_empty_set_and_compatibility_mode() {
+        let mut manager = NemManager::new([31; 16]);
+        for mode in [1, 2] {
+            let id = 600 + mode;
+            manager
+                .add_layer_configured(
+                    id,
+                    "emanephy",
+                    2,
+                    &[
+                        ("subid".into(), vec!["7".into()]),
+                        ("compatibilitymode".into(), vec![mode.to_string()]),
+                        ("bandwidth".into(), vec!["2M".into()]),
+                        ("frequencyofinterest".into(), vec!["2.4G".into()]),
+                    ],
+                )
+                .unwrap();
+            let context = manager.layers[&id][0].invocation.context();
+            for frequencies in [vec![2_500_000_000], Vec::new()] {
+                let encoded = FrequencyOfInterest {
+                    bandwidth_hz: 0,
+                    frequencies_hz: frequencies.clone(),
+                }
+                .encode()
+                .unwrap();
+                let control = FfiControlMessage {
+                    msg_type: CONTROL_FREQUENCY_INTEREST,
+                    payload: FfiSlice {
+                        data: encoded.as_ptr(),
+                        len: encoded.len(),
+                    },
+                };
+                builtin_downstream(context, std::ptr::null(), &control, 1);
+                let state = unsafe { &*(context as *const BuiltinState) };
+                assert_eq!(state.phy.bandwidth_hz, 2_000_000);
+                assert_eq!(
+                    state.phy.frequencies_of_interest,
+                    if mode == 1 {
+                        frequencies
+                    } else {
+                        vec![2_400_000_000]
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn framework_spectrum_queries_share_live_phy_monitor_and_isolate_nems() {
         let mut manager = NemManager::new([29; 16]);
         let config = vec![
@@ -8686,3 +9549,11 @@ mod receive_regressions;
 #[cfg(test)]
 #[path = "nem_upstream_tests.rs"]
 mod upstream_regressions;
+
+#[cfg(test)]
+#[path = "nem_lifecycle_tests.rs"]
+mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "nem_dispatch_tests.rs"]
+mod nem_dispatch_tests;

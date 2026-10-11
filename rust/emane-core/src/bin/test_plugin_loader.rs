@@ -171,6 +171,12 @@ fn main() -> Result<(), String> {
         update_neighbor_tx: neighbor_tx,
         update_neighbor_rx: neighbor_rx,
         update_neighbor_status: neighbor_status,
+        register_queue_metric: {
+            extern "C" fn register(_: *mut c_void, _: u16, _: u32) -> bool {
+                true
+            }
+            register
+        },
         update_queue_metric: queue,
         publish_r2ri: publish,
         register_rf_signal_table: register_rf,

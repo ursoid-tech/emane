@@ -212,6 +212,12 @@ fn framework(capture: bool) -> FfiFrameworkService {
         update_neighbor_tx: neighbor_tx_noop,
         update_neighbor_rx: neighbor_rx_noop,
         update_neighbor_status: neighbor_status_noop,
+        register_queue_metric: {
+            extern "C" fn register(_: *mut c_void, _: u16, _: u32) -> bool {
+                true
+            }
+            register
+        },
         update_queue_metric: queue_noop,
         publish_r2ri: publish_noop,
         register_rf_signal_table: register_rf_noop,
@@ -402,12 +408,14 @@ fn dequeue_samples_delay() {
     QUEUE_SAMPLES.lock().unwrap().clear();
     let mut fw = framework(false);
     fw.update_queue_metric = sample_queue;
+    fw.send_downstream_packet = capture_packet;
     let mac = RfpipeMac::new(1, fw);
-    let now = now_microseconds();
+    // An explicit clock sample makes a second sample inside send_packet visible.
+    let now = now_microseconds() - 1_000_000;
     {
         let mut state = mac.state.lock().unwrap();
         state.started = true;
-        state.queue.push_back(PendingTx {
+        state.active_tx = Some(PendingTx {
             packet: OwnedPacket {
                 info: FfiPacketInfo {
                     uuid: [1; 16],
@@ -427,6 +435,18 @@ fn dequeue_samples_delay() {
         });
     }
     drive_transmit(&mac, now);
+    let capture = CAPTURE.lock().unwrap();
+    let (_, tx) = capture
+        .controls
+        .iter()
+        .find(|(kind, _)| *kind == CONTROL_TX_PROPERTIES)
+        .unwrap();
+    let tx = TxProperties::decode(tx).unwrap();
+    assert_eq!(tx.tx_time_microseconds, now);
+    assert_eq!(
+        mac.state.lock().unwrap().current_end_of_transmission,
+        tx.tx_time_microseconds + tx.duration_microseconds as i64
+    );
     let samples = QUEUE_SAMPLES.lock().unwrap().clone();
     assert_eq!(samples, vec![20_000]);
     assert_eq!(
@@ -435,4 +455,207 @@ fn dequeue_samples_delay() {
         "C++ samples queue metrics on dequeue; Rust samples {:?}",
         samples
     );
+}
+
+#[test]
+fn tiny_payloads_preserve_zero_airtime_in_transmit_controls() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let mac = RfpipeMac::new(1, framework(true));
+    {
+        let mut state = mac.state.lock().unwrap();
+        state.started = true;
+        state.data_rate_bps = 11_000_000;
+    }
+    for (size, expected) in [(0, 0), (1, 0), (2, 1)] {
+        let payload = vec![0; size];
+        let packet = FfiPacket {
+            info: FfiPacketInfo {
+                uuid: [1; 16],
+                source: 1,
+                destination: 2,
+                priority: 0,
+                creation_time_sec: 0,
+                creation_time_usec: 0,
+            },
+            payload: FfiSlice {
+                data: payload.as_ptr(),
+                len: payload.len(),
+            },
+        };
+        process_downstream(
+            &mac as *const _ as *mut c_void,
+            &packet,
+            std::ptr::null(),
+            0,
+        );
+        let capture = CAPTURE.lock().unwrap();
+        let (_, tx) = capture
+            .controls
+            .iter()
+            .find(|(kind, _)| *kind == CONTROL_TX_PROPERTIES)
+            .unwrap();
+        assert_eq!(
+            TxProperties::decode(tx).unwrap().duration_microseconds,
+            expected
+        );
+    }
+}
+
+#[test]
+fn airtime_preserves_cpp_float_seconds_truncation() {
+    // Original RFPipe::getDurationMicroseconds results, also observed through
+    // the complete C++ NEM's NeighborMetricTable in seeded live traces.
+    assert_eq!(duration_microseconds(4096, 2_000_000), 16_383);
+    assert_eq!(duration_microseconds(511, 1_000_000), 4_087);
+    assert_eq!(duration_microseconds(513, 2_000_000), 2_052);
+    assert_eq!(duration_microseconds(512, 11_000_000), 372);
+    assert_eq!(duration_microseconds(0, 1_000_000), 0);
+    assert_eq!(duration_microseconds(64, 0), 0);
+}
+
+#[test]
+fn queue_overflow_preserves_separate_active_packet() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let mac = RfpipeMac::new(1, framework(false));
+    let now = now_microseconds();
+    {
+        let mut state = mac.state.lock().unwrap();
+        state.started = true;
+        state.current_end_of_transmission = now + 10_000_000;
+    }
+    for index in 0..258u16 {
+        pend_or_enqueue(
+            &mac,
+            PendingTx {
+                packet: OwnedPacket {
+                    info: FfiPacketInfo {
+                        uuid: [0; 16],
+                        source: 1,
+                        destination: 2,
+                        priority: 0,
+                        creation_time_sec: 0,
+                        creation_time_usec: 0,
+                    },
+                    payload: index.to_be_bytes().to_vec(),
+                    controls: vec![],
+                },
+                acquired_at: now,
+                ready_at: now,
+                duration: 1000,
+                data_rate: 1_000_000,
+            },
+            now,
+        );
+    }
+    let state = mac.state.lock().unwrap();
+    assert_eq!(
+        state.active_tx.as_ref().unwrap().packet.payload,
+        0u16.to_be_bytes()
+    );
+    assert_eq!(state.queue.len(), 255);
+    assert_eq!(
+        state.queue.front().unwrap().packet.payload,
+        3u16.to_be_bytes()
+    );
+    assert_eq!(
+        state.queue.back().unwrap().packet.payload,
+        257u16.to_be_bytes()
+    );
+    assert_eq!(state.queue_discards, 2);
+}
+
+#[test]
+fn delayed_packets_do_not_enter_bounded_queue_and_stop_clears_them() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let mac = RfpipeMac::new(1, framework(false));
+    {
+        let mut state = mac.state.lock().unwrap();
+        state.started = true;
+        state.delay_microseconds = 10_000_000;
+    }
+    let payload = [0; 16];
+    let packet = FfiPacket {
+        info: FfiPacketInfo {
+            uuid: [0; 16],
+            source: 1,
+            destination: 2,
+            priority: 0,
+            creation_time_sec: 0,
+            creation_time_usec: 0,
+        },
+        payload: FfiSlice {
+            data: payload.as_ptr(),
+            len: payload.len(),
+        },
+    };
+    for _ in 0..260 {
+        process_downstream(
+            &mac as *const _ as *mut c_void,
+            &packet,
+            std::ptr::null(),
+            0,
+        );
+    }
+    {
+        let state = mac.state.lock().unwrap();
+        assert_eq!(state.delayed_tx.len(), 260);
+        assert!(state.active_tx.is_none());
+        assert!(state.queue.is_empty());
+        assert_eq!(state.queue_discards, 0);
+    }
+    stop(&mac as *const _ as *mut c_void);
+    let state = mac.state.lock().unwrap();
+    assert!(state.delayed_tx.is_empty());
+    assert!(state.active_tx.is_none());
+    assert!(state.queue.is_empty());
+}
+
+#[test]
+fn startup_announcements_wait_for_post_start() {
+    extern "C" fn control(
+        ctx: *mut c_void,
+        _: u16,
+        messages: *const FfiControlMessage,
+        count: usize,
+    ) {
+        let counts = unsafe { &*(ctx as *const Mutex<[usize; 2]>) };
+        for message in unsafe { std::slice::from_raw_parts(messages, count) } {
+            if message.msg_type == CONTROL_FLOW_CONTROL_TOKEN {
+                counts.lock().unwrap()[0] += 1;
+            }
+        }
+    }
+    extern "C" fn timer(
+        ctx: *mut c_void,
+        _: u16,
+        _: u64,
+        _: u32,
+        _: u32,
+        _: *const u8,
+        _: usize,
+    ) -> u64 {
+        let counts = unsafe { &*(ctx as *const Mutex<[usize; 2]>) };
+        let mut counts = counts.lock().unwrap();
+        counts[1] += 1;
+        counts[1] as u64
+    }
+    let counts = Mutex::new([0usize; 2]);
+    let mut mac = RfpipeMac::new(1, framework(false));
+    mac.framework.framework_ctx = &counts as *const _ as *mut c_void;
+    mac.framework.send_upstream_control = control;
+    mac.framework.schedule_timed_event = timer;
+    {
+        let mut state = mac.state.lock().unwrap();
+        state.pcr_curve_uri =
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rfpipe-pcr.xml").into();
+        state.flow_control_enable = true;
+        state.flow_control_tokens = 3;
+    }
+    let plugin = &mut mac as *mut _ as *mut c_void;
+    // Original models announce grants and arm recurring timers in postStart.
+    assert!(start(plugin));
+    assert_eq!(*counts.lock().unwrap(), [0, 0]);
+    post_start(plugin);
+    assert_eq!(*counts.lock().unwrap(), [1, 1]);
+    stop(plugin);
 }

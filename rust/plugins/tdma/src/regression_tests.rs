@@ -157,6 +157,12 @@ fn test_mac() -> TdmaMac {
             update_neighbor_tx: neighbor_tx_callback,
             update_neighbor_rx: neighbor_rx_callback,
             update_neighbor_status: neighbor_status_callback,
+            register_queue_metric: {
+                extern "C" fn register(_: *mut c_void, _: u16, _: u32) -> bool {
+                    true
+                }
+                register
+            },
             update_queue_metric: queue_callback,
             publish_r2ri: publish_callback,
             register_rf_signal_table: register_rf_callback,
@@ -287,7 +293,8 @@ fn small_slots_use_component_capacity_and_airtime() {
     }
     let first = take_transmission(&mac, &mut state, 0, 0).unwrap();
     assert_eq!(first.bytes.len(), 100);
-    assert_eq!(tx_properties(&first, 100, 1_000).duration_microseconds, 800);
+    // Original float-seconds conversion truncates 100 bytes at 1 Mbps to 799 us.
+    assert_eq!(tx_properties(&first, 100, 1_000).duration_microseconds, 799);
     let second = take_transmission(&mac, &mut state, 0, 100).unwrap();
     assert_eq!(second.bytes.len(), 12);
     assert!(second.more);
@@ -489,4 +496,231 @@ fn duplicate_fragments_do_not_extend_reassembly_lifetime() {
     expire_reassembly(&mac, &mut state, previous + 6_000_001);
     assert!(!refreshed);
     assert!(state.reassembly.is_empty());
+}
+
+fn finish_component(mac: &mut TdmaMac, message: TdmaMessage, creation_usec: u32) {
+    let slot = receive(mac, 2, 100, None);
+    {
+        let mut state = mac.state.lock().unwrap();
+        let pending = state.pending_rx.get_mut(&slot).unwrap();
+        pending.wire.messages = vec![message];
+        pending.info.creation_time_usec = creation_usec;
+    }
+    complete_receive(mac, slot);
+}
+
+fn fragment_component(index: u32, offset: u32, more: bool, data: &[u8]) -> TdmaMessage {
+    TdmaMessage {
+        message_type: TdmaMessageType::Data as i32,
+        destination: 1,
+        priority: 0,
+        data: data.to_vec(),
+        fragment: Some(TdmaFragment {
+            index,
+            offset,
+            more,
+            sequence: 123,
+        }),
+    }
+}
+
+#[test]
+fn reassembly_counts_indices_orders_offsets_and_uses_completion_metadata() {
+    let capture = Mutex::new(Capture {
+        noise: Some(-100.0),
+        ..Default::default()
+    });
+    let mut mac = mac(&capture);
+    mac.state.lock().unwrap().schedule = Some(schedule(60_000_000, 100, false));
+    finish_component(&mut mac, fragment_component(0, u32::MAX, true, b"A"), 1);
+    finish_component(&mut mac, fragment_component(0, 2, true, b"duplicate"), 2);
+    assert!(capture.lock().unwrap().upstream.is_empty());
+    let mut tail = fragment_component(1, 1, false, b"B");
+    tail.destination = u32::from(BROADCAST_NEM);
+    finish_component(&mut mac, tail, 3);
+    let capture = capture.lock().unwrap();
+    assert_eq!(capture.upstream.len(), 1);
+    assert_eq!(capture.upstream[0].payload, b"BA");
+    assert_eq!(capture.upstream[0].info.destination, BROADCAST_NEM);
+    assert_eq!(capture.upstream[0].info.creation_time_usec, 3);
+}
+
+#[test]
+fn zero_offset_terminal_is_whole_and_wire_identifiers_are_narrowed() {
+    let capture = Mutex::new(Capture {
+        noise: Some(-100.0),
+        ..Default::default()
+    });
+    let mut mac = mac(&capture);
+    mac.state.lock().unwrap().schedule = Some(schedule(60_000_000, 100, false));
+    let mut message = fragment_component(17, 0, false, b"whole");
+    message.destination = 65_537;
+    message.priority = 300;
+    finish_component(&mut mac, message, 4);
+    let capture = capture.lock().unwrap();
+    assert_eq!(capture.upstream.len(), 1);
+    assert_eq!(capture.upstream[0].payload, b"whole");
+    assert_eq!(capture.upstream[0].info.destination, 1);
+    assert_eq!(capture.upstream[0].info.priority, 44);
+    assert!(mac.state.lock().unwrap().reassembly.is_empty());
+}
+
+#[test]
+fn expiry_requires_both_check_and_fragment_deadlines_inclusively() {
+    let capture = Mutex::new(Capture {
+        noise: Some(-100.0),
+        ..Default::default()
+    });
+    let mut mac = mac(&capture);
+    mac.state.lock().unwrap().schedule = Some(schedule(60_000_000, 100, false));
+    finish_component(&mut mac, fragment_component(0, 0, true, b"pending"), 1);
+    let mut state = mac.state.lock().unwrap();
+    state.fragment_check_us = 2_000_000;
+    state.fragment_timeout_us = 1_000_000;
+    state.last_fragment_check_us = 100;
+    state
+        .reassembly
+        .get_mut(&(2, 0, 123))
+        .unwrap()
+        .last_update_us = 100;
+    expire_reassembly(&mac, &mut state, 2_000_099);
+    assert_eq!(state.reassembly.len(), 1);
+    expire_reassembly(&mac, &mut state, 2_000_100);
+    assert!(state.reassembly.is_empty());
+}
+
+#[test]
+fn expired_but_unchecked_assembly_can_complete_before_cleanup() {
+    let capture = Mutex::new(Capture {
+        noise: Some(-100.0),
+        ..Default::default()
+    });
+    let mut mac = mac(&capture);
+    mac.state.lock().unwrap().schedule = Some(schedule(60_000_000, 100, false));
+    finish_component(&mut mac, fragment_component(0, 0, true, b"late"), 1);
+    {
+        let mut state = mac.state.lock().unwrap();
+        state.fragment_check_us = 0;
+        state
+            .reassembly
+            .get_mut(&(2, 0, 123))
+            .unwrap()
+            .last_update_us = now_us() - 10_000_000;
+    }
+    finish_component(&mut mac, fragment_component(1, 4, false, b"-tail"), 2);
+    assert_eq!(capture.lock().unwrap().upstream[0].payload, b"late-tail");
+    assert!(mac.state.lock().unwrap().reassembly.is_empty());
+}
+
+#[test]
+fn schedule_replacement_and_rejection_preserve_fragment_state() {
+    let capture = Mutex::new(Capture {
+        noise: Some(-100.0),
+        ..Default::default()
+    });
+    let mut mac = mac(&capture);
+    mac.state.lock().unwrap().schedule = Some(schedule(60_000_000, 100, false));
+    finish_component(&mut mac, fragment_component(0, 0, true, b"head"), 1);
+    let full = ScheduleEvent {
+        structure: Some(ScheduleStructure {
+            slots_per_frame: 2,
+            frames_per_multiframe: 1,
+            slot_duration_microseconds: 60_000_000,
+            slot_overhead_microseconds: 100,
+            bandwidth_hz: 1_000_000,
+        }),
+        frames: vec![ScheduleFrame {
+            index: 0,
+            ..Default::default()
+        }],
+        frequency_hz: Some(1_000_000),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    process_event(
+        &mut mac as *mut _ as *mut c_void,
+        EVENT_TDMA_SCHEDULE,
+        full.as_ptr(),
+        full.len(),
+    );
+    assert_eq!(mac.state.lock().unwrap().reassembly.len(), 1);
+    let invalid = ScheduleEvent {
+        frames: vec![ScheduleFrame {
+            index: 9,
+            slots: vec![ScheduleSlot {
+                index: 0,
+                slot_type: SlotType::Rx as i32,
+                rx: Some(ScheduleRx {
+                    frequency_hz: Some(1_000_000),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+    .encode_to_vec();
+    process_event(
+        &mut mac as *mut _ as *mut c_void,
+        EVENT_TDMA_SCHEDULE,
+        invalid.as_ptr(),
+        invalid.len(),
+    );
+    let state = mac.state.lock().unwrap();
+    assert!(state.schedule.is_none());
+    assert!(state.schedule_frequencies.is_empty());
+    assert_eq!(state.reassembly.len(), 1);
+}
+
+#[test]
+fn startup_announcements_wait_for_post_start() {
+    extern "C" fn control(
+        ctx: *mut c_void,
+        _: u16,
+        messages: *const FfiControlMessage,
+        count: usize,
+    ) {
+        let counts = unsafe { &*(ctx as *const Mutex<[usize; 2]>) };
+        for message in unsafe { std::slice::from_raw_parts(messages, count) } {
+            if message.msg_type == CONTROL_FLOW_CONTROL_TOKEN {
+                counts.lock().unwrap()[0] += 1;
+            }
+        }
+    }
+    extern "C" fn timer(
+        ctx: *mut c_void,
+        _: u16,
+        _: u64,
+        _: u32,
+        _: u32,
+        _: *const u8,
+        _: usize,
+    ) -> u64 {
+        let counts = unsafe { &*(ctx as *const Mutex<[usize; 2]>) };
+        let mut counts = counts.lock().unwrap();
+        counts[1] += 1;
+        counts[1] as u64
+    }
+    let counts = Mutex::new([0usize; 2]);
+    let mut mac = test_mac();
+    mac.framework.framework_ctx = &counts as *const _ as *mut c_void;
+    mac.framework.send_upstream_control = control;
+    mac.framework.schedule_timed_event = timer;
+    {
+        let mut state = mac.state.lock().unwrap();
+        state.pcr_uri = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../validation/guide-samples/tdma-pcr.xml"
+        )
+        .into();
+        state.flow_control_enable = true;
+        state.flow_control_tokens = 3;
+    }
+    let plugin = &mut mac as *mut _ as *mut c_void;
+    // Original models announce grants and arm recurring timers in postStart.
+    assert!(start(plugin));
+    assert_eq!(*counts.lock().unwrap(), [0, 0]);
+    post_start(plugin);
+    assert_eq!(*counts.lock().unwrap(), [1, 1]);
+    stop(plugin);
 }

@@ -10,6 +10,7 @@
 )]
 
 pub mod application_runtime;
+pub mod bit_pool;
 pub mod build_id_service;
 pub mod common;
 pub mod control_port;
@@ -141,7 +142,6 @@ impl LognormalFadingState {
         if !power_dbm.is_finite()
             || !params.dmu.is_finite()
             || !params.dsigma.is_finite()
-            || params.dsigma < 0.0
             || !params.lmean.is_finite()
             || !params.lstddev.is_finite()
             || params.lmean < 0.0
@@ -216,6 +216,38 @@ pub extern "C" fn emane_rs_lognormal_fading_process(
     let p = unsafe { &*params };
 
     state.process(power_dbm, p, now_microsec).unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod lognormal_tests {
+    use super::*;
+
+    #[test]
+    fn negative_depth_sigma_preserves_original_sample_and_period() {
+        // The original public schema accepts signed depth sigma. These powers
+        // come from its default-seeded distribution at controlled timestamps.
+        let mut state = LognormalFadingState::new();
+        let params = LognormalFadingParameters {
+            dmu: 0.0,
+            dsigma: -1.0,
+            dlthresh: 0.25,
+            maxpathloss: 40.0,
+            duthresh: 0.75,
+            minpathloss: 0.0,
+            lmean: 0.001,
+            lstddev: 0.001,
+            counter: 1,
+        };
+        assert!(
+            (state.process(-47.0, &params, 11_002_000).unwrap() - 2.223_241_472_745_230_4e-6).abs()
+                < 1e-18
+        );
+        assert!(
+            (state.process(-120.0, &params, 11_002_002).unwrap() - 1.114_260_243_410_600_7e-13)
+                .abs()
+                < 1e-24
+        );
+    }
 }
 pub mod antenna;
 pub mod flow_control_client;

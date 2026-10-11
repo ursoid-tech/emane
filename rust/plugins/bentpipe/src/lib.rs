@@ -1,5 +1,7 @@
 use emane_plugin_api::random::LegacyRandom;
 mod pcr_manager;
+mod slot_schedule;
+use slot_schedule::SlotSchedule;
 
 use emane_plugin_api::{
     AntennaPattern, FfiConfigRequest, FfiControlMessage, FfiFrameworkService, FfiPacket,
@@ -8,8 +10,8 @@ use emane_plugin_api::{
     RxAntennaRemove, RxProperties, TxAntennaProfile, TxProperties, CONTROL_MIMO_RX_PROPERTIES,
     CONTROL_MIMO_TX_PROPERTIES, CONTROL_MODEL_HEADER, CONTROL_RX_ANTENNA_ADD,
     CONTROL_RX_ANTENNA_REMOVE, CONTROL_RX_PROPERTIES, CONTROL_TX_PROPERTIES,
-    MAC_REGISTRATION_BENTPIPE, PLUGIN_ABI_VERSION, STATISTIC_VALUE_F64, STATISTIC_VALUE_STRING,
-    STATISTIC_VALUE_U64,
+    MAC_REGISTRATION_BENTPIPE, PLUGIN_ABI_VERSION, STATISTIC_VALUE_F64, STATISTIC_VALUE_I64,
+    STATISTIC_VALUE_STRING, STATISTIC_VALUE_U16, STATISTIC_VALUE_U64,
 };
 use pcr_manager::PCRManager;
 use prost::Message;
@@ -19,9 +21,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const EVENT_TRANSMIT: u32 = 1;
-const EVENT_REASSEMBLY_CHECK: u32 = 2;
 const EVENT_RECEIVE: u32 = 3;
 const EVENT_RECEPTION_CHECK: u32 = 4;
+const EVENT_UBEND: u32 = 5;
 const DEFAULT_QUEUE_DEPTH: usize = 256;
 const BENTPIPE_MESSAGE_TYPE: u8 = 1;
 const BROADCAST_NEM: u16 = u16::MAX;
@@ -95,10 +97,24 @@ struct Transponder {
     transmit_delay_us: u64,
     transmit_slots_per_frame: u16,
     transmit_slot_size_us: u64,
+    protocol_slot_size: Option<u64>,
     transmit_slots: Vec<u16>,
     transmit_enable: bool,
     tos: HashSet<u8>,
     all_tos: bool,
+}
+
+impl Transponder {
+    fn valid_transmit_configuration(&self) -> bool {
+        let frames = self.transmit_slots_per_frame;
+        let size = self.transmit_slot_size_us;
+        let mtu = self.transmit_mtu_bytes;
+        if frames != 0 || size != 0 || !self.transmit_slots.is_empty() {
+            frames != 0 && size != 0 && !self.transmit_slots.is_empty()
+        } else {
+            mtu != 0
+        }
+    }
 }
 
 impl Default for Transponder {
@@ -119,6 +135,7 @@ impl Default for Transponder {
             transmit_delay_us: 0,
             transmit_slots_per_frame: 0,
             transmit_slot_size_us: 0,
+            protocol_slot_size: None,
             transmit_slots: Vec::new(),
             transmit_enable: false,
             tos: HashSet::new(),
@@ -145,10 +162,9 @@ struct TxComponent {
 }
 
 struct Reassembly {
-    info: FfiPacketInfo,
-    controls: Vec<OwnedControl>,
     destination: u16,
-    parts: BTreeMap<usize, (u32, Vec<u8>)>,
+    indices: HashSet<u32>,
+    parts: BTreeMap<usize, Vec<u8>>,
     last_fragment_index: Option<u32>,
     last_update: i64,
 }
@@ -162,6 +178,17 @@ struct QueueStatistics {
     high_water: u64,
     fragment_histogram: [u64; 10],
     aggregate_histogram: [u64; 10],
+}
+
+impl QueueStatistics {
+    fn reported_depth(&self) -> u64 {
+        // QueueStatusPublisher tracks enqueue/completion/drop notifications,
+        // not the physical queue length (notably for an empty dequeue).
+        self.enqueued
+            .wrapping_sub(self.dequeued)
+            .wrapping_sub(self.overflow)
+            .wrapping_sub(self.too_big)
+    }
 }
 
 #[derive(Default)]
@@ -184,11 +211,14 @@ struct NeighborStatistics {
 struct PacketAcceptInfo {
     tx_bytes: u64,
     rx_bytes: u64,
+    tx_updated: bool,
+    rx_updated: bool,
 }
 
 #[derive(Clone, Default)]
 struct PacketDropInfo {
     bytes: [u64; 13],
+    updated: [bool; 13],
 }
 
 #[derive(Clone, Copy)]
@@ -226,10 +256,11 @@ struct PendingReception {
 
 struct State {
     transponders: BTreeMap<u16, Transponder>,
-    configured_transponder_fields: HashMap<u16, u32>,
+    configuration_values: BTreeMap<String, Vec<String>>,
     queues: HashMap<u16, VecDeque<PendingTx>>,
     queue_statistics: HashMap<u16, QueueStatistics>,
     slot_statistics: HashMap<u16, SlotStatistics>,
+    slot_schedules: HashMap<u16, SlotSchedule>,
     neighbor_statistics: HashMap<(u16, u16), NeighborStatistics>,
     broadcast_accept: HashMap<u16, PacketAcceptInfo>,
     broadcast_drop: HashMap<u16, PacketDropInfo>,
@@ -244,7 +275,7 @@ struct State {
     fragment_timeout_us: i64,
     pcr_uri: String,
     pcr: PCRManager,
-    packet_sequence: u64,
+    packet_sequences: HashMap<u16, u64>,
     frame_sequence: u64,
     current_eot: HashMap<u16, i64>,
     receive_end: HashMap<u16, i64>,
@@ -252,10 +283,53 @@ struct State {
     timers: HashSet<u64>,
     next_receive_id: u64,
     pending_receptions: HashMap<u64, OwnedPacket>,
-    receive_candidates: BTreeMap<(u16, i64, u64), PendingReception>,
-    reassembly: HashMap<(u16, u64), Reassembly>,
+    pending_ubend: HashMap<u64, (u16, OwnedPacket)>,
+    receive_candidates: BTreeMap<(u16, i64), PendingReception>,
+    reassembly: HashMap<(u16, u16, u64), Reassembly>,
+    last_fragment_check: HashMap<u16, i64>,
     receive_random: HashMap<u16, LegacyRandom>,
     started: bool,
+}
+
+// Stage parsing and validation before mutating live model configuration.
+struct PendingConfiguration {
+    transponders: BTreeMap<u16, Transponder>,
+    configuration_values: BTreeMap<String, Vec<String>>,
+    queue_depth: usize,
+    aggregation_enable: bool,
+    fragmentation_enable: bool,
+    antennas: HashMap<u16, AntennaDefinition>,
+    fragment_check_us: i64,
+    fragment_timeout_us: i64,
+    pcr_uri: String,
+}
+
+impl PendingConfiguration {
+    fn from_state(state: &State) -> Self {
+        Self {
+            transponders: state.transponders.clone(),
+            configuration_values: state.configuration_values.clone(),
+            queue_depth: state.queue_depth,
+            aggregation_enable: state.aggregation_enable,
+            fragmentation_enable: state.fragmentation_enable,
+            antennas: state.antennas.clone(),
+            fragment_check_us: state.fragment_check_us,
+            fragment_timeout_us: state.fragment_timeout_us,
+            pcr_uri: state.pcr_uri.clone(),
+        }
+    }
+
+    fn commit(self, state: &mut State) {
+        state.transponders = self.transponders;
+        state.configuration_values = self.configuration_values;
+        state.queue_depth = self.queue_depth;
+        state.aggregation_enable = self.aggregation_enable;
+        state.fragmentation_enable = self.fragmentation_enable;
+        state.antennas = self.antennas;
+        state.fragment_check_us = self.fragment_check_us;
+        state.fragment_timeout_us = self.fragment_timeout_us;
+        state.pcr_uri = self.pcr_uri;
+    }
 }
 
 struct BentpipeMac {
@@ -456,10 +530,11 @@ impl BentpipeMac {
             tables,
             state: Mutex::new(State {
                 transponders: BTreeMap::new(),
-                configured_transponder_fields: HashMap::new(),
+                configuration_values: BTreeMap::new(),
                 queues: HashMap::new(),
                 queue_statistics: HashMap::new(),
                 slot_statistics: HashMap::new(),
+                slot_schedules: HashMap::new(),
                 neighbor_statistics: HashMap::new(),
                 broadcast_accept: HashMap::new(),
                 broadcast_drop: HashMap::new(),
@@ -474,7 +549,7 @@ impl BentpipeMac {
                 fragment_timeout_us: 5_000_000,
                 pcr_uri: String::new(),
                 pcr: PCRManager::new(),
-                packet_sequence: 0,
+                packet_sequences: HashMap::new(),
                 frame_sequence: 0,
                 current_eot: HashMap::new(),
                 receive_end: HashMap::new(),
@@ -482,8 +557,10 @@ impl BentpipeMac {
                 timers: HashSet::new(),
                 next_receive_id: 0,
                 pending_receptions: HashMap::new(),
+                pending_ubend: HashMap::new(),
                 receive_candidates: BTreeMap::new(),
                 reassembly: HashMap::new(),
+                last_fragment_check: HashMap::new(),
                 receive_random: HashMap::new(),
                 started: false,
             }),
@@ -516,6 +593,20 @@ fn stat_u64(value: u64) -> FfiStatisticValue {
         u64_value: value,
         f64_value: 0.0,
         string_value: std::ptr::null(),
+    }
+}
+
+fn stat_u16(value: u16) -> FfiStatisticValue {
+    FfiStatisticValue {
+        value_type: STATISTIC_VALUE_U16,
+        ..stat_u64(u64::from(value))
+    }
+}
+
+fn stat_i64(value: i64) -> FfiStatisticValue {
+    FfiStatisticValue {
+        value_type: STATISTIC_VALUE_I64,
+        ..stat_u64(value as u64)
     }
 }
 
@@ -558,16 +649,16 @@ fn publish_configuration_tables(mac: &BentpipeMac, state: &State) {
             "TransponderStatusTable",
             &[u64::from(*index)],
             &[
-                stat_u64(u64::from(*index)),
+                stat_u16(*index),
                 stat_u64(transponder.receive_frequency_hz),
                 stat_u64(transponder.receive_bandwidth_hz),
-                stat_u64(u64::from(transponder.receive_antenna_index)),
+                stat_u16(transponder.receive_antenna_index),
                 stat_string(enabled_rx),
                 stat_string(action),
                 stat_u64(transponder.transmit_frequency_hz),
                 stat_u64(transponder.transmit_bandwidth_hz),
                 stat_u64(transponder.transmit_data_rate_bps),
-                stat_u64(u64::from(transponder.transmit_antenna_index)),
+                stat_u16(transponder.transmit_antenna_index),
                 stat_f64(transponder.transmit_power_dbm),
                 stat_string(enabled_tx),
             ],
@@ -576,10 +667,10 @@ fn publish_configuration_tables(mac: &BentpipeMac, state: &State) {
             "TransponderStatusExTable",
             &[u64::from(*index)],
             &[
-                stat_u64(u64::from(*index)),
-                stat_u64(transponder.transmit_delay_us),
-                stat_u64(u64::from(transponder.transmit_slots_per_frame)),
-                stat_u64(transponder.transmit_slot_size_us),
+                stat_u16(*index),
+                stat_i64(transponder.transmit_delay_us as i64),
+                stat_u16(transponder.transmit_slots_per_frame),
+                stat_i64(transponder.transmit_slot_size_us as i64),
                 stat_u64(effective_mtu(transponder) as u64),
             ],
         );
@@ -593,7 +684,7 @@ fn publish_configuration_tables(mac: &BentpipeMac, state: &State) {
         {
             let (profile, fixed_gain, azimuth, elevation) = match antenna.pattern {
                 AntennaPattern::Profile(profile) => (
-                    stat_u64(u64::from(profile.profile_id)),
+                    stat_u16(profile.profile_id),
                     stat_string(c"NA"),
                     stat_f64(profile.azimuth_degrees),
                     stat_f64(profile.elevation_degrees),
@@ -610,14 +701,14 @@ fn publish_configuration_tables(mac: &BentpipeMac, state: &State) {
                 "AntennaStatusTable",
                 &[u64::from(*antenna_index), transponder.receive_frequency_hz],
                 &[
-                    stat_u64(u64::from(*antenna_index)),
+                    stat_u16(*antenna_index),
                     profile,
                     stat_u64(transponder.receive_bandwidth_hz),
                     stat_u64(transponder.receive_frequency_hz),
                     fixed_gain,
                     azimuth,
                     elevation,
-                    stat_u64(u64::from(antenna.spectral_mask_index)),
+                    stat_u16(antenna.spectral_mask_index),
                 ],
             );
         }
@@ -628,12 +719,12 @@ fn publish_queue_tables(mac: &BentpipeMac, state: &State, index: u16) {
     let Some(statistics) = state.queue_statistics.get(&index) else {
         return;
     };
-    let depth = state.queues.get(&index).map_or(0, VecDeque::len) as u64;
+    let depth = statistics.reported_depth();
     mac.set_table_row(
         "QueueStatusTable",
         &[u64::from(index)],
         &[
-            stat_u64(u64::from(index)),
+            stat_u16(index),
             stat_u64(statistics.enqueued),
             stat_u64(statistics.dequeued),
             stat_u64(statistics.overflow),
@@ -647,7 +738,7 @@ fn publish_queue_tables(mac: &BentpipeMac, state: &State, index: u16) {
         ("QueueAggregateHistogram", &statistics.aggregate_histogram),
     ] {
         let mut values = Vec::with_capacity(11);
-        values.push(stat_u64(u64::from(index)));
+        values.push(stat_u16(index));
         values.extend(histogram.iter().copied().map(stat_u64));
         mac.set_table_row(name, &[u64::from(index)], &values);
     }
@@ -685,11 +776,25 @@ fn update_slot_statistics(
     };
     statistics.quantiles[quantile] += 1;
     let mut values = vec![
-        stat_u64(u64::from(index)),
-        stat_u64(statistics.valid),
-        stat_u64(statistics.missed),
+        stat_u16(index),
+        if statistics.valid == 0 {
+            stat_i64(0)
+        } else {
+            stat_u64(statistics.valid)
+        },
+        if statistics.missed == 0 {
+            stat_i64(0)
+        } else {
+            stat_u64(statistics.missed)
+        },
     ];
-    values.extend(statistics.quantiles.iter().copied().map(stat_u64));
+    values.extend(statistics.quantiles.iter().copied().map(|n| {
+        if n == 0 {
+            stat_i64(0)
+        } else {
+            stat_u64(n)
+        }
+    }));
     mac.set_table_row("TxSlotStatusTable", &[u64::from(index)], &values);
 }
 
@@ -736,8 +841,8 @@ fn update_neighbor_statistics(
         "NeighborStatusTable",
         &[u64::from(remote), u64::from(transponder)],
         &[
-            stat_u64(u64::from(remote)),
-            stat_u64(u64::from(transponder)),
+            stat_u16(remote),
+            stat_u16(transponder),
             stat_f64(weighted_moving_average(&statistics.sinr_window)),
             stat_f64(weighted_moving_average(&statistics.noise_floor_window)),
             stat_u64(statistics.samples),
@@ -777,17 +882,27 @@ fn record_packet_accept(
     }
     let info = infos.entry(source).or_default();
     if inbound {
+        info.rx_updated = true;
         info.rx_bytes = info.rx_bytes.saturating_add(size as u64);
     } else {
+        info.tx_updated = true;
         info.tx_bytes = info.tx_bytes.saturating_add(size as u64);
     }
     mac.set_table_row(
         name,
         &[u64::from(source)],
         &[
-            stat_u64(u64::from(source)),
-            stat_u64(info.tx_bytes),
-            stat_u64(info.rx_bytes),
+            stat_u16(source),
+            if info.tx_updated {
+                stat_u64(info.tx_bytes)
+            } else {
+                stat_i64(0)
+            },
+            if info.rx_updated {
+                stat_u64(info.rx_bytes)
+            } else {
+                stat_i64(0)
+            },
         ],
     );
 }
@@ -820,10 +935,22 @@ fn record_packet_drop(
         infos.clear();
     }
     let info = infos.entry(source).or_default();
+    info.updated[reason as usize] = true;
     info.bytes[reason as usize] = info.bytes[reason as usize].saturating_add(size as u64);
     let mut row = Vec::with_capacity(14);
-    row.push(stat_u64(u64::from(source)));
-    row.extend(info.bytes.iter().copied().map(stat_u64));
+    row.push(stat_u16(source));
+    row.extend(
+        info.bytes
+            .iter()
+            .zip(info.updated)
+            .map(|(&value, updated)| {
+                if updated {
+                    stat_u64(value)
+                } else {
+                    stat_i64(0)
+                }
+            }),
+    );
     mac.set_table_row(name, &[u64::from(source)], &row);
 }
 
@@ -848,22 +975,78 @@ fn record_component_drops(
     }
 }
 
-fn expire_reassembly(mac: &BentpipeMac, state: &mut State, now: i64) {
+fn reassemble_component(
+    state: &mut State,
+    transponder: u16,
+    info: FfiPacketInfo,
+    controls: &[OwnedControl],
+    fragment: BentPipeFragment,
+    data: Vec<u8>,
+    now: i64,
+) -> Option<OwnedPacket> {
+    let key = (transponder, info.source, fragment.sequence);
+    let entry = match state.reassembly.entry(key) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(Reassembly {
+                destination: info.destination,
+                indices: HashSet::from([fragment.index]),
+                parts: BTreeMap::from([(fragment.offset as usize, data)]),
+                last_fragment_index: (!fragment.more).then_some(fragment.index),
+                last_update: now,
+            });
+            return None;
+        }
+        std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+    };
+    if !entry.indices.insert(fragment.index) {
+        return None;
+    }
+    // The original tracks indices separately and keeps the first payload at
+    // each offset. Completion depends on the number of distinct indices.
+    entry.parts.entry(fragment.offset as usize).or_insert(data);
+    if !fragment.more {
+        entry.last_fragment_index = Some(fragment.index);
+    }
+    entry.last_update = now;
+    let complete = entry
+        .last_fragment_index
+        .is_some_and(|last| entry.indices.len() as u64 == u64::from(last) + 1);
+    complete.then(|| {
+        let entry = state.reassembly.remove(&key).expect("reassembly entry");
+        OwnedPacket {
+            info,
+            payload: entry.parts.into_values().flatten().collect(),
+            controls: controls.to_vec(),
+        }
+    })
+}
+
+fn expire_reassembly(mac: &BentpipeMac, state: &mut State, transponder: u16, now: i64) {
+    let last_check = state
+        .last_fragment_check
+        .get(&transponder)
+        .copied()
+        .unwrap_or(0);
+    if last_check.saturating_add(state.fragment_check_us) > now {
+        return;
+    }
+    state.last_fragment_check.insert(transponder, now);
     let timeout = state.fragment_timeout_us;
     let expired = state
         .reassembly
         .iter()
         .filter_map(|(key, entry)| {
-            (now.saturating_sub(entry.last_update) >= timeout).then_some(*key)
+            (key.0 == transponder && now.saturating_sub(entry.last_update) >= timeout)
+                .then_some(*key)
         })
         .collect::<Vec<_>>();
     for key in expired {
         if let Some(entry) = state.reassembly.remove(&key) {
-            let size = entry.parts.values().map(|(_, data)| data.len()).sum();
+            let size = entry.parts.values().map(Vec::len).sum();
             record_packet_drop(
                 mac,
                 state,
-                key.0,
+                key.1,
                 entry.destination,
                 size,
                 PacketDropReason::MissingFragment,
@@ -894,47 +1077,6 @@ fn parse_scaled_u64(value: &str) -> Option<u64> {
 fn split_index(value: &str) -> Option<(u16, &str)> {
     let (index, value) = value.split_once(':')?;
     Some((index.parse().ok()?, value))
-}
-
-fn transponder_config_bit(name: &str) -> Option<u32> {
-    const NAMES: [&str; 18] = [
-        "transponder.receive.frequency",
-        "transponder.receive.bandwidth",
-        "transponder.receive.antenna",
-        "transponder.receive.action",
-        "transponder.receive.enable",
-        "transponder.transmit.pcrcurveindex",
-        "transponder.transmit.frequency",
-        "transponder.transmit.bandwidth",
-        "transponder.transmit.antenna",
-        "transponder.transmit.ubend.delay",
-        "transponder.transmit.datarate",
-        "transponder.transmit.power",
-        "transponder.transmit.tosmap",
-        "transponder.transmit.slotperframe",
-        "transponder.transmit.slotsize",
-        "transponder.transmit.txslots",
-        "transponder.transmit.mtu",
-        "transponder.transmit.enable",
-    ];
-    NAMES
-        .iter()
-        .position(|candidate| *candidate == name)
-        .map(|index| 1u32 << index)
-}
-
-const TRANSPONDER_REQUIRED_FIELDS: u32 = (1 << 18) - 1;
-const TRANSPONDER_TOSMAP_FIELD: u32 = 1 << 12;
-
-fn required_transponder_fields(action: ReceiveAction) -> u32 {
-    if action == ReceiveAction::Ubend {
-        // U-bend transponders relay received frames and never classify locally
-        // originated traffic, so the guide does not define a TOS map for each
-        // one.
-        TRANSPONDER_REQUIRED_FIELDS & !TRANSPONDER_TOSMAP_FIELD
-    } else {
-        TRANSPONDER_REQUIRED_FIELDS
-    }
 }
 
 fn parse_antenna(value: &str) -> Option<(u16, AntennaDefinition)> {
@@ -1126,41 +1268,58 @@ fn now_us() -> i64 {
 }
 
 fn airtime(bytes: usize, rate: u64) -> u64 {
-    (bytes as u64)
-        .saturating_mul(8_000_000)
-        .saturating_add(rate.saturating_sub(1))
-        .checked_div(rate)
-        .unwrap_or(0)
+    if rate == 0 {
+        0
+    } else {
+        // TransponderNoProtocol computes double seconds and duration_cast
+        // truncates to microseconds, including zero for sub-microsecond frames.
+        (bytes as f64 * 8.0 / rate as f64 * 1_000_000.0) as u64
+    }
 }
 
-fn next_slot(transponder: &Transponder, now: i64) -> i64 {
-    if transponder.transmit_slots.is_empty()
-        || transponder.transmit_slots_per_frame == 0
-        || transponder.transmit_slot_size_us == 0
-    {
-        return now;
+fn slotted(transponder: &Transponder) -> bool {
+    transponder
+        .protocol_slot_size
+        .unwrap_or(transponder.transmit_slot_size_us)
+        != 0
+}
+
+fn slotted_opportunity(
+    mac: &BentpipeMac,
+    state: &mut State,
+    index: u16,
+    transponder: &Transponder,
+    now: i64,
+    consume: bool,
+) -> bool {
+    let schedule = state
+        .slot_schedules
+        .entry(index)
+        .or_insert_with(|| SlotSchedule::new(transponder, now));
+    let (available, updates) = schedule.check(transponder, now, consume);
+    for (valid, ratio) in updates {
+        update_slot_statistics(mac, state, index, valid, ratio);
     }
-    let size = transponder.transmit_slot_size_us as i64;
-    let absolute_slot = now.div_euclid(size);
-    let current = absolute_slot.rem_euclid(i64::from(transponder.transmit_slots_per_frame)) as u16;
-    for slot in &transponder.transmit_slots {
-        if *slot > current || (*slot == current && now % size == 0) {
-            return (absolute_slot + i64::from(*slot) - i64::from(current)) * size;
-        }
+    available
+}
+
+fn slot_timestamp(transponder: &Transponder, now: i64) -> i64 {
+    let size = transponder
+        .protocol_slot_size
+        .unwrap_or(transponder.transmit_slot_size_us) as i64;
+    if size == 0 {
+        now
+    } else {
+        now / size * size
     }
-    let first = i64::from(transponder.transmit_slots[0]);
-    (absolute_slot + i64::from(transponder.transmit_slots_per_frame) - i64::from(current) + first)
-        * size
 }
 
 fn effective_mtu(transponder: &Transponder) -> usize {
-    if transponder.transmit_mtu_bytes != 0 {
-        transponder.transmit_mtu_bytes
-    } else if transponder.transmit_slot_size_us != 0 {
-        ((transponder.transmit_data_rate_bps as u128 * transponder.transmit_slot_size_us as u128)
-            / 8_000_000) as usize
+    if slotted(transponder) {
+        ((transponder.transmit_data_rate_bps as f64 / 8.0)
+            * (transponder.transmit_slot_size_us as f64 / 1_000_000.0)) as usize
     } else {
-        0
+        transponder.transmit_mtu_bytes
     }
 }
 
@@ -1171,14 +1330,7 @@ fn enqueue(
     packet: OwnedPacket,
     ready_at: i64,
 ) -> bool {
-    let Some(transponder) = state.transponders.get(&index) else {
-        return false;
-    };
-    if !transponder.transmit_enable {
-        return false;
-    }
-    let mtu = effective_mtu(transponder);
-    if mtu == 0 {
+    if !state.transponders.contains_key(&index) {
         return false;
     }
     if state.queue_depth == 0 {
@@ -1194,15 +1346,16 @@ fn enqueue(
         publish_queue_tables(mac, state, index);
         return true;
     }
-    let sequence = state.packet_sequence;
-    state.packet_sequence = state.packet_sequence.wrapping_add(1);
-    let (dropped_packets, depth) = {
+    let next = state.packet_sequences.entry(index).or_default();
+    let sequence = *next;
+    *next = next.wrapping_add(1);
+    let dropped_packets = {
         let queue = state.queues.entry(index).or_default();
         let mut dropped_packets = Vec::new();
         while queue.len() >= state.queue_depth {
             let position = queue
                 .iter()
-                .position(|entry| entry.offset == 0)
+                .position(|entry| entry.fragment_index == 0)
                 .unwrap_or(0);
             dropped_packets.push(
                 queue
@@ -1217,7 +1370,7 @@ fn enqueue(
             fragment_index: 0,
             ready_at,
         });
-        (dropped_packets, queue.len() as u64)
+        dropped_packets
     };
     state.queue_statistics.entry(index).or_default().overflow += dropped_packets.len() as u64;
     for dropped in dropped_packets {
@@ -1232,7 +1385,7 @@ fn enqueue(
     }
     let statistics = state.queue_statistics.entry(index).or_default();
     statistics.enqueued += 1;
-    statistics.high_water = statistics.high_water.max(depth);
+    statistics.high_water = statistics.high_water.max(statistics.reported_depth());
     publish_queue_tables(mac, state, index);
     true
 }
@@ -1253,16 +1406,14 @@ fn dequeue_components(
     let mut dropped_packets = Vec::new();
     let mut used = 0usize;
 
-    while used < mtu {
+    // The original also visits the next packet at an exact frame boundary,
+    // emitting a zero-byte first fragment when fragmentation is enabled.
+    while used <= mtu {
         let Some(front) = queue.front() else { break };
         if front.ready_at > now {
             break;
         }
         let remaining = front.packet.payload.len().saturating_sub(front.offset);
-        if remaining == 0 {
-            queue.pop_front();
-            continue;
-        }
         let available = mtu - used;
         if remaining <= available {
             let pending = queue.pop_front().expect("queue front");
@@ -1296,11 +1447,13 @@ fn dequeue_components(
             pending.offset = end;
             pending.fragment_index = pending.fragment_index.saturating_add(1);
             break;
-        } else {
-            // Legacy strict dequeue drops an oversized head packet so it cannot
-            // permanently block smaller packets behind it.
+        } else if components.is_empty() {
+            // Strict dequeue drops an oversized head only before assembling an
+            // aggregate. A later packet can fit in the next frame.
             let dropped = queue.pop_front().expect("queue front");
             dropped_packets.push(dropped);
+        } else {
+            break;
         }
     }
     state.queue_statistics.entry(index).or_default().too_big += dropped_packets.len() as u64;
@@ -1313,6 +1466,14 @@ fn dequeue_components(
             dropped.packet.payload.len(),
             PacketDropReason::TooBig,
         );
+    }
+    // The original QueueManager discards a zero-byte dequeue without notifying
+    // QueueStatusPublisher. Empty components in a nonempty aggregate survive.
+    if components
+        .iter()
+        .all(|component| component.packet.payload.is_empty())
+    {
+        components.clear();
     }
     if !components.is_empty() {
         let statistics = state.queue_statistics.entry(index).or_default();
@@ -1366,29 +1527,6 @@ fn schedule_transmit(mac: &BentpipeMac, index: u16, when: i64) {
     }
 }
 
-fn schedule_reassembly_check(mac: &BentpipeMac) {
-    let when = {
-        let state = mac.state.lock().unwrap();
-        if !state.started {
-            return;
-        }
-        now_us().saturating_add(state.fragment_check_us)
-    };
-    let when_u64 = when.max(0) as u64;
-    let timer = (mac.framework.schedule_timed_event)(
-        mac.framework.framework_ctx,
-        mac.id,
-        when_u64 / 1_000_000,
-        (when_u64 % 1_000_000) as u32,
-        EVENT_REASSEMBLY_CHECK,
-        std::ptr::null(),
-        0,
-    );
-    if timer != 0 {
-        mac.state.lock().unwrap().timers.insert(timer);
-    }
-}
-
 fn schedule_receive(mac: &BentpipeMac, packet: OwnedPacket, when: i64) {
     let id = {
         let mut state = mac.state.lock().unwrap();
@@ -1423,6 +1561,7 @@ fn send_downstream(
     frame_sequence: u64,
     transponder: &Transponder,
     antenna: AntennaDefinition,
+    start_of_transmission: i64,
 ) {
     {
         let mut state = mac.state.lock().unwrap();
@@ -1435,11 +1574,24 @@ fn send_downstream(
                 component.packet.payload.len(),
                 false,
             );
+            if !transponder.transmit_enable {
+                record_packet_drop(
+                    mac,
+                    &mut state,
+                    mac.id,
+                    component.packet.info.destination,
+                    component.packet.payload.len(),
+                    PacketDropReason::TxOff,
+                );
+            }
         }
     }
-    let start_of_transmission = now_us();
+    if !transponder.transmit_enable {
+        return;
+    }
     let wire = BentPipeMessage {
-        start_of_transmission_microseconds: start_of_transmission.max(0) as u64,
+        start_of_transmission_microseconds: slot_timestamp(transponder, start_of_transmission)
+            .max(0) as u64,
         curve_index: u32::from(transponder.curve_index),
         messages: components
             .iter()
@@ -1484,7 +1636,7 @@ fn send_downstream(
         flags: transponder.curve_index,
     };
     let header_bytes = header.encode();
-    let duration = airtime(total_data_bytes, transponder.transmit_data_rate_bps).max(1);
+    let duration = airtime(total_data_bytes, transponder.transmit_data_rate_bps);
     let tx_bytes = TxProperties {
         frequency_hz: transponder.transmit_frequency_hz,
         bandwidth_hz: transponder.transmit_bandwidth_hz,
@@ -1495,7 +1647,7 @@ fn send_downstream(
             },
         duration_microseconds: duration,
         offset_microseconds: 0,
-        tx_time_microseconds: start_of_transmission,
+        tx_time_microseconds: slot_timestamp(transponder, start_of_transmission),
         antenna_index: transponder.transmit_antenna_index,
         spectral_mask_index: antenna.spectral_mask_index,
         sub_id: 0,
@@ -1580,12 +1732,30 @@ fn send_downstream(
     );
 }
 
-fn drive(mac: &BentpipeMac, index: u16, now: i64, expected: Option<i64>) {
-    let (components, frame_sequence, transponder, antenna, next) = 'decision: {
+fn drive_all(mac: &BentpipeMac, now: i64) {
+    let mut indices = mac
+        .state
+        .lock()
+        .unwrap()
+        .transponders
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    for index in indices {
+        drive(mac, index, now, None);
+    }
+}
+
+fn drive(mac: &BentpipeMac, index: u16, now: i64, _expected: Option<i64>) {
+    let (components, frame_sequence, transponder, antenna, next) = {
         let mut state = mac.state.lock().unwrap();
         let Some(transponder) = state.transponders.get(&index).cloned() else {
             return;
         };
+        let is_slotted = slotted(&transponder);
+        let allowed =
+            !is_slotted || slotted_opportunity(mac, &mut state, index, &transponder, now, true);
         let Some(antenna) = state
             .antennas
             .get(&transponder.transmit_antenna_index)
@@ -1593,35 +1763,14 @@ fn drive(mac: &BentpipeMac, index: u16, now: i64, expected: Option<i64>) {
         else {
             return;
         };
-        let slotted = transponder.transmit_slot_size_us != 0
-            && transponder.transmit_slots_per_frame != 0
-            && !transponder.transmit_slots.is_empty();
-        let allowed = expected
-            .filter(|_| slotted)
-            .unwrap_or_else(|| next_slot(&transponder, now));
-        if let Some(expected) = expected.filter(|_| slotted) {
-            let ratio = now.saturating_sub(expected) as f64
-                / transponder.transmit_slot_size_us.max(1) as f64;
-            let valid = now < expected.saturating_add(transponder.transmit_slot_size_us as i64);
-            update_slot_statistics(mac, &mut state, index, valid, ratio);
-            if !valid {
-                let next = next_slot(&transponder, now);
-                break 'decision (
-                    Vec::new(),
-                    state.frame_sequence,
-                    transponder,
-                    antenna,
-                    Some(next),
-                );
-            }
-        }
         let eot = state.current_eot.get(&index).copied().unwrap_or(0);
         let ready = state
             .queues
             .get(&index)
             .and_then(VecDeque::front)
             .map(|item| item.ready_at);
-        let can_send = ready.is_some_and(|ready| ready <= now) && eot <= now && allowed <= now;
+        let can_send =
+            ready.is_some_and(|ready| ready <= now) && (is_slotted || eot <= now) && allowed;
         let components = if can_send {
             let mtu = effective_mtu(&transponder);
             let components = dequeue_components(mac, &mut state, index, mtu, now);
@@ -1640,25 +1789,30 @@ fn drive(mac: &BentpipeMac, index: u16, now: i64, expected: Option<i64>) {
             Vec::new()
         };
         let frame_sequence = state.frame_sequence;
-        if !components.is_empty() {
+        if !components.is_empty() && transponder.transmit_enable {
             state.frame_sequence = state.frame_sequence.wrapping_add(1);
         }
-        let next = state
-            .queues
-            .get(&index)
-            .and_then(VecDeque::front)
-            .map(|item| {
-                next_slot(
-                    &transponder,
+        // A zero-byte dequeue does not prepare a transmission in C++, so it
+        // creates no completion callback. Wait for another packet/opportunity.
+        let next = if is_slotted || (can_send && components.is_empty()) {
+            None
+        } else {
+            state
+                .queues
+                .get(&index)
+                .and_then(VecDeque::front)
+                .map(|item| {
                     item.ready_at
                         .max(*state.current_eot.get(&index).unwrap_or(&0))
-                        .max(now),
-                )
-            });
+                        .max(now)
+                })
+        };
         (components, frame_sequence, transponder, antenna, next)
     };
     if !components.is_empty() {
-        send_downstream(mac, components, frame_sequence, &transponder, antenna);
+        // Use the same timestamp as current_eot so back-to-back transmissions
+        // cannot overlap merely because serialization sampled a later clock.
+        send_downstream(mac, components, frame_sequence, &transponder, antenna, now);
     }
     if let Some(next) = next {
         schedule_transmit(mac, index, next);
@@ -1700,6 +1854,193 @@ extern "C" fn init(id: u16, framework: *const FfiFrameworkService) -> *mut c_voi
     Box::into_raw(Box::new(BentpipeMac::new(id, *framework))).cast()
 }
 
+fn apply_transponder_value(transponder: &mut Transponder, name: &str, value: &str) -> bool {
+    match name {
+        "transponder.receive.frequency" => {
+            transponder.receive_frequency_hz = match parse_scaled_u64(value) {
+                Some(value) => value,
+                None => return false,
+            };
+        }
+        "transponder.receive.bandwidth" => {
+            transponder.receive_bandwidth_hz = match parse_scaled_u64(value) {
+                Some(value) => value,
+                None => return false,
+            }
+        }
+        "transponder.receive.antenna" => {
+            transponder.receive_antenna_index = match value.parse() {
+                Ok(value) => value,
+                Err(_) => return false,
+            }
+        }
+        "transponder.receive.action" => {
+            transponder.receive_action = match value {
+                "ubend" => ReceiveAction::Ubend,
+                "process" => ReceiveAction::Process,
+                _ => return false,
+            }
+        }
+        "transponder.receive.enable" => {
+            transponder.receive_enable = match parse_bool(value) {
+                Some(value) => value,
+                None => return false,
+            }
+        }
+        "transponder.transmit.pcrcurveindex" => {
+            transponder.curve_index = match value.parse() {
+                Ok(value) => value,
+                Err(_) => return false,
+            }
+        }
+        "transponder.transmit.frequency" => {
+            transponder.transmit_frequency_hz = match parse_scaled_u64(value) {
+                Some(value) => value,
+                None => return false,
+            }
+        }
+        "transponder.transmit.bandwidth" => {
+            transponder.transmit_bandwidth_hz = match parse_scaled_u64(value) {
+                Some(value) => value,
+                None => return false,
+            }
+        }
+        "transponder.transmit.datarate" => {
+            transponder.transmit_data_rate_bps = match parse_scaled_u64(value) {
+                Some(value) => value,
+                None => return false,
+            }
+        }
+        "transponder.transmit.mtu" => {
+            let configured = if value == "na" {
+                0
+            } else {
+                match value.parse::<usize>() {
+                    Ok(value) => value,
+                    Err(_) => return false,
+                }
+            };
+            if value != "na" {
+                transponder.transmit_mtu_bytes = configured;
+            }
+        }
+        "transponder.transmit.antenna" => {
+            transponder.transmit_antenna_index = match value.parse() {
+                Ok(value) => value,
+                Err(_) => return false,
+            }
+        }
+        "transponder.transmit.power" => {
+            transponder.transmit_power_dbm = match value.parse::<f64>() {
+                Ok(value) if value.is_finite() => value,
+                _ => return false,
+            }
+        }
+        "transponder.transmit.ubend.delay" => {
+            if value != "na" {
+                transponder.transmit_delay_us = match value.parse() {
+                    Ok(value) => value,
+                    Err(_) => return false,
+                }
+            }
+        }
+        "transponder.transmit.slotperframe" => {
+            let configured = if value == "na" {
+                0
+            } else {
+                match value.parse::<u16>() {
+                    Ok(value) => value,
+                    Err(_) => return false,
+                }
+            };
+            if value != "na" {
+                transponder.transmit_slots_per_frame = configured;
+            }
+        }
+        "transponder.transmit.slotsize" => {
+            let configured = if value == "na" {
+                0
+            } else {
+                match value.parse::<u64>() {
+                    Ok(value) => value,
+                    Err(_) => return false,
+                }
+            };
+            if value != "na" {
+                transponder.transmit_slot_size_us = configured;
+            }
+        }
+        "transponder.transmit.txslots" => {
+            transponder.transmit_slots = match parse_slots(value) {
+                Some(value) => value,
+                None => return false,
+            }
+        }
+        "transponder.transmit.tosmap" => {
+            if value == "all" {
+                transponder.all_tos = true
+            } else {
+                transponder.tos = match parse_ranges(value) {
+                    Some(value) => value,
+                    None => return false,
+                }
+            }
+        }
+        "transponder.transmit.enable" => {
+            transponder.transmit_enable = match parse_bool(value) {
+                Some(value) => value,
+                None => return false,
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn validate_parameter_values(values: &BTreeMap<String, Vec<String>>, pcr: &PCRManager) -> bool {
+    let mut transponders = BTreeMap::<u16, Transponder>::new();
+    let mut antennas = HashSet::new();
+    for (name, entries) in values {
+        if name == "antenna.defines" {
+            for entry in entries {
+                let Some((index, _)) = parse_antenna(entry) else {
+                    return false;
+                };
+                antennas.insert(index);
+            }
+        } else if name.starts_with("transponder.") {
+            for entry in entries {
+                let Some((index, value)) = split_index(entry) else {
+                    return false;
+                };
+                if !apply_transponder_value(transponders.entry(index).or_default(), name, value) {
+                    return false;
+                }
+            }
+        }
+    }
+    if transponders.is_empty() || antennas.is_empty() {
+        return false;
+    }
+    let mut receive_channels = HashSet::new();
+    transponders.values().all(|transponder| {
+        transponder.receive_frequency_hz != 0
+            && transponder.receive_bandwidth_hz != 0
+            && transponder.receive_action != ReceiveAction::Unknown
+            && transponder.transmit_frequency_hz != 0
+            && transponder.transmit_bandwidth_hz != 0
+            && transponder.transmit_data_rate_bps != 0
+            && transponder.valid_transmit_configuration()
+            && pcr.contains_curve(transponder.curve_index)
+            && antennas.contains(&transponder.receive_antenna_index)
+            && antennas.contains(&transponder.transmit_antenna_index)
+            && receive_channels.insert((
+                transponder.receive_antenna_index,
+                transponder.receive_frequency_hz,
+            ))
+    })
+}
+
 extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
     let Some(mac) = (unsafe { (plugin as *mut BentpipeMac).as_ref() }) else {
         return false;
@@ -1708,14 +2049,18 @@ extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
         return false;
     };
     let mut state = mac.state.lock().unwrap();
+    let mut pending = PendingConfiguration::from_state(&state);
     let mut refresh_receive_antennas = false;
     for (name, values) in items {
+        pending
+            .configuration_values
+            .insert(name.clone(), values.clone());
         match name.as_str() {
             "pcrcurveuri" => {
                 let Some(value) = values.first() else {
                     return false;
                 };
-                state.pcr_uri.clone_from(value);
+                pending.pcr_uri.clone_from(value);
                 continue;
             }
             "queue.depth" => {
@@ -1725,26 +2070,26 @@ extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
                 if value > u16::MAX as usize {
                     return false;
                 }
-                state.queue_depth = value;
+                pending.queue_depth = value;
                 continue;
             }
             "queue.fragmentationenable" => {
                 let Some(value) = values.first().and_then(|value| parse_bool(value)) else {
                     return false;
                 };
-                state.fragmentation_enable = value;
+                pending.fragmentation_enable = value;
                 continue;
             }
             "queue.aggregationenable" => {
                 let Some(value) = values.first().and_then(|value| parse_bool(value)) else {
                     return false;
                 };
-                state.aggregation_enable = value;
+                pending.aggregation_enable = value;
                 continue;
             }
             "antenna.defines" => {
                 let mut antennas = if state.started {
-                    state.antennas.clone()
+                    pending.antennas.clone()
                 } else {
                     HashMap::new()
                 };
@@ -1752,7 +2097,7 @@ extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
                     let Some((index, antenna)) = parse_antenna(&value) else {
                         return false;
                     };
-                    if state.started && !state.antennas.contains_key(&index) {
+                    if state.started && !pending.antennas.contains_key(&index) {
                         return false;
                     }
                     if !state.started && antennas.contains_key(&index) {
@@ -1760,7 +2105,7 @@ extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
                     }
                     antennas.insert(index, antenna);
                 }
-                state.antennas = antennas;
+                pending.antennas = antennas;
                 refresh_receive_antennas = true;
                 continue;
             }
@@ -1768,14 +2113,14 @@ extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
                 let Some(Ok(value)) = values.first().map(|value| value.parse::<u16>()) else {
                     return false;
                 };
-                state.fragment_check_us = i64::from(value) * 1_000_000;
+                pending.fragment_check_us = i64::from(value) * 1_000_000;
                 continue;
             }
             "reassembly.fragmenttimeoutthreshold" => {
                 let Some(Ok(value)) = values.first().map(|value| value.parse::<u16>()) else {
                     return false;
                 };
-                state.fragment_timeout_us = i64::from(value) * 1_000_000;
+                pending.fragment_timeout_us = i64::from(value) * 1_000_000;
                 continue;
             }
             _ => {}
@@ -1784,184 +2129,40 @@ extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
             let Some((index, value)) = split_index(&entry) else {
                 return false;
             };
-            let Some(field) = transponder_config_bit(&name) else {
-                return false;
-            };
-            if state.started && !state.transponders.contains_key(&index) {
+            if state.started && !pending.transponders.contains_key(&index) {
                 return false;
             }
-            *state
-                .configured_transponder_fields
-                .entry(index)
-                .or_default() |= field;
-            let transponder = state.transponders.entry(index).or_default();
-            match name.as_str() {
-                "transponder.receive.frequency" => {
-                    transponder.receive_frequency_hz = match parse_scaled_u64(value) {
-                        Some(value) => value,
-                        None => return false,
-                    };
-                    refresh_receive_antennas = true;
-                }
-                "transponder.receive.bandwidth" => {
-                    transponder.receive_bandwidth_hz = match parse_scaled_u64(value) {
-                        Some(value) => value,
-                        None => return false,
-                    }
-                }
-                "transponder.receive.antenna" => {
-                    transponder.receive_antenna_index = match value.parse() {
-                        Ok(value) => value,
-                        Err(_) => return false,
-                    }
-                }
-                "transponder.receive.action" => {
-                    transponder.receive_action = match value {
-                        "ubend" => ReceiveAction::Ubend,
-                        "process" => ReceiveAction::Process,
-                        _ => return false,
-                    }
-                }
-                "transponder.receive.enable" => {
-                    transponder.receive_enable = match parse_bool(value) {
-                        Some(value) => value,
-                        None => return false,
-                    }
-                }
-                "transponder.transmit.pcrcurveindex" => {
-                    transponder.curve_index = match value.parse() {
-                        Ok(value) => value,
-                        Err(_) => return false,
-                    }
-                }
-                "transponder.transmit.frequency" => {
-                    transponder.transmit_frequency_hz = match parse_scaled_u64(value) {
-                        Some(value) => value,
-                        None => return false,
-                    }
-                }
-                "transponder.transmit.bandwidth" => {
-                    transponder.transmit_bandwidth_hz = match parse_scaled_u64(value) {
-                        Some(value) => value,
-                        None => return false,
-                    }
-                }
-                "transponder.transmit.datarate" => {
-                    transponder.transmit_data_rate_bps = match parse_scaled_u64(value) {
-                        Some(value) => value,
-                        None => return false,
-                    }
-                }
-                "transponder.transmit.mtu" => {
-                    if value != "na" {
-                        transponder.transmit_mtu_bytes = match value.parse() {
-                            Ok(value) => value,
-                            Err(_) => return false,
-                        }
-                    }
-                }
-                "transponder.transmit.antenna" => {
-                    transponder.transmit_antenna_index = match value.parse() {
-                        Ok(value) => value,
-                        Err(_) => return false,
-                    }
-                }
-                "transponder.transmit.power" => {
-                    transponder.transmit_power_dbm = match value.parse::<f64>() {
-                        Ok(value) if value.is_finite() => value,
-                        _ => return false,
-                    }
-                }
-                "transponder.transmit.ubend.delay" => {
-                    if value != "na" {
-                        transponder.transmit_delay_us = match value.parse() {
-                            Ok(value) => value,
-                            Err(_) => return false,
-                        }
-                    }
-                }
-                "transponder.transmit.slotperframe" => {
-                    if value != "na" {
-                        transponder.transmit_slots_per_frame = match value.parse() {
-                            Ok(value) => value,
-                            Err(_) => return false,
-                        }
-                    }
-                }
-                "transponder.transmit.slotsize" => {
-                    if value != "na" {
-                        transponder.transmit_slot_size_us = match value.parse() {
-                            Ok(value) => value,
-                            Err(_) => return false,
-                        }
-                    }
-                }
-                "transponder.transmit.txslots" => {
-                    transponder.transmit_slots = match parse_slots(value) {
-                        Some(value) => value,
-                        None => return false,
-                    }
-                }
-                "transponder.transmit.tosmap" => {
-                    if value == "all" {
-                        transponder.all_tos = true
-                    } else {
-                        transponder.tos = match parse_ranges(value) {
-                            Some(value) => value,
-                            None => return false,
-                        }
-                    }
-                }
-                "transponder.transmit.enable" => {
-                    transponder.transmit_enable = match parse_bool(value) {
-                        Some(value) => value,
-                        None => return false,
-                    }
-                }
-                _ => return false,
+            let transponder = pending.transponders.entry(index).or_default();
+            if !apply_transponder_value(transponder, &name, value) {
+                return false;
             }
+            refresh_receive_antennas |= name == "transponder.receive.frequency";
         }
     }
     if state.started {
+        if !validate_parameter_values(&pending.configuration_values, &state.pcr) {
+            return false;
+        }
         let mut receive_antennas: HashMap<u16, (u64, Vec<u64>)> = HashMap::new();
         let mut receive_channels = HashSet::new();
-        for (index, transponder) in &state.transponders {
-            let slotted = transponder.transmit_slots_per_frame != 0
-                || transponder.transmit_slot_size_us != 0
-                || !transponder.transmit_slots.is_empty();
+        for transponder in pending.transponders.values() {
             if transponder.receive_frequency_hz == 0
                 || transponder.receive_bandwidth_hz == 0
                 || transponder.receive_action == ReceiveAction::Unknown
                 || transponder.transmit_frequency_hz == 0
                 || transponder.transmit_bandwidth_hz == 0
                 || transponder.transmit_data_rate_bps == 0
-                || effective_mtu(transponder) == 0
-                || !state
+                || !pending
                     .antennas
                     .contains_key(&transponder.receive_antenna_index)
-                || !state
+                || !pending
                     .antennas
                     .contains_key(&transponder.transmit_antenna_index)
-                || state
-                    .configured_transponder_fields
-                    .get(index)
-                    .copied()
-                    .unwrap_or_default()
-                    & required_transponder_fields(transponder.receive_action)
-                    != required_transponder_fields(transponder.receive_action)
                 || !state.pcr.contains_curve(transponder.curve_index)
                 || !receive_channels.insert((
                     transponder.receive_antenna_index,
                     transponder.receive_frequency_hz,
                 ))
-                || (slotted
-                    && (transponder.transmit_slots_per_frame == 0
-                        || transponder.transmit_slot_size_us == 0
-                        || transponder.transmit_slots.is_empty()))
-                || transponder
-                    .transmit_slots
-                    .iter()
-                    .any(|slot| *slot >= transponder.transmit_slots_per_frame)
             {
                 return false;
             }
@@ -1979,7 +2180,7 @@ extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
                 .map(|(antenna_index, (bandwidth_hz, mut frequencies_hz))| {
                     frequencies_hz.sort_unstable();
                     frequencies_hz.dedup();
-                    let definition = *state.antennas.get(&antenna_index)?;
+                    let definition = *pending.antennas.get(&antenna_index)?;
                     Some(RxAntennaAdd {
                         antenna: MimoTxAntenna {
                             frequency_group_index: 0,
@@ -1999,6 +2200,7 @@ extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
         } else {
             None
         };
+        pending.commit(&mut state);
         publish_configuration_tables(mac, &state);
         drop(state);
         if let Some(definitions) = definitions {
@@ -2034,6 +2236,8 @@ extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
                 );
             }
         }
+    } else {
+        pending.commit(&mut state);
     }
     true
 }
@@ -2053,45 +2257,38 @@ extern "C" fn start(plugin: *mut c_void) -> bool {
     if state.pcr.load(&uri).is_err() {
         return false;
     }
+    if !validate_parameter_values(&state.configuration_values, &state.pcr) {
+        return false;
+    }
+    let mut mapped_tos = [false; 256];
     let mut receive_channels = HashSet::new();
     let mut receive_antennas: HashMap<u16, (u64, Vec<u64>)> = HashMap::new();
-    for (index, transponder) in &state.transponders {
-        let slotted = transponder.transmit_slots_per_frame != 0
-            || transponder.transmit_slot_size_us != 0
-            || !transponder.transmit_slots.is_empty();
+    for transponder in state.transponders.values() {
+        for tos in 0..=u8::MAX {
+            if (transponder.all_tos || transponder.tos.contains(&tos))
+                && std::mem::replace(&mut mapped_tos[usize::from(tos)], true)
+            {
+                return false;
+            }
+        }
         if transponder.receive_frequency_hz == 0
             || transponder.receive_bandwidth_hz == 0
             || transponder.receive_action == ReceiveAction::Unknown
             || transponder.transmit_frequency_hz == 0
             || transponder.transmit_bandwidth_hz == 0
             || transponder.transmit_data_rate_bps == 0
-            || effective_mtu(transponder) == 0
+            || !transponder.valid_transmit_configuration()
             || !state
                 .antennas
                 .contains_key(&transponder.receive_antenna_index)
             || !state
                 .antennas
                 .contains_key(&transponder.transmit_antenna_index)
-            || state
-                .configured_transponder_fields
-                .get(index)
-                .copied()
-                .unwrap_or_default()
-                & required_transponder_fields(transponder.receive_action)
-                != required_transponder_fields(transponder.receive_action)
             || !state.pcr.contains_curve(transponder.curve_index)
             || !receive_channels.insert((
                 transponder.receive_antenna_index,
                 transponder.receive_frequency_hz,
             ))
-            || (slotted
-                && (transponder.transmit_slots_per_frame == 0
-                    || transponder.transmit_slot_size_us == 0
-                    || transponder.transmit_slots.is_empty()))
-            || transponder
-                .transmit_slots
-                .iter()
-                .any(|slot| *slot >= transponder.transmit_slots_per_frame)
         {
             return false;
         }
@@ -2103,7 +2300,30 @@ extern "C" fn start(plugin: *mut c_void) -> bool {
         }
         receive.1.push(transponder.receive_frequency_hz);
     }
+    for transponder in state.transponders.values_mut() {
+        transponder
+            .protocol_slot_size
+            .get_or_insert(transponder.transmit_slot_size_us);
+    }
     state.started = true;
+    publish_configuration_tables(mac, &state);
+    true
+}
+
+extern "C" fn post_start(plugin: *mut c_void) {
+    let Some(mac) = (unsafe { (plugin as *mut BentpipeMac).as_ref() }) else {
+        return;
+    };
+    let state = mac.state.lock().unwrap();
+    // Match the original postStart phase and one control call per antenna.
+    let mut receive_antennas: BTreeMap<u16, (u64, Vec<u64>)> = BTreeMap::new();
+    for transponder in state.transponders.values() {
+        receive_antennas
+            .entry(transponder.receive_antenna_index)
+            .or_insert_with(|| (transponder.receive_bandwidth_hz, Vec::new()))
+            .1
+            .push(transponder.receive_frequency_hz);
+    }
     let definitions = receive_antennas
         .into_iter()
         .map(|(antenna_index, (bandwidth_hz, mut frequencies_hz))| {
@@ -2123,39 +2343,45 @@ extern "C" fn start(plugin: *mut c_void) -> bool {
         })
         .collect::<Option<Vec<_>>>();
     let Some(definitions) = definitions else {
-        state.started = false;
-        return false;
+        return;
     };
-    publish_configuration_tables(mac, &state);
     drop(state);
-    let payloads = definitions
-        .iter()
-        .map(RxAntennaAdd::encode)
-        .collect::<Option<Vec<_>>>();
-    let Some(payloads) = payloads else {
-        return false;
-    };
-    let messages = payloads
-        .iter()
-        .map(|payload| FfiControlMessage {
+    for definition in definitions {
+        let Some(payload) = definition.encode() else {
+            continue;
+        };
+        let message = FfiControlMessage {
             msg_type: CONTROL_RX_ANTENNA_ADD,
             payload: FfiSlice {
                 data: payload.as_ptr(),
                 len: payload.len(),
             },
-        })
-        .collect::<Vec<_>>();
-    (mac.framework.send_downstream_control)(
-        mac.framework.framework_ctx,
-        mac.id,
-        messages.as_ptr(),
-        messages.len(),
-    );
-    schedule_reassembly_check(mac);
-    true
+        };
+        (mac.framework.send_downstream_control)(mac.framework.framework_ctx, mac.id, &message, 1);
+    }
+    let now = now_us();
+    let mut wakeups = Vec::new();
+    {
+        let mut state = mac.state.lock().unwrap();
+        let transponders = state
+            .transponders
+            .iter()
+            .map(|(i, t)| (*i, t.clone()))
+            .collect::<Vec<_>>();
+        for (index, transponder) in transponders {
+            if slotted(&transponder) {
+                let schedule = SlotSchedule::new(&transponder, now);
+                if let Some(when) = schedule.next_time() {
+                    wakeups.push((index, when));
+                }
+                state.slot_schedules.insert(index, schedule);
+            }
+        }
+    }
+    for (index, when) in wakeups {
+        schedule_transmit(mac, index, when);
+    }
 }
-
-extern "C" fn post_start(_: *mut c_void) {}
 
 extern "C" fn stop(plugin: *mut c_void) {
     let Some(mac) = (unsafe { (plugin as *mut BentpipeMac).as_ref() }) else {
@@ -2166,10 +2392,13 @@ extern "C" fn stop(plugin: *mut c_void) {
         state.started = false;
         state.queues.clear();
         state.pending_receptions.clear();
+        state.pending_ubend.clear();
         state.receive_candidates.clear();
         state.reassembly.clear();
+        state.last_fragment_check.clear();
         state.receive_end.clear();
         state.wakeups.clear();
+        state.slot_schedules.clear();
         state.timers.drain().collect::<Vec<_>>()
     };
     for timer in timers {
@@ -2358,6 +2587,8 @@ extern "C" fn upstream(
                 &wire.messages,
                 PacketDropReason::Lock,
             );
+            drop(state);
+            complete_receptions(mac, now_us(), index);
             return;
         }
         let transponder = &state.transponders[&index];
@@ -2391,17 +2622,15 @@ extern "C" fn upstream(
         .3
         .start_time_microseconds
         .saturating_add(i64::try_from(decision.3.duration_microseconds).unwrap_or(i64::MAX));
-    let key = {
+    let key = (decision.0, decision.3.start_time_microseconds);
+    let inserted = {
         let mut state = mac.state.lock().unwrap();
-        state.next_receive_id = state.next_receive_id.wrapping_add(1);
-        let key = (
-            decision.0,
-            decision.3.start_time_microseconds,
-            state.next_receive_id,
-        );
-        state.receive_candidates.insert(
-            key,
-            PendingReception {
+        // Each original ReceiveManager uses map<TimePoint, FrameInfo>::emplace:
+        // the first pending frame at an equal SoR wins within its transponder.
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            state.receive_candidates.entry(key)
+        {
+            entry.insert(PendingReception {
                 info: packet_ref.info,
                 controls,
                 wire,
@@ -2410,22 +2639,25 @@ extern "C" fn upstream(
                 action: decision.1,
                 delay: decision.2,
                 query: decision.3,
-            },
-        );
-        key
+            });
+            true
+        } else {
+            false
+        }
     };
-    if end <= now_us() {
-        complete_receptions(mac, now_us());
-    } else {
+    let now = now_us();
+    complete_receptions(mac, now, decision.0);
+    if inserted && end > now {
         let when = end.max(0) as u64;
+        let index_bytes = decision.0.to_be_bytes();
         let timer = (mac.framework.schedule_timed_event)(
             mac.framework.framework_ctx,
             mac.id,
             when / 1_000_000,
             (when % 1_000_000) as u32,
             EVENT_RECEPTION_CHECK,
-            std::ptr::null(),
-            0,
+            index_bytes.as_ptr(),
+            index_bytes.len(),
         );
         let mut state = mac.state.lock().unwrap();
         if timer != 0 {
@@ -2436,18 +2668,15 @@ extern "C" fn upstream(
     }
 }
 
-fn complete_receptions(mac: &BentpipeMac, now: i64) {
+fn complete_receptions(mac: &BentpipeMac, now: i64, index: u16) {
     loop {
         let next = {
             let mut state = mac.state.lock().unwrap();
-            let mut seen = HashSet::new();
             let key = state
                 .receive_candidates
                 .iter()
-                .find_map(|(key, candidate)| {
-                    if !seen.insert(key.0) {
-                        return None;
-                    }
+                .find(|(key, _)| key.0 == index)
+                .and_then(|(key, candidate)| {
                     let end = candidate.query.start_time_microseconds.saturating_add(
                         i64::try_from(candidate.query.duration_microseconds).unwrap_or(i64::MAX),
                     );
@@ -2456,11 +2685,12 @@ fn complete_receptions(mac: &BentpipeMac, now: i64) {
             key.and_then(|key| state.receive_candidates.remove(&key))
         };
         let Some(candidate) = next else { break };
-        complete_reception(mac, candidate);
+        complete_reception(mac, candidate, now);
     }
+    expire_reassembly(mac, &mut mac.state.lock().unwrap(), index, now);
 }
 
-fn complete_reception(mac: &BentpipeMac, candidate: PendingReception) {
+fn complete_reception(mac: &BentpipeMac, candidate: PendingReception, now: i64) {
     let PendingReception {
         info,
         controls,
@@ -2540,6 +2770,7 @@ fn complete_reception(mac: &BentpipeMac, candidate: PendingReception) {
         );
     }
     let decision = (index, action, delay, end);
+    let frame_destination = info.destination;
     for component in wire.messages {
         let Ok(destination) = u16::try_from(component.destination) else {
             continue;
@@ -2564,126 +2795,101 @@ fn complete_reception(mac: &BentpipeMac, candidate: PendingReception) {
             destination,
             ..info
         };
-        let completed = if let Some(fragment) = component.fragment {
-            let mut state = mac.state.lock().unwrap();
-            let now = now_us();
-            expire_reassembly(mac, &mut state, now);
-            let key = (info.source, fragment.sequence);
-            let entry = state.reassembly.entry(key).or_insert_with(|| Reassembly {
-                info,
-                controls: controls.clone(),
-                destination,
-                parts: BTreeMap::new(),
-                last_fragment_index: None,
-                last_update: now,
-            });
-            if entry.destination != destination
-                || entry
-                    .parts
-                    .values()
-                    .any(|(index, _)| *index == fragment.index)
-            {
-                continue;
-            }
-            entry
-                .parts
-                .insert(fragment.offset as usize, (fragment.index, component.data));
-            if !fragment.more {
-                entry.last_fragment_index = Some(fragment.index);
-            }
-            entry.last_update = now;
-            let complete = entry.last_fragment_index.is_some_and(|last| {
-                entry.parts.len() == last as usize + 1
-                    && (0..=last).all(|index| {
-                        entry
-                            .parts
-                            .values()
-                            .any(|(fragment_index, _)| *fragment_index == index)
-                    })
-                    && {
-                        let mut offset = 0usize;
-                        entry.parts.iter().all(|(part_offset, (_, data))| {
-                            if *part_offset != offset {
-                                false
-                            } else {
-                                offset = offset.saturating_add(data.len());
-                                true
-                            }
-                        })
-                    }
-            });
-            complete.then(|| {
-                let entry = state.reassembly.remove(&key).expect("reassembly entry");
-                let payload = entry
-                    .parts
-                    .into_values()
-                    .flat_map(|(_, data)| data)
-                    .collect();
-                OwnedPacket {
-                    info: entry.info,
-                    payload,
-                    controls: entry.controls,
-                }
-            })
-        } else {
-            mac.state
-                .lock()
-                .unwrap()
-                .receive_end
-                .insert(decision.0, decision.3);
-            Some(OwnedPacket {
-                info,
-                payload: component.data,
-                controls: controls.clone(),
-            })
-        };
+        let completed =
+            if let Some(fragment) = component.fragment.filter(|f| f.more || f.offset != 0) {
+                reassemble_component(
+                    &mut mac.state.lock().unwrap(),
+                    index,
+                    info,
+                    &controls,
+                    fragment,
+                    component.data,
+                    now,
+                )
+            } else {
+                mac.state
+                    .lock()
+                    .unwrap()
+                    .receive_end
+                    .insert(decision.0, decision.3);
+                Some(OwnedPacket {
+                    info,
+                    payload: component.data,
+                    controls: controls.clone(),
+                })
+            };
         let Some(packet) = completed else { continue };
-        record_packet_accept(
-            mac,
-            &mut mac.state.lock().unwrap(),
-            info.source,
-            packet.info.destination,
-            packet.payload.len(),
-            true,
-        );
         match decision.1 {
             ReceiveAction::Process => {
+                record_packet_accept(
+                    mac,
+                    &mut mac.state.lock().unwrap(),
+                    info.source,
+                    packet.info.destination,
+                    packet.payload.len(),
+                    true,
+                );
                 schedule_receive(mac, packet, decision.3.max(now_us()));
             }
             ReceiveAction::Ubend => {
-                let now = now_us();
-                let when = decision
-                    .3
-                    .max(now)
-                    .saturating_add(i64::try_from(decision.2).unwrap_or(i64::MAX));
-                let destination = packet.info.destination;
-                let size = packet.payload.len();
-                let queued = enqueue(
+                forward_ubend(
                     mac,
-                    &mut mac.state.lock().unwrap(),
                     decision.0,
                     packet,
-                    when,
+                    frame_destination,
+                    decision.2,
+                    now_us(),
                 );
-                if queued {
-                    if when <= now {
-                        drive(mac, decision.0, now, None);
-                    } else {
-                        schedule_transmit(mac, decision.0, when);
-                    }
-                } else {
-                    record_packet_drop(
-                        mac,
-                        &mut mac.state.lock().unwrap(),
-                        mac.id,
-                        destination,
-                        size,
-                        PacketDropReason::TxOff,
-                    );
-                }
             }
             ReceiveAction::Unknown => {}
         }
+    }
+}
+
+fn forward_ubend(
+    mac: &BentpipeMac,
+    index: u16,
+    mut packet: OwnedPacket,
+    frame_destination: u16,
+    delay: u64,
+    now: i64,
+) {
+    packet.info.source = mac.id;
+    packet.info.destination = frame_destination;
+    // C++ constructs a fresh downstream packet. Receive-side controls must not
+    // travel back to the PHY (notably the original OTA transmitter list).
+    packet.controls.clear();
+    if delay == 0 {
+        if enqueue(mac, &mut mac.state.lock().unwrap(), index, packet, now) {
+            drive_all(mac, now);
+        }
+        return;
+    }
+    let id = {
+        let mut state = mac.state.lock().unwrap();
+        state.next_receive_id = state.next_receive_id.wrapping_add(1).max(1);
+        let id = state.next_receive_id;
+        state.pending_ubend.insert(id, (index, packet));
+        id
+    };
+    let when = now
+        .saturating_add(i64::try_from(delay).unwrap_or(i64::MAX))
+        .max(0) as u64;
+    let bytes = id.to_be_bytes();
+    let timer = (mac.framework.schedule_timed_event)(
+        mac.framework.framework_ctx,
+        mac.id,
+        when / 1_000_000,
+        (when % 1_000_000) as u32,
+        EVENT_UBEND,
+        bytes.as_ptr(),
+        bytes.len(),
+    );
+    let mut state = mac.state.lock().unwrap();
+    if timer == 0 {
+        state.pending_ubend.remove(&id);
+    } else {
+        state.timers.insert(timer);
     }
 }
 
@@ -2714,15 +2920,14 @@ extern "C" fn downstream(
             .transponders
             .iter()
             .find(|(_, transponder)| {
-                transponder.transmit_enable
-                    && (transponder.all_tos || transponder.tos.contains(&packet.info.priority))
+                transponder.all_tos || transponder.tos.contains(&packet.info.priority)
             })
             .map(|(index, _)| *index)
     };
     let Some(index) = index else { return };
     let now = now_us();
     if enqueue(mac, &mut mac.state.lock().unwrap(), index, packet, now) {
-        drive(mac, index, now, None);
+        drive_all(mac, now);
     }
 }
 
@@ -2738,18 +2943,28 @@ extern "C" fn timed(
     };
     mac.state.lock().unwrap().timers.remove(&timer_id);
     if event_id == EVENT_RECEPTION_CHECK {
-        complete_receptions(mac, now_us());
+        if len == 2 && !data.is_null() {
+            let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+            complete_receptions(mac, now_us(), u16::from_be_bytes([bytes[0], bytes[1]]));
+        }
         return;
     }
-    if event_id == EVENT_REASSEMBLY_CHECK {
-        let mut state = mac.state.lock().unwrap();
-        if !state.started {
+    if event_id == EVENT_UBEND {
+        if len != 8 || data.is_null() {
             return;
         }
-        let now = now_us();
-        expire_reassembly(mac, &mut state, now);
-        drop(state);
-        schedule_reassembly_check(mac);
+        let id = u64::from_be_bytes(
+            unsafe { std::slice::from_raw_parts(data, len) }
+                .try_into()
+                .unwrap(),
+        );
+        let pending = mac.state.lock().unwrap().pending_ubend.remove(&id);
+        if let Some((index, packet)) = pending {
+            let now = now_us();
+            if enqueue(mac, &mut mac.state.lock().unwrap(), index, packet, now) {
+                drive_all(mac, now);
+            }
+        }
         return;
     }
     if event_id == EVENT_RECEIVE {
@@ -2779,7 +2994,33 @@ extern "C" fn timed(
         }
         state.wakeups.remove(&index);
     }
-    drive(mac, index, now_us(), Some(expected));
+    let now = now_us();
+    let slot_probe = {
+        let mut state = mac.state.lock().unwrap();
+        state
+            .transponders
+            .get(&index)
+            .cloned()
+            .filter(slotted)
+            .map(|transponder| {
+                slotted_opportunity(mac, &mut state, index, &transponder, now, false)
+            })
+    };
+    if slot_probe.unwrap_or(true) {
+        drive_all(mac, now);
+    }
+    if slot_probe.is_some() {
+        let next = mac
+            .state
+            .lock()
+            .unwrap()
+            .slot_schedules
+            .get(&index)
+            .and_then(SlotSchedule::next_time);
+        if let Some(when) = next {
+            schedule_transmit(mac, index, when);
+        }
+    }
 }
 
 extern "C" fn process_event(_: *mut c_void, _: u16, _: *const u8, _: usize) {}
@@ -3028,6 +3269,12 @@ mod tests {
             update_neighbor_tx: neighbor_tx_noop,
             update_neighbor_rx: neighbor_rx_noop,
             update_neighbor_status: neighbor_status_noop,
+            register_queue_metric: {
+                extern "C" fn register(_: *mut c_void, _: u16, _: u32) -> bool {
+                    true
+                }
+                register
+            },
             update_queue_metric: queue_noop,
             publish_r2ri: publish_noop,
             register_rf_signal_table: register_rf_noop,
@@ -3057,6 +3304,174 @@ mod tests {
     }
 
     #[test]
+    fn airtime_matches_original_transponder_vectors() {
+        // matches original TransponderNoProtocol::prepareTransmission directly.
+        for (bytes, rate, expected) in [
+            (0, 1_000_000, 0),
+            (1, 11_000_000, 0),
+            (1, 1_000_000, 8),
+            (63, 11_000_000, 45),
+            (600, 11_000_000, 436),
+            (600, 1_000_000, 4800),
+            (4096, 2_000_000, 16384),
+            (32000, 11_000_000, 23272),
+            (58, 1_000_000, 464),
+        ] {
+            assert_eq!(
+                airtime(bytes, rate),
+                expected,
+                "{bytes} bytes at {rate} bps"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_table_cells_preserve_signed_initial_and_unsigned_updated_zero() {
+        extern "C" fn capture_rows(
+            ctx: *mut c_void,
+            _: u64,
+            _: *const u64,
+            _: usize,
+            values: *const FfiStatisticValue,
+            count: usize,
+        ) -> bool {
+            let rows = unsafe { &mut *(ctx as *mut Vec<Vec<(u32, u64)>>) };
+            rows.push(
+                unsafe { std::slice::from_raw_parts(values, count) }
+                    .iter()
+                    .map(|v| (v.value_type, v.u64_value))
+                    .collect(),
+            );
+            true
+        }
+        let mut rows: Vec<Vec<(u32, u64)>> = Vec::new();
+        let mut service = framework(false);
+        service.framework_ctx = (&mut rows as *mut Vec<Vec<(u32, u64)>>).cast();
+        service.set_table_row = capture_rows;
+        let mut mac = BentpipeMac::new(1, service);
+        mac.tables.insert("UnicastByteAcceptTable0".into(), 1);
+        mac.tables.insert("UnicastByteDropTable0".into(), 2);
+        let mut state = mac.state.lock().unwrap();
+        record_packet_accept(&mac, &mut state, 2, 1, 0, true);
+        assert_eq!(
+            rows.last().unwrap(),
+            &vec![
+                (STATISTIC_VALUE_U16, 2),
+                (STATISTIC_VALUE_I64, 0),
+                (STATISTIC_VALUE_U64, 0)
+            ]
+        );
+        record_packet_accept(&mac, &mut state, 2, 1, 7, false);
+        assert_eq!(rows.last().unwrap()[1], (STATISTIC_VALUE_U64, 7));
+        record_packet_drop(&mac, &mut state, 2, 1, 0, PacketDropReason::Lock);
+        let row = rows.last().unwrap();
+        assert_eq!(row[0], (STATISTIC_VALUE_U16, 2));
+        for (index, cell) in row[1..].iter().enumerate() {
+            assert_eq!(
+                *cell,
+                (
+                    if index == PacketDropReason::Lock as usize {
+                        STATISTIC_VALUE_U64
+                    } else {
+                        STATISTIC_VALUE_I64
+                    },
+                    0
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn startup_announcements_wait_for_post_start() {
+        extern "C" fn capture(
+            ctx: *mut c_void,
+            _: u16,
+            messages: *const FfiControlMessage,
+            count: usize,
+        ) {
+            let calls = unsafe { &*(ctx as *const Mutex<Vec<Vec<u16>>>) };
+            let antennas = unsafe { std::slice::from_raw_parts(messages, count) }
+                .iter()
+                .filter(|message| message.msg_type == CONTROL_RX_ANTENNA_ADD)
+                .map(|message| {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(message.payload.data, message.payload.len)
+                    };
+                    RxAntennaAdd::decode(bytes).unwrap().antenna.antenna_index
+                })
+                .collect();
+            calls.lock().unwrap().push(antennas);
+        }
+        let calls = Mutex::new(Vec::<Vec<u16>>::new());
+        let mut fw = framework(false);
+        fw.framework_ctx = &calls as *const _ as *mut c_void;
+        fw.send_downstream_control = capture;
+        let mut mac = BentpipeMac::new(1, fw);
+        {
+            let mut state = mac.state.lock().unwrap();
+            state.pcr_uri = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../validation/guide-samples/bentpipe-pcr.xml"
+            )
+            .into();
+            for (name, value) in [
+                ("antenna.defines", "omni;0;0"),
+                ("transponder.receive.frequency", "2400000000"),
+                ("transponder.receive.bandwidth", "1000000"),
+                ("transponder.receive.action", "process"),
+                ("transponder.transmit.frequency", "2400000000"),
+                ("transponder.transmit.bandwidth", "1000000"),
+                ("transponder.transmit.datarate", "1000000"),
+                ("transponder.transmit.mtu", "1500"),
+            ] {
+                state.configuration_values.insert(
+                    name.into(),
+                    vec![format!("7:{value}"), format!("2:{value}")],
+                );
+            }
+            for name in [
+                "transponder.receive.antenna",
+                "transponder.transmit.antenna",
+            ] {
+                state
+                    .configuration_values
+                    .insert(name.into(), vec!["7:7".into(), "2:2".into()]);
+            }
+            for index in [7, 2] {
+                state.antennas.insert(
+                    index,
+                    AntennaDefinition {
+                        pattern: AntennaPattern::IdealOmni { gain_db: 0.0 },
+                        spectral_mask_index: 0,
+                    },
+                );
+                state.transponders.insert(
+                    index,
+                    Transponder {
+                        receive_frequency_hz: 2_400_000_000,
+                        receive_bandwidth_hz: 1_000_000,
+                        receive_antenna_index: index,
+                        receive_action: ReceiveAction::Process,
+                        transmit_frequency_hz: 2_400_000_000,
+                        transmit_bandwidth_hz: 1_000_000,
+                        transmit_data_rate_bps: 1_000_000,
+                        transmit_mtu_bytes: 1500,
+                        transmit_antenna_index: index,
+                        ..Transponder::default()
+                    },
+                );
+            }
+        }
+        let plugin = &mut mac as *mut _ as *mut c_void;
+        assert!(start(plugin));
+        assert!(calls.lock().unwrap().is_empty());
+        post_start(plugin);
+        // Original postStart emits one call per antenna, in antenna-index order.
+        assert_eq!(*calls.lock().unwrap(), vec![vec![2], vec![7]]);
+        stop(plugin);
+    }
+
+    #[test]
     fn parses_ranges_units_and_slots() {
         assert_eq!(parse_scaled_u64("2.5M"), Some(2_500_000));
         assert_eq!(parse_ranges("1-3;8").unwrap().len(), 4);
@@ -3074,14 +3489,425 @@ mod tests {
             })
         );
         assert!(parse_antenna("7:0;0;0;2").is_none());
+    }
+
+    #[test]
+    fn zero_capacity_unslotted_protocol_does_not_spin_timers() {
+        let mac = BentpipeMac::new(1, framework(false));
+        {
+            let mut state = mac.state.lock().unwrap();
+            state.started = true;
+            // Runtime slot settings do not replace the originally unslotted
+            // protocol, which continues to use the explicit MTU (now zero).
+            state.transponders.insert(
+                0,
+                Transponder {
+                    transmit_enable: true,
+                    transmit_slot_size_us: 10_000,
+                    transmit_slots_per_frame: 4,
+                    transmit_slots: vec![0, 2],
+                    transmit_mtu_bytes: 0,
+                    transmit_data_rate_bps: 1_000_000,
+                    protocol_slot_size: Some(0),
+                    ..Transponder::default()
+                },
+            );
+            state.antennas.insert(
+                0,
+                AntennaDefinition {
+                    pattern: AntennaPattern::IdealOmni { gain_db: 0.0 },
+                    spectral_mask_index: 0,
+                },
+            );
+            assert!(state.transponders[&0].valid_transmit_configuration());
+            assert!(enqueue(&mac, &mut state, 0, packet(2, b"abc"), 10_000_000));
+        }
+        drive(&mac, 0, 10_000_000, None);
+        let state = mac.state.lock().unwrap();
+        assert_eq!(state.queues[&0][0].fragment_index, 1);
+        assert_eq!(state.queues[&0][0].offset, 0);
+        assert!(state.wakeups.is_empty());
+        assert!(state.timers.is_empty());
+        assert_eq!(state.frame_sequence, 0);
+    }
+
+    #[test]
+    fn subbyte_slot_retains_packet_until_capacity_recovers() {
+        extern "C" fn capture(
+            ctx: *mut c_void,
+            _: u16,
+            packet: *const FfiPacket,
+            controls: *const FfiControlMessage,
+            count: usize,
+        ) {
+            let sent = unsafe { &mut *(ctx as *mut Vec<BentPipeMessage>) };
+            let packet = unsafe { &*packet };
+            let payload =
+                unsafe { std::slice::from_raw_parts(packet.payload.data, packet.payload.len) };
+            let _ = (controls, count);
+            sent.push(BentPipeMessage::decode(&payload[2..]).unwrap());
+        }
+        let mut sent = Vec::<BentPipeMessage>::new();
+        let mut fw = framework(false);
+        fw.framework_ctx = (&mut sent as *mut Vec<BentPipeMessage>).cast();
+        fw.send_downstream_packet = capture;
+        let mac = BentpipeMac::new(1, fw);
+        {
+            let mut state = mac.state.lock().unwrap();
+            state.transponders.insert(
+                0,
+                Transponder {
+                    transmit_enable: true,
+                    transmit_slot_size_us: 10_000,
+                    transmit_slots_per_frame: 4,
+                    transmit_slots: vec![0, 2],
+                    transmit_data_rate_bps: 7,
+                    protocol_slot_size: Some(10_000),
+                    ..Transponder::default()
+                },
+            );
+            state.antennas.insert(
+                0,
+                AntennaDefinition {
+                    pattern: AntennaPattern::IdealOmni { gain_db: 0.0 },
+                    spectral_mask_index: 0,
+                },
+            );
+            assert_eq!(effective_mtu(&state.transponders[&0]), 0);
+            assert!(state.transponders[&0].valid_transmit_configuration());
+            assert!(enqueue(&mac, &mut state, 0, packet(2, b"abc"), 10_000_000));
+        }
+        drive(&mac, 0, 10_000_000, None);
+        assert!(sent.is_empty());
+        {
+            let mut state = mac.state.lock().unwrap();
+            assert_eq!(state.queues[&0][0].offset, 0);
+            assert_eq!(state.queues[&0][0].fragment_index, 1);
+            assert_eq!(state.frame_sequence, 0);
+            state
+                .transponders
+                .get_mut(&0)
+                .unwrap()
+                .transmit_data_rate_bps = 1_000_000;
+        }
+        drive(&mac, 0, 10_020_000, None);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].messages[0].data, b"abc");
+        assert!(sent[0].messages[0].fragment.is_none());
+        let state = mac.state.lock().unwrap();
+        assert!(state.queues[&0].is_empty());
+        assert_eq!(state.frame_sequence, 1);
+    }
+
+    #[test]
+    fn rejected_slot_configuration_preserves_active_values() {
+        use emane_plugin_api::{FfiConfigItem, FfiConfigStringArray};
+        use std::ffi::CString;
+        let mut mac = BentpipeMac::new(1, framework(false));
+        {
+            let mut state = mac.state.lock().unwrap();
+            state.started = true;
+            state.transponders.insert(
+                0,
+                Transponder {
+                    receive_frequency_hz: 1,
+                    receive_bandwidth_hz: 1,
+                    receive_action: ReceiveAction::Process,
+                    transmit_frequency_hz: 1,
+                    transmit_bandwidth_hz: 1,
+                    transmit_data_rate_bps: 1_000_000,
+                    transmit_slot_size_us: 10_000,
+                    transmit_slots_per_frame: 4,
+                    transmit_slots: vec![0, 2],
+                    ..Transponder::default()
+                },
+            );
+        }
+        let name = CString::new("transponder.transmit.slotsize").unwrap();
+        let value = CString::new("0:0").unwrap();
+        let pointers = [value.as_ptr()];
+        let items = [FfiConfigItem {
+            name: name.as_ptr(),
+            values: FfiConfigStringArray {
+                data: pointers.as_ptr(),
+                len: 1,
+            },
+        }];
+        let request = FfiConfigRequest {
+            data: items.as_ptr(),
+            len: 1,
+        };
+        assert!(!configure(
+            (&mut mac as *mut BentpipeMac).cast(),
+            (&request as *const FfiConfigRequest).cast()
+        ));
+        let state = mac.state.lock().unwrap();
+        assert_eq!(state.transponders[&0].transmit_slot_size_us, 10_000);
+        assert!(state.configuration_values.is_empty());
+    }
+
+    #[test]
+    fn slotted_drive_consumes_idle_opportunity_and_uses_slot_timestamp() {
+        extern "C" fn capture(
+            ctx: *mut c_void,
+            _: u16,
+            packet: *const FfiPacket,
+            controls: *const FfiControlMessage,
+            count: usize,
+        ) {
+            let captured = unsafe { &mut *(ctx as *mut Vec<(u64, i64, u64)>) };
+            let packet = unsafe { &*packet };
+            let payload =
+                unsafe { std::slice::from_raw_parts(packet.payload.data, packet.payload.len) };
+            let wire = BentPipeMessage::decode(&payload[2..]).unwrap();
+            let controls = unsafe { std::slice::from_raw_parts(controls, count) };
+            let tx = TxProperties::decode(find_control(controls, CONTROL_TX_PROPERTIES).unwrap())
+                .unwrap();
+            captured.push((
+                wire.start_of_transmission_microseconds,
+                tx.tx_time_microseconds,
+                packet.info.creation_time_sec * 1_000_000
+                    + u64::from(packet.info.creation_time_usec),
+            ));
+        }
+        let mut captured: Vec<(u64, i64, u64)> = Vec::new();
+        let mut fw = framework(false);
+        fw.framework_ctx = (&mut captured as *mut Vec<(u64, i64, u64)>).cast();
+        fw.send_downstream_packet = capture;
+        let mac = BentpipeMac::new(1, fw);
+        let transponder = Transponder {
+            transmit_enable: true,
+            transmit_slot_size_us: 1000,
+            transmit_slots_per_frame: 2,
+            transmit_slots: vec![0],
+            transmit_data_rate_bps: 1_000_000,
+            transmit_mtu_bytes: 600,
+            protocol_slot_size: Some(1000),
+            ..Transponder::default()
+        };
+        {
+            let mut state = mac.state.lock().unwrap();
+            state
+                .slot_schedules
+                .insert(0, SlotSchedule::new(&transponder, 10_000_050));
+            state.transponders.insert(0, transponder);
+            state.antennas.insert(
+                0,
+                AntennaDefinition {
+                    pattern: AntennaPattern::IdealOmni { gain_db: 0.0 },
+                    spectral_mask_index: 0,
+                },
+            );
+        }
+        drive(&mac, 0, 10_000_050, None);
+        assert!(enqueue(
+            &mac,
+            &mut mac.state.lock().unwrap(),
+            0,
+            packet(2, &[1; 600]),
+            10_000_060
+        ));
+        drive(&mac, 0, 10_000_060, None);
+        assert!(captured.is_empty());
+        drive(&mac, 0, 10_002_001, None);
+        assert_eq!(captured, vec![(10_002_000, 10_002_000, 10_002_001)]);
+        drive(&mac, 0, 10_002_050, None);
+        assert_eq!(captured.len(), 1);
+        let state = mac.state.lock().unwrap();
+        assert_eq!(state.queues[&0][0].offset, 125);
+        assert_eq!(state.slot_statistics[&0].valid, 2);
+    }
+
+    #[test]
+    fn ubend_delay_defers_queue_entry_and_rebuilds_packet_identity() {
+        #[derive(Default)]
+        struct Timers(Vec<(u64, u32, Vec<u8>)>);
+        extern "C" fn capture_timer(
+            ctx: *mut c_void,
+            _: u16,
+            sec: u64,
+            usec: u32,
+            event: u32,
+            data: *const u8,
+            len: usize,
+        ) -> u64 {
+            let timers = unsafe { &mut *(ctx as *mut Timers) };
+            timers.0.push((
+                sec * 1_000_000 + u64::from(usec),
+                event,
+                unsafe { std::slice::from_raw_parts(data, len) }.to_vec(),
+            ));
+            timers.0.len() as u64
+        }
+        let mut timers = Timers::default();
+        let mut fw = framework(false);
+        fw.framework_ctx = &mut timers as *mut _ as *mut c_void;
+        fw.schedule_timed_event = capture_timer;
+        let mac = BentpipeMac::new(2, fw);
+        {
+            let mut state = mac.state.lock().unwrap();
+            state.queue_depth = 1;
+            state.transponders.insert(
+                0,
+                Transponder {
+                    transmit_enable: true,
+                    transmit_mtu_bytes: 600,
+                    ..Transponder::default()
+                },
+            );
+        }
+        for data in [b"ab", b"cd"] {
+            let mut p = packet(7, data);
+            p.info.source = 9;
+            p.info.priority = 4;
+            p.controls.push(OwnedControl {
+                msg_type: CONTROL_RX_PROPERTIES,
+                payload: vec![1],
+            });
+            forward_ubend(&mac, 0, p, BROADCAST_NEM, 50_000, 1_000_000);
+        }
+        assert_eq!(timers.0.len(), 2);
+        {
+            let state = mac.state.lock().unwrap();
+            assert_eq!(state.pending_ubend.len(), 2);
+            assert!(state.queues.is_empty());
+            assert!(state.queue_statistics.is_empty());
+        }
+        for (i, (when, event, bytes)) in timers.0.iter().enumerate() {
+            assert_eq!(*when, 1_050_000);
+            assert_eq!(*event, EVENT_UBEND);
+            timed(
+                &mac as *const _ as *mut c_void,
+                i as u64 + 1,
+                *event,
+                bytes.as_ptr(),
+                bytes.len(),
+            );
+        }
+        let state = mac.state.lock().unwrap();
+        assert!(state.pending_ubend.is_empty());
+        let queued = &state.queues[&0][0].packet;
+        assert_eq!(queued.payload, b"cd");
+        assert_eq!(queued.info.source, 2);
+        assert_eq!(queued.info.destination, BROADCAST_NEM);
+        assert_eq!(queued.info.priority, 4);
+        assert!(queued.controls.is_empty());
+        assert_eq!(state.queue_statistics[&0].enqueued, 2);
+        assert_eq!(state.queue_statistics[&0].overflow, 1);
         assert_eq!(
-            required_transponder_fields(ReceiveAction::Process),
-            TRANSPONDER_REQUIRED_FIELDS
+            state.broadcast_drop[&2].bytes[PacketDropReason::QueueOverflow as usize],
+            2
         );
-        assert_eq!(
-            required_transponder_fields(ReceiveAction::Ubend),
-            TRANSPONDER_REQUIRED_FIELDS & !TRANSPONDER_TOSMAP_FIELD
+    }
+
+    #[test]
+    fn disabled_transponder_consumes_queued_airtime_before_reenable() {
+        let mac = BentpipeMac::new(1, framework(false));
+        let start = 1_000_000;
+        {
+            let mut state = mac.state.lock().unwrap();
+            state.transponders.insert(
+                0,
+                Transponder {
+                    transmit_enable: false,
+                    transmit_mtu_bytes: 600,
+                    transmit_data_rate_bps: 1_000_000,
+                    ..Transponder::default()
+                },
+            );
+            state.antennas.insert(
+                0,
+                AntennaDefinition {
+                    pattern: AntennaPattern::IdealOmni { gain_db: 0.0 },
+                    spectral_mask_index: 0,
+                },
+            );
+            assert!(enqueue(&mac, &mut state, 0, packet(2, &[1; 1800]), start));
+        }
+        drive(&mac, 0, start, None);
+        {
+            let mut state = mac.state.lock().unwrap();
+            assert_eq!(state.queues[&0][0].offset, 600);
+            assert_eq!(state.current_eot[&0], start + 4800);
+            assert_eq!(state.frame_sequence, 0);
+            assert_eq!(state.unicast_accept[&1].tx_bytes, 600);
+            assert_eq!(
+                state.unicast_drop[&1].bytes[PacketDropReason::TxOff as usize],
+                600
+            );
+            state.transponders.get_mut(&0).unwrap().transmit_enable = true;
+        }
+        drive(&mac, 0, start + 4799, None);
+        assert_eq!(mac.state.lock().unwrap().queues[&0][0].offset, 600);
+        drive(&mac, 0, start + 4800, None);
+        let state = mac.state.lock().unwrap();
+        assert_eq!(state.queues[&0][0].offset, 1200);
+        assert_eq!(state.frame_sequence, 1);
+        assert_eq!(state.current_eot[&0], start + 9600);
+    }
+
+    #[test]
+    fn aggregate_remainder_preserves_next_packet_and_boundary_fragment() {
+        let mac = BentpipeMac::new(1, framework(false));
+        let mut state = mac.state.lock().unwrap();
+        state.queue_depth = 2;
+        state.fragmentation_enable = false;
+        state.transponders.insert(
+            0,
+            Transponder {
+                transmit_enable: true,
+                transmit_mtu_bytes: 10,
+                ..Transponder::default()
+            },
         );
+        assert!(enqueue(&mac, &mut state, 0, packet(2, b"abc"), 0));
+        assert!(enqueue(&mac, &mut state, 0, packet(3, b"defghijk"), 0));
+        let components = dequeue_components(&mac, &mut state, 0, 10, 0);
+        assert_eq!(components.len(), 1);
+        assert_eq!(state.queues[&0][0].packet.payload, b"defghijk");
+        assert_eq!(state.queue_statistics[&0].too_big, 0);
+
+        state.fragmentation_enable = true;
+        assert!(enqueue(&mac, &mut state, 0, packet(2, b"lmn"), 0));
+        let components = dequeue_components(&mac, &mut state, 0, 8, 0);
+        assert_eq!(components.len(), 2);
+        assert!(components[1].packet.payload.is_empty());
+        assert!(components[1].more);
+        assert_eq!(state.queues[&0][0].offset, 0);
+        assert_eq!(state.queues[&0][0].fragment_index, 1);
+        assert!(enqueue(&mac, &mut state, 0, packet(3, b"opq"), 0));
+        assert!(enqueue(&mac, &mut state, 0, packet(2, b"rst"), 0));
+        assert_eq!(state.queues[&0][0].packet.payload, b"lmn");
+        assert_eq!(state.queues[&0][1].packet.payload, b"rst");
+        assert_eq!(state.queue_statistics[&0].overflow, 1);
+    }
+
+    #[test]
+    fn empty_dequeue_and_empty_aggregate_component_match_queue_publisher() {
+        let mac = BentpipeMac::new(1, framework(false));
+        let mut state = mac.state.lock().unwrap();
+        state.transponders.insert(
+            0,
+            Transponder {
+                transmit_enable: true,
+                transmit_mtu_bytes: 600,
+                transmit_data_rate_bps: 1_000_000,
+                ..Transponder::default()
+            },
+        );
+        assert!(enqueue(&mac, &mut state, 0, packet(2, b""), 0));
+        assert!(dequeue_components(&mac, &mut state, 0, 600, 0).is_empty());
+        assert!(state.queues[&0].is_empty());
+        assert_eq!(state.queue_statistics[&0].reported_depth(), 1);
+        assert!(enqueue(&mac, &mut state, 0, packet(2, b""), 0));
+        assert!(enqueue(&mac, &mut state, 0, packet(2, b"abc"), 0));
+        let components = dequeue_components(&mac, &mut state, 0, 600, 0);
+        assert_eq!(components.len(), 2);
+        assert!(components[0].packet.payload.is_empty());
+        assert_eq!(components[1].packet.payload, b"abc");
+        assert_eq!(state.queue_statistics[&0].reported_depth(), 1);
+        assert_eq!(state.queue_statistics[&0].dequeued, 2);
+        assert_eq!(state.queue_statistics[&0].high_water, 3);
     }
 
     #[test]
@@ -3117,9 +3943,10 @@ mod tests {
         let mac = BentpipeMac::new(1, framework(true));
         let transponder = Transponder {
             curve_index: 4,
+            transmit_enable: true,
             transmit_frequency_hz: 2_400_000_000,
             transmit_bandwidth_hz: 1_000_000,
-            transmit_data_rate_bps: 1_000_000,
+            transmit_data_rate_bps: 100_000_000,
             transmit_antenna_index: 7,
             transmit_power_dbm: 5.0,
             ..Transponder::default()
@@ -3145,10 +3972,12 @@ mod tests {
                 }),
                 spectral_mask_index: 3,
             },
+            1_000_000,
         );
         let capture = CAPTURE.lock().unwrap();
         let length = u16::from_be_bytes(capture.packet[..2].try_into().unwrap()) as usize;
         let wire = BentPipeMessage::decode(&capture.packet[2..2 + length]).unwrap();
+        assert_eq!(wire.start_of_transmission_microseconds, 1_000_000);
         assert_eq!(wire.curve_index, 4);
         assert_eq!(wire.messages.len(), 2);
         assert_eq!(wire.messages[0].destination, 2);
@@ -3159,6 +3988,7 @@ mod tests {
             .find(|(kind, _)| *kind == CONTROL_MIMO_TX_PROPERTIES)
             .and_then(|(_, payload)| MimoTxProperties::decode(payload))
             .unwrap();
+        assert_eq!(mimo.frequency_groups[0][0].duration_microseconds, 0);
         assert_eq!(
             mimo.transmit_antennas[0].pattern,
             AntennaPattern::Profile(TxAntennaProfile {
@@ -3407,6 +4237,8 @@ mod tests {
             noise: f64,
             queries: usize,
             sources: Vec<u16>,
+            payloads: Vec<Vec<u8>>,
+            infos: Vec<FfiPacketInfo>,
         }
         extern "C" fn capture(
             ctx: *mut c_void,
@@ -3416,7 +4248,14 @@ mod tests {
             _: usize,
         ) {
             unsafe {
-                (&mut *(ctx as *mut Probe)).sources.push((*p).info.source);
+                let probe = &mut *(ctx as *mut Probe);
+                probe.sources.push((*p).info.source);
+                probe.infos.push((*p).info);
+                probe.payloads.push(if (*p).payload.len == 0 {
+                    Vec::new()
+                } else {
+                    std::slice::from_raw_parts((*p).payload.data, (*p).payload.len).to_vec()
+                });
             }
         }
         extern "C" fn spectrum(
@@ -3482,14 +4321,31 @@ mod tests {
             mac
         }
         fn receive(mac: &BentpipeMac, source: u16, start: i64, power: f64) {
-            let body = BentPipeMessage {
-                start_of_transmission_microseconds: start as u64,
-                curve_index: 0,
-                messages: vec![BentPipeComponent {
+            receive_component(
+                mac,
+                source,
+                start,
+                power,
+                2_400_000_000,
+                BentPipeComponent {
                     destination: 2,
                     data: vec![42],
                     fragment: None,
-                }],
+                },
+            );
+        }
+        fn receive_component(
+            mac: &BentpipeMac,
+            source: u16,
+            start: i64,
+            power: f64,
+            frequency_hz: u64,
+            component: BentPipeComponent,
+        ) {
+            let body = BentPipeMessage {
+                start_of_transmission_microseconds: start as u64,
+                curve_index: 0,
+                messages: vec![component],
             }
             .encode_to_vec();
             let mut payload = (body.len() as u16).to_be_bytes().to_vec();
@@ -3504,7 +4360,7 @@ mod tests {
             }
             .encode();
             let rx = RxProperties {
-                frequency_hz: 2_400_000_000,
+                frequency_hz,
                 bandwidth_hz: 1_000_000,
                 rx_power_dbm: power,
                 noise_floor_dbm: -100.0,
@@ -3538,8 +4394,8 @@ mod tests {
                     source,
                     destination: 2,
                     priority: 0,
-                    creation_time_sec: 0,
-                    creation_time_usec: 0,
+                    creation_time_sec: start as u64 / 1_000_000,
+                    creation_time_usec: (start % 1_000_000) as u32,
                 },
                 payload: FfiSlice {
                     data: payload.as_ptr(),
@@ -3554,6 +4410,132 @@ mod tests {
             );
         }
         #[test]
+        fn final_fragment_at_timeout_completes_before_expiry() {
+            let mut probe = Probe {
+                noise: -100.0,
+                ..Probe::default()
+            };
+            let mac = receiver(&mut probe);
+            let start = now_us() + 1_000_000;
+            let fragment = |index, offset, more, data: &[u8]| BentPipeComponent {
+                destination: 2,
+                data: data.to_vec(),
+                fragment: Some(BentPipeFragment {
+                    sequence: 7,
+                    index,
+                    offset,
+                    more,
+                }),
+            };
+            receive_component(
+                &mac,
+                1,
+                start,
+                -50.0,
+                2_400_000_000,
+                fragment(0, 0, true, b"ab"),
+            );
+            complete_receptions(&mac, start + 100_000, 1);
+            assert!(probe.payloads.is_empty());
+            assert_eq!(mac.state.lock().unwrap().reassembly.len(), 1);
+            let last_start = start + 5_000_000;
+            receive_component(
+                &mac,
+                1,
+                last_start,
+                -50.0,
+                2_400_000_000,
+                fragment(1, 2, false, b"cd"),
+            );
+            complete_receptions(&mac, last_start + 100_000, 1);
+            assert_eq!(probe.payloads, vec![b"abcd".to_vec()]);
+            let info = probe.infos[0];
+            assert_eq!(
+                info.creation_time_sec * 1_000_000 + u64::from(info.creation_time_usec),
+                last_start as u64
+            );
+            let state = mac.state.lock().unwrap();
+            assert!(state.reassembly.is_empty());
+            assert!(state.unicast_drop.is_empty());
+        }
+
+        #[test]
+        fn transponders_reassemble_equal_source_sequences_independently() {
+            let mut probe = Probe {
+                noise: -100.0,
+                ..Probe::default()
+            };
+            let mac = receiver(&mut probe);
+            {
+                let mut state = mac.state.lock().unwrap();
+                let mut other = state.transponders[&1].clone();
+                other.receive_frequency_hz += 1;
+                state.transponders.insert(2, other);
+            }
+            let start = now_us() + 1_000_000;
+            for (tr, index, data) in [(1, 0, b"ab"), (2, 1, b"YZ"), (1, 1, b"cd"), (2, 0, b"WX")] {
+                let when = start + if index == 1 { 200_000 } else { 0 };
+                receive_component(
+                    &mac,
+                    1,
+                    when,
+                    -50.0,
+                    2_400_000_000 + u64::from(tr - 1),
+                    BentPipeComponent {
+                        destination: 2,
+                        data: data.to_vec(),
+                        fragment: Some(BentPipeFragment {
+                            sequence: 7,
+                            index,
+                            offset: index * 2,
+                            more: index == 0,
+                        }),
+                    },
+                );
+                complete_receptions(&mac, when + 100_000, tr);
+            }
+            assert_eq!(probe.payloads, vec![b"abcd".to_vec(), b"WXYZ".to_vec()]);
+            assert!(mac.state.lock().unwrap().reassembly.is_empty());
+        }
+
+        #[test]
+        fn equal_start_keeps_first_pending_fragment_until_retransmission() {
+            let mut probe = Probe {
+                noise: -100.0,
+                ..Probe::default()
+            };
+            let mac = receiver(&mut probe);
+            let start = now_us() + 1_000_000;
+            let fragment = |index, data: &[u8]| BentPipeComponent {
+                destination: 2,
+                data: data.to_vec(),
+                fragment: Some(BentPipeFragment {
+                    sequence: 7,
+                    index,
+                    offset: index * 2,
+                    more: index == 0,
+                }),
+            };
+            for (index, data) in [(0, b"ab"), (1, b"cd")] {
+                receive_component(&mac, 1, start, -50.0, 2_400_000_000, fragment(index, data));
+            }
+            complete_receptions(&mac, start + 100_000, 1);
+            assert!(probe.payloads.is_empty());
+            assert_eq!(probe.queries, 1);
+            receive_component(
+                &mac,
+                1,
+                start + 200_000,
+                -50.0,
+                2_400_000_000,
+                fragment(1, b"cd"),
+            );
+            complete_receptions(&mac, start + 300_000, 1);
+            assert_eq!(probe.payloads, vec![b"abcd".to_vec()]);
+            assert_eq!(probe.queries, 2);
+        }
+
+        #[test]
         fn earlier_start_wins_even_when_its_callback_arrives_later() {
             let mut probe = Probe {
                 noise: -100.0,
@@ -3565,7 +4547,7 @@ mod tests {
             receive(&mac, 1, start + 10_000, -50.0);
             assert_eq!(mac.state.lock().unwrap().receive_candidates.len(), 2);
             assert_eq!(probe.queries, 0);
-            complete_receptions(&mac, start + 120_000);
+            complete_receptions(&mac, start + 120_000, 1);
             assert_eq!(probe.sources, vec![1]);
             assert_eq!(probe.queries, 1);
         }
@@ -3579,7 +4561,7 @@ mod tests {
             let start = now_us() + 1_000_000;
             receive(&mac, 3, start + 20_000, -30.0);
             receive(&mac, 1, start + 10_000, -70.0);
-            complete_receptions(&mac, start + 120_000);
+            complete_receptions(&mac, start + 120_000, 1);
             assert_eq!(probe.sources, vec![3]);
             assert_eq!(probe.queries, 2);
         }
@@ -3594,7 +4576,7 @@ mod tests {
             receive(&mac, 1, start, -70.0);
             assert_eq!(probe.queries, 0);
             probe.noise = -50.0;
-            complete_receptions(&mac, start + 100_000);
+            complete_receptions(&mac, start + 100_000, 1);
             assert!(probe.sources.is_empty());
             assert_eq!(probe.queries, 1);
             assert!(mac.state.lock().unwrap().receive_end.is_empty());

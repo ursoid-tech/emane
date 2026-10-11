@@ -194,7 +194,12 @@ enum StatisticTableSource {
 
 #[derive(Clone, Debug)]
 pub enum NativeTableValue {
+    UInt8(u8),
+    UInt16(u16),
+    UInt32(u32),
     UInt64(u64),
+    Int64(i64),
+    Float(f32),
     Double(f64),
     String(String),
 }
@@ -924,13 +929,13 @@ fn native_rf_signal_table_values(
 ) -> (FfiStringArray, *mut FfiTableRow, usize) {
     let labels = [
         "NEM",
-        "Antenna",
-        "Frequency",
-        "Samples",
-        "Avg Rx Power",
-        "Avg Noise",
-        "Avg SINR",
-        "Avg INR",
+        "AntennaId",
+        "FrequencyHz",
+        "NumSamples",
+        "AvgRxPower",
+        "AvgNoiseFloor",
+        "AvgSINR",
+        "AvgINR",
     ];
     let mut label_ptrs = labels
         .into_iter()
@@ -949,7 +954,7 @@ fn native_rf_signal_table_values(
         .map(|row| {
             let antenna = row
                 .antenna
-                .map(|value| (8, value as u64, None))
+                .map(|value| (4, value as u64, None))
                 .unwrap_or_else(|| (11, 0, Some("NA")));
             let frequency = row
                 .frequency_hz
@@ -957,7 +962,7 @@ fn native_rf_signal_table_values(
                 .unwrap_or_else(|| (11, 0, Some("NA")));
             let mut values = vec![
                 FfiAny {
-                    any_type: 8,
+                    any_type: 4,
                     i64_value: 0,
                     u64_value: u64::from(row.source),
                     d_value: 0.0,
@@ -1069,6 +1074,41 @@ fn native_table_values(
             let mut values = row
                 .iter()
                 .map(|value| match value {
+                    NativeTableValue::UInt8(value) => FfiAny {
+                        any_type: 2,
+                        i64_value: 0,
+                        u64_value: u64::from(*value),
+                        d_value: 0.0,
+                        s_value: std::ptr::null(),
+                    },
+                    NativeTableValue::UInt32(value) => FfiAny {
+                        any_type: 6,
+                        i64_value: 0,
+                        u64_value: u64::from(*value),
+                        d_value: 0.0,
+                        s_value: std::ptr::null(),
+                    },
+                    NativeTableValue::UInt16(value) => FfiAny {
+                        any_type: 4,
+                        i64_value: 0,
+                        u64_value: u64::from(*value),
+                        d_value: 0.0,
+                        s_value: std::ptr::null(),
+                    },
+                    NativeTableValue::Int64(value) => FfiAny {
+                        any_type: 7,
+                        i64_value: *value,
+                        u64_value: 0,
+                        d_value: 0.0,
+                        s_value: std::ptr::null(),
+                    },
+                    NativeTableValue::Float(value) => FfiAny {
+                        any_type: 9,
+                        i64_value: 0,
+                        u64_value: 0,
+                        d_value: f64::from(*value),
+                        s_value: std::ptr::null(),
+                    },
                     NativeTableValue::UInt64(value) => FfiAny {
                         any_type: 8,
                         i64_value: 0,
@@ -1590,6 +1630,49 @@ mod tests {
         let result =
             emane_rs_statistic_query_table(build_id, empty, error.as_mut_ptr(), error.len());
         assert_eq!(unsafe { &*result.data }.rows_len, 1);
+        emane_rs_statistic_free_table_query_result(result);
+        unregister_native_statistics(build_id);
+    }
+
+    #[test]
+    fn native_tables_preserve_original_numeric_cell_types() {
+        let build_id = emane_rs_buildid_assign();
+        let handle = register_native_table(
+            build_id,
+            "WireTypes",
+            &["NEM", "Duration", "Loss", "Count"],
+            "",
+            true,
+        )
+        .unwrap();
+        assert!(set_native_table_row(
+            handle,
+            vec![1],
+            vec![
+                NativeTableValue::UInt16(65535),
+                NativeTableValue::Int64(-1),
+                NativeTableValue::Float(0.1),
+                NativeTableValue::UInt64(u64::MAX),
+            ]
+        ));
+        let empty = FfiStringArray {
+            data: ptr::null(),
+            len: 0,
+        };
+        let mut error = [0i8; 128];
+        let result =
+            emane_rs_statistic_query_table(build_id, empty, error.as_mut_ptr(), error.len());
+        assert_eq!(result.len, 1);
+        let row = unsafe { &*(*result.data).rows };
+        let values = unsafe { std::slice::from_raw_parts(row.values.data, row.values.len) };
+        assert_eq!(
+            values.iter().map(|v| v.any_type).collect::<Vec<_>>(),
+            [4, 7, 9, 8]
+        );
+        assert_eq!(values[0].u64_value, 65535);
+        assert_eq!(values[1].i64_value, -1);
+        assert_eq!(values[2].d_value, f64::from(0.1f32));
+        assert_eq!(values[3].u64_value, u64::MAX);
         emane_rs_statistic_free_table_query_result(result);
         unregister_native_statistics(build_id);
     }

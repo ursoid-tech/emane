@@ -11,7 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use std::os::raw::c_void;
 use std::os::unix::io::RawFd;
 use std::sync::{
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
     Arc, Mutex,
 };
 use std::thread;
@@ -126,6 +126,7 @@ pub struct NemQueuedLayer {
     queue: Arc<Mutex<VecDeque<QueuedTask>>>,
     cancel: Arc<Mutex<bool>>,
     lifecycle: AtomicU8,
+    model_running: AtomicBool,
     event_fd: RawFd,
     epoll_fd: RawFd,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -162,6 +163,7 @@ impl NemQueuedLayer {
                 queue: Arc::new(Mutex::new(VecDeque::new())),
                 cancel: Arc::new(Mutex::new(false)),
                 lifecycle: AtomicU8::new(LIFECYCLE_CREATED),
+                model_running: AtomicBool::new(false),
                 event_fd,
                 epoll_fd,
                 thread: Mutex::new(None),
@@ -174,6 +176,14 @@ impl NemQueuedLayer {
 
     pub fn is_running(&self) -> bool {
         self.lifecycle.load(Ordering::Acquire) == LIFECYCLE_RUNNING
+    }
+
+    pub fn is_model_running(&self) -> bool {
+        self.model_running.load(Ordering::Acquire)
+    }
+
+    pub fn set_model_running(&self, running: bool) {
+        self.model_running.store(running, Ordering::Release);
     }
 
     pub fn accepts_direct_calls(&self) -> bool {
@@ -281,7 +291,7 @@ impl NemQueuedLayer {
                                             statistics.event_table,
                                             vec![u64::from(event_id)],
                                             vec![
-                                                NativeTableValue::UInt64(u64::from(event_id)),
+                                                NativeTableValue::UInt16(event_id),
                                                 NativeTableValue::UInt64(*count),
                                             ],
                                         );
@@ -361,9 +371,8 @@ impl NemQueuedLayer {
     ) -> Result<(), Box<dyn FnOnce() + Send>> {
         let depth = {
             let mut queue = self.queue.lock().unwrap();
-            if self.lifecycle.load(Ordering::Acquire) != LIFECYCLE_RUNNING {
-                return Err(operation);
-            }
+            // The original queue accepts work before start and after stop.
+            // The model's lifecycle gate is checked when that work executes.
             queue.push_back(QueuedTask {
                 operation,
                 enqueued: Instant::now(),

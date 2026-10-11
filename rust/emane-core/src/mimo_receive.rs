@@ -20,6 +20,7 @@ struct PreparedReception {
     receive_index: u16,
     cache_hit: bool,
     receive_powers: BTreeMap<PowerKey, ReceivePower>,
+    doppler_shifts: BTreeMap<u64, f64>,
 }
 
 #[derive(Default)]
@@ -31,6 +32,7 @@ struct AntennaReception {
     cache_hit: bool,
     receive_powers: BTreeMap<PowerKey, ReceivePower>,
     observed_powers: BTreeMap<PowerKey, (u16, f64)>,
+    doppler_shifts: BTreeMap<u64, f64>,
 }
 
 fn process_antenna(
@@ -46,6 +48,7 @@ fn process_antenna(
     };
     result.cache_hit = reception.cache_hit;
     result.receive_powers.extend(reception.receive_powers);
+    result.doppler_shifts.extend(reception.doppler_shifts);
     let mut monitor = reception.monitor.lock().unwrap();
     let (time, propagation, span, report, in_band, sensitivity) = monitor.update(
         reception.now,
@@ -125,6 +128,11 @@ pub(super) fn receive(
     incoming: &[FfiControlMessage],
     now: i64,
 ) -> Result<MimoRxProperties, usize> {
+    // With noise disabled, the original framework rejects another sub-ID
+    // before antenna, gain, fading or spectrum state can be changed.
+    if tx.sub_id != state.phy.sub_id && state.phy.noise_mode == NoiseMode::None {
+        return Err(1);
+    }
     let transmitters = find_tx_transmitters(incoming).unwrap_or(TxTransmitters {
         transmitters: vec![TxTransmitter {
             nem_id: packet.info.source,
@@ -136,8 +144,19 @@ pub(super) fn receive(
         .iter()
         .map(|t| t.nem_id)
         .collect::<Vec<_>>();
+    // The original framework updates every transmitter antenna before any
+    // propagation/fading path can fail. Preserve those cache invalidations.
+    for transmitter in &transmitters.transmitters {
+        for antenna in &mimo.transmit_antennas {
+            state.phy.update_gain_antenna(transmitter.nem_id, *antenna);
+        }
+    }
     let filter_data = filter_data(incoming).unwrap_or_default();
-    let doppler = state.phy.doppler_fraction(state.id, packet.info.source);
+    // Spectrum overlap uses the first physical transmitter, independently of
+    // the packet's logical source. Per-frequency controls use the last one.
+    let doppler = transmitter_ids
+        .first()
+        .map_or(0.0, |source| state.phy.doppler_fraction(state.id, *source));
     let mut antennas = if state.phy.compatibility_mode == 1 {
         vec![(
             0,
@@ -185,6 +204,7 @@ pub(super) fn receive(
                 let mut propagation = None;
                 let mut cache_hit = false;
                 let mut receive_powers = BTreeMap::new();
+                let mut doppler_shifts = BTreeMap::new();
                 for transmitter in &transmitters.transmitters {
                     // Resolve all path loss before gain/fading, as ReceiveProcessor does.
                     let paths = group
@@ -212,6 +232,7 @@ pub(super) fn receive(
                         )
                         .map_err(PhyPathError::drop_code)?;
                     cache_hit = hit;
+                    let factor = 1.0 + state.phy.doppler_fraction(state.id, transmitter.nem_id);
                     for (index, (segment, (pathloss, delay))) in group.iter().zip(paths).enumerate()
                     {
                         let power = state
@@ -227,6 +248,11 @@ pub(super) fn receive(
                             )
                             .map_err(PhyPathError::drop_code)?;
                         powers[index] += 10.0f64.powf(power / 10.0);
+                        let frequency = segment.frequency_hz as f64;
+                        let shift = frequency * factor - frequency;
+                        if state.phy.doppler_shift_enabled {
+                            doppler_shifts.insert(segment.frequency_hz, shift);
+                        }
                         receive_powers.insert(
                             (
                                 transmitter.nem_id,
@@ -240,7 +266,7 @@ pub(super) fn receive(
                                 receive_gain,
                                 segment.tx_power_dbm.unwrap_or(transmitter.tx_power_dbm),
                                 pathloss,
-                                segment.frequency_hz as f64 * doppler,
+                                shift,
                             ),
                         );
                         if propagation.is_none()
@@ -276,6 +302,7 @@ pub(super) fn receive(
                     receive_index,
                     cache_hit,
                     receive_powers,
+                    doppler_shifts,
                 })
             })();
             jobs.push(Box::new(move || process_antenna(reception, result)));
@@ -289,6 +316,7 @@ pub(super) fn receive(
     let mut not_foi = false;
     let mut timing = None;
     let mut infos = Vec::new();
+    let mut doppler_shifts = BTreeMap::new();
     for mut result in results {
         if result.error.is_none() && result.infos.is_empty() {
             result.error = result.out_of_band;
@@ -354,29 +382,19 @@ pub(super) fn receive(
                 (a.min(time), b.min(propagation))
             }));
         }
+        for (frequency, shift) in result.doppler_shifts {
+            doppler_shifts.entry(frequency).or_insert(shift);
+        }
         infos.extend(result.infos);
     }
     if infos.is_empty() {
         return Err(if not_foi { 7 } else { 2 });
     }
     let (time, propagation) = timing.unwrap();
-    let mut doppler_shifts_hz = mimo
-        .frequency_groups
-        .iter()
-        .flatten()
-        .map(|s| {
-            (
-                s.frequency_hz,
-                (s.frequency_hz as f64 * doppler).round() as i64,
-            )
-        })
-        .collect::<Vec<_>>();
-    doppler_shifts_hz.sort_unstable_by_key(|entry| entry.0);
-    doppler_shifts_hz.dedup_by_key(|entry| entry.0);
     Ok(MimoRxProperties {
         tx_time_microseconds: time,
         propagation_microseconds: propagation.max(0) as u64,
         antenna_infos: infos,
-        doppler_shifts_hz,
+        doppler_shifts_hz: doppler_shifts.into_iter().collect(),
     })
 }

@@ -252,7 +252,7 @@ impl OtaStatistics {
             self.packet_table,
             statistic_key(key.uuid, key.source),
             vec![
-                NativeTableValue::UInt64(u64::from(key.source)),
+                NativeTableValue::UInt16(key.source),
                 NativeTableValue::String(format_uuid(key.uuid)),
                 NativeTableValue::UInt64(counts[0]),
                 NativeTableValue::UInt64(counts[1]),
@@ -284,7 +284,7 @@ impl OtaStatistics {
             self.event_table,
             statistic_key(key.uuid, key.event_id),
             vec![
-                NativeTableValue::UInt64(u64::from(key.event_id)),
+                NativeTableValue::UInt16(key.event_id),
                 NativeTableValue::String(format_uuid(key.uuid)),
                 NativeTableValue::UInt64(counts[0]),
                 NativeTableValue::UInt64(counts[1]),

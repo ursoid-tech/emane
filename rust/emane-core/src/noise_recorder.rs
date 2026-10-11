@@ -558,15 +558,16 @@ impl NoiseRecorder {
                     self.max_end_of_reception_bin = end_of_reception_bin;
                 }
             }
-        }
-
-        if !b_is_more {
-            for &transmitter in transmitters {
-                let map = self
-                    .nem_antenna_index_eor_bin_map
-                    .entry(transmitter)
-                    .or_default();
-                map.insert(tx_antenna_index, end_of_reception_bin);
+            // A fully overlapping segment is skipped. It must not move the
+            // transmitter's end marker backward and admit later duplicate bins.
+            if !b_is_more {
+                for &transmitter in transmitters {
+                    let map = self
+                        .nem_antenna_index_eor_bin_map
+                        .entry(transmitter)
+                        .or_default();
+                    map.insert(tx_antenna_index, end_of_reception_bin);
+                }
             }
         }
 
@@ -847,6 +848,33 @@ pub extern "C" fn emane_rs_noise_recorder_dump(
 #[cfg(test)]
 mod tests {
     use super::NoiseRecorder;
+
+    #[test]
+    fn skipped_overlap_does_not_rewind_transmitter_end() {
+        let mut recorder = NoiseRecorder::new(
+            1000,
+            10000,
+            10000,
+            1000000,
+            0.0,
+            2_400_000_000,
+            1_000_000,
+            0,
+        );
+        recorder.update(0, 100000, 500, 0, 3500, 1.0, &[2, 3], 0, 0, 0, false);
+        recorder.update(0, 100000, 500, 0, 1000, 2.0, &[2, 3], 0, 0, 0, false);
+        recorder.update(0, 100000, 2000, 0, 1000, 3.0, &[2, 3], 0, 0, 0, false);
+        assert_eq!(
+            recorder.get(110000, 5000, 100000).0,
+            vec![1.0, 1.0, 1.0, 1.0, 0.0]
+        );
+        // A different transmit antenna has independent overlap suppression.
+        recorder.update(0, 100000, 2000, 0, 1000, 3.0, &[2, 3], 0, 0, 1, false);
+        assert_eq!(
+            recorder.get(110000, 5000, 100000).0,
+            vec![1.0, 1.0, 4.0, 1.0, 0.0]
+        );
+    }
 
     #[test]
     fn update_resets_stale_wheel_after_long_idle_period() {

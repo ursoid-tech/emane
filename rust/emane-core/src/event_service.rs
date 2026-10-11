@@ -261,7 +261,7 @@ impl EventChannelStatistics {
                 u64::from(key.event_id),
             ],
             vec![
-                NativeTableValue::UInt64(u64::from(key.event_id)),
+                NativeTableValue::UInt16(key.event_id),
                 NativeTableValue::String(format_uuid(key.uuid)),
                 NativeTableValue::UInt64(counts[0]),
                 NativeTableValue::UInt64(counts[1]),
