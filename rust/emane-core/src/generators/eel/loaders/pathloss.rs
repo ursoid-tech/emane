@@ -113,16 +113,16 @@ impl PathlossLoader {
         callback_data: *mut c_void,
         cb: extern "C" fn(*mut c_void, u16, u16, *const u8, usize),
     ) {
-        if self.delta_cache.is_empty() {
-            return;
-        }
-
         let cache = if mode == 0 {
             // DELTA
             &self.delta_cache
         } else {
             &self.cache
         };
+        if cache.is_empty() {
+            self.delta_cache.clear();
+            return;
+        }
 
         let mut sorted_dests: Vec<&u16> = cache.keys().collect();
         sorted_dests.sort();

@@ -130,6 +130,7 @@ struct NeighborActivity {
 }
 
 struct NeighborList {
+    #[allow(dead_code)]
     last_update: i64,
     neighbors: HashSet<u16>,
 }
@@ -859,9 +860,6 @@ fn estimate_channel_activity(state: &mut State, now: i64) -> (Vec<u16>, Vec<u16>
         state
             .channel_activity
             .retain(|_, activity| now.saturating_sub(activity.last_activity) <= timeout);
-        state
-            .neighbor_lists
-            .retain(|_, list| now.saturating_sub(list.last_update) <= timeout);
         state
             .two_hop_activity
             .retain(|_, activity| now.saturating_sub(activity.last_activity) <= timeout);

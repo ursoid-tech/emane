@@ -1040,14 +1040,15 @@ extern "C" fn event(plugin: *mut c_void, event_id: u16, data: *const u8, data_le
     state.default_connectivity = false;
 }
 
-fn parse_optional<T: std::str::FromStr + PartialEq + Default>(
+fn parse_optional<T: emane_plugin_api::numeric::LegacyNumber + PartialEq + Default>(
     node: Node<'_, '_>,
     name: &str,
 ) -> Result<Option<T>, String> {
+    use emane_plugin_api::numeric::LegacyParse;
     match node.attribute(name) {
         None => Ok(None),
         Some(value) => value
-            .parse::<T>()
+            .parse_legacy()
             .map(|value| (value != T::default()).then_some(value))
             .map_err(|_| format!("invalid {name}")),
     }
@@ -1062,27 +1063,29 @@ fn parse_ipv4(value: Option<&str>) -> Result<Option<[u8; 4]>, String> {
 }
 
 fn parse_duration(node: Option<Node<'_, '_>>) -> Result<u64, String> {
+    use emane_plugin_api::numeric::LegacyParse;
     let Some(node) = node else { return Ok(0) };
-    let seconds = node
+    let seconds: u32 = node
         .attribute("sec")
         .unwrap_or("0")
-        .parse::<u64>()
+        .parse_legacy()
         .map_err(|_| "invalid duration seconds")?;
-    let microseconds = node
+    let microseconds: u32 = node
         .attribute("usec")
         .unwrap_or("0")
-        .parse::<u64>()
+        .parse_legacy()
         .map_err(|_| "invalid duration microseconds")?;
-    seconds
+    u64::from(seconds)
         .checked_mul(1_000_000)
-        .and_then(|value| value.checked_add(microseconds))
+        .and_then(|value| value.checked_add(u64::from(microseconds)))
         .ok_or_else(|| "duration overflow".to_string())
 }
 
-fn text_value<T: std::str::FromStr + Default>(
+fn text_value<T: emane_plugin_api::numeric::LegacyNumber + Default>(
     parent: Node<'_, '_>,
     name: &str,
 ) -> Result<T, String> {
+    use emane_plugin_api::numeric::LegacyParse;
     parent
         .children()
         .find(|node| node.is_element() && node.tag_name().name() == name)
@@ -1090,7 +1093,7 @@ fn text_value<T: std::str::FromStr + Default>(
             node.text()
                 .unwrap_or("0")
                 .trim()
-                .parse()
+                .parse_legacy()
                 .map_err(|_| format!("invalid {name}"))
         })
 }
@@ -1133,13 +1136,14 @@ fn load_filters(path: &str) -> Result<Vec<Filter>, String> {
                             source: parse_optional(child, "sport")?,
                             destination: parse_optional(child, "dport")?,
                         }),
-                        "protocol" => protocols.push(ProtocolRule::Number(
+                        "protocol" => protocols.push(ProtocolRule::Number({
+                            use emane_plugin_api::numeric::LegacyParse;
                             child
                                 .attribute("type")
                                 .unwrap_or("0")
-                                .parse()
-                                .map_err(|_| "invalid protocol type")?,
-                        )),
+                                .parse_legacy()
+                                .map_err(|_| "invalid protocol type")?
+                        })),
                         _ => return Err("unexpected IPv4 rule".to_string()),
                     }
                 }

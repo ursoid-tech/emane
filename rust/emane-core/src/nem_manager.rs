@@ -3289,7 +3289,16 @@ impl PhyState {
         self.antenna_pair_gains_for(local_id, source, 0, 0, local_pattern, remote_pattern)
     }
 
-    fn update_gain_antenna(&mut self, nem_id: u16, antenna: MimoTxAntenna) {
+    fn update_gain_antenna(&mut self, nem_id: u16, mut antenna: MimoTxAntenna) {
+        if antenna.pattern == AntennaPattern::Default && antenna.antenna_index == 0 {
+            if let Some(profile) = self.antenna_profiles.get(&nem_id) {
+                antenna.pattern = AntennaPattern::Profile(TxAntennaProfile {
+                    profile_id: profile.profile_id,
+                    azimuth_degrees: profile.azimuth_degrees,
+                    elevation_degrees: profile.elevation_degrees,
+                });
+            }
+        }
         let key = (nem_id, antenna.antenna_index);
         if self.gain_antennas.get(&key).is_some_and(|previous| {
             let same_pattern = match (previous.pattern, antenna.pattern) {
@@ -3344,7 +3353,16 @@ impl PhyState {
         };
         let remote_pattern = match remote_pattern {
             AntennaPattern::Default => self
-                .default_antenna_pattern(source)
+                .antenna_profiles
+                .get(&source)
+                .map(|profile| {
+                    AntennaPattern::Profile(TxAntennaProfile {
+                        profile_id: profile.profile_id,
+                        azimuth_degrees: profile.azimuth_degrees,
+                        elevation_degrees: profile.elevation_degrees,
+                    })
+                })
+                .or_else(|| self.default_antenna_pattern(source))
                 .ok_or(PhyPathError::GainProfile)?,
             pattern => pattern,
         };
@@ -3529,7 +3547,17 @@ impl PhyState {
             pattern => pattern,
         };
         let remote_pattern = match remote_pattern {
-            AntennaPattern::Default => self.default_antenna_pattern(source)?,
+            AntennaPattern::Default => self
+                .antenna_profiles
+                .get(&source)
+                .map(|profile| {
+                    AntennaPattern::Profile(TxAntennaProfile {
+                        profile_id: profile.profile_id,
+                        azimuth_degrees: profile.azimuth_degrees,
+                        elevation_degrees: profile.elevation_degrees,
+                    })
+                })
+                .or_else(|| self.default_antenna_pattern(source))?,
             pattern => pattern,
         };
         let fixed = |pattern| match pattern {
@@ -3822,14 +3850,39 @@ fn antenna_direction(
     direction.2 += -local_placement.2 + remote_placement.2;
     let (north, east, up) = direction;
     let magnitude = north.hypot(east).hypot(up);
-    if magnitude <= f64::EPSILON || !magnitude.is_finite() {
+    if !magnitude.is_finite() {
         return None;
     }
-    Some((
-        normalize_azimuth(east.atan2(north).to_degrees()),
-        normalize_elevation((up / magnitude).clamp(-1.0, 1.0).asin().to_degrees()),
-        magnitude,
-    ))
+    let elevation = if magnitude == 0.0 {
+        0.0
+    } else {
+        normalize_elevation((up / magnitude).clamp(-1.0, 1.0).asin().to_degrees())
+    };
+    let azimuth = if north == 0.0 {
+        if east > 0.0 {
+            90.0
+        } else {
+            270.0
+        }
+    } else {
+        let mut azimuth = if east == 0.0 {
+            if north > 0.0 {
+                0.0
+            } else {
+                180.0
+            }
+        } else {
+            (east / north).atan().to_degrees()
+        };
+        if north < 0.0 {
+            azimuth += 180.0;
+        }
+        if north > 0.0 && east < 0.0 {
+            azimuth += 360.0;
+        }
+        normalize_azimuth(azimuth)
+    };
+    Some((azimuth, elevation, magnitude))
 }
 
 fn adjusted_orientation(location: Location) -> Orientation {
@@ -4285,6 +4338,7 @@ extern "C" fn builtin_configure(state: *mut c_void, request: *const c_void) -> b
                 | "excludesamesubidfromfilterenable"
         )
     });
+    let mut fixed_antenna_gain_updated = false;
     for (name, values) in items {
         let Some(value) = values.first() else {
             return false;
@@ -4446,11 +4500,8 @@ extern "C" fn builtin_configure(state: *mut c_void, request: *const c_void) -> b
                 if !value.is_finite() {
                     return false;
                 }
-                if state.phy.fixed_antenna_gain_db != value && state.phy.fixed_antenna_gain_enabled
-                {
-                    state.phy.gain_cache.retain(|key, _| key[2] != 0);
-                }
                 state.phy.fixed_antenna_gain_db = value;
+                fixed_antenna_gain_updated = true;
             }
             "subid" => {
                 let Ok(value) = value.parse::<u16>() else {
@@ -4679,6 +4730,7 @@ extern "C" fn builtin_configure(state: *mut c_void, request: *const c_void) -> b
                     Some(value) => value,
                     None => return false,
                 };
+                state.bit_pool.start(state.bitrate_bps);
             }
             "flowcontrolenable" => {
                 state.flow_control_enabled = match parse_bool(value) {
@@ -4712,6 +4764,26 @@ extern "C" fn builtin_configure(state: *mut c_void, request: *const c_void) -> b
                 >= state.phy.nakagami_parameters.distance1_meters
         {
             return false;
+        }
+        // Apply after all configuration values so initial enable/gain ordering
+        // cannot install an omni antenna when fixed gain is disabled.
+        if fixed_antenna_gain_updated && state.phy.fixed_antenna_gain_enabled {
+            let pattern = AntennaPattern::IdealOmni {
+                gain_db: state.phy.fixed_antenna_gain_db,
+            };
+            state.phy.update_gain_antenna(
+                state.id,
+                MimoTxAntenna {
+                    antenna_index: 0,
+                    frequency_group_index: 0,
+                    bandwidth_hz: 0,
+                    spectral_mask_index: 0,
+                    pattern,
+                },
+            );
+            if let Some(entry) = state.phy.receive_antennas.get_mut(&0) {
+                entry.antenna.pattern = pattern;
+            }
         }
         if reset_monitor {
             state.phy.initialize_monitor();
@@ -4755,6 +4827,7 @@ extern "C" fn builtin_start(state: *mut c_void) -> bool {
             ) == 0
         }
         BuiltinKind::RawTransport => {
+            state.bit_pool.start(state.bitrate_bps);
             emane_rs_raw_transport_start(state.raw_transport, name.as_ptr()) == 0
         }
     }
@@ -6053,6 +6126,29 @@ extern "C" fn builtin_event(state: *mut c_void, event_id: u16, data: *const u8, 
                             elevation_degrees: profile.antenna_elevation_degrees,
                         },
                     );
+                    let pattern = AntennaPattern::Profile(TxAntennaProfile {
+                        profile_id,
+                        azimuth_degrees: profile.antenna_azimuth_degrees,
+                        elevation_degrees: profile.antenna_elevation_degrees,
+                    });
+                    let existing = state.phy.gain_antennas.get(&(nem_id, 0)).copied();
+                    state.phy.update_gain_antenna(
+                        nem_id,
+                        MimoTxAntenna {
+                            antenna_index: 0,
+                            frequency_group_index: existing
+                                .map_or(0, |antenna| antenna.frequency_group_index),
+                            bandwidth_hz: existing.map_or(0, |antenna| antenna.bandwidth_hz),
+                            spectral_mask_index: existing
+                                .map_or(0, |antenna| antenna.spectral_mask_index),
+                            pattern,
+                        },
+                    );
+                    if nem_id == state.id {
+                        if let Some(entry) = state.phy.receive_antennas.get_mut(&0) {
+                            entry.antenna.pattern = pattern;
+                        }
+                    }
                     if let Some(handle) = state.phy.antenna_profile_event_table {
                         let _ = set_native_table_row(
                             handle,
@@ -9557,3 +9653,7 @@ mod lifecycle_tests;
 #[cfg(test)]
 #[path = "nem_dispatch_tests.rs"]
 mod nem_dispatch_tests;
+
+#[cfg(test)]
+#[path = "nem_antenna_tests.rs"]
+mod antenna_regressions;

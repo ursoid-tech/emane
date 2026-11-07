@@ -71,6 +71,25 @@ impl NetworkServices {
             0,
         )?);
         let control_endpoint = parameter(params, "controlportendpoint").unwrap_or("0.0.0.0:47000");
+        let mut initial_config = params
+            .iter()
+            .map(|(name, values)| (name.clone(), values.values.clone()))
+            .collect::<Vec<_>>();
+        if !params.contains_key("controlportendpoint") {
+            initial_config.push((
+                "controlportendpoint".to_string(),
+                vec![control_endpoint.to_string()],
+            ));
+        }
+        emane_core::native_configuration::unregister(0);
+        emane_core::native_configuration::register_with_schema(
+            0,
+            emane_core::nem_manager::component_configuration_defaults("nemmanager"),
+            emane_core::nem_manager::component_configuration_schema("nemmanager"),
+            &initial_config,
+            &emane_core::nem_manager::component_modifiable_parameters("nemmanager"),
+            |_| Err("nemmanager has no modifiable parameters".to_string()),
+        )?;
         services.control = Some(ControlPort::open(control_endpoint)?);
         if let Some(group) = parameter(params, "eventservicegroup") {
             let group = c_string(group, "eventservicegroup")?;
@@ -140,6 +159,7 @@ impl NetworkServices {
 
 impl Drop for NetworkServices {
     fn drop(&mut self) {
+        emane_core::native_configuration::unregister(0);
         if self.ota {
             ota_manager::emane_rs_ota_manager_close();
         }
@@ -383,5 +403,52 @@ fn main() -> ExitCode {
             eprintln!("emane: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use emane_core::native_configuration::{parse_initial, ConfigurationValue};
+    use emane_core::xml_parser::ParamValues;
+
+    #[test]
+    fn platform_loopback_configuration_matches_runtime_values() {
+        let schema = emane_core::nem_manager::component_configuration_schema("nemmanager");
+        for (value, expected) in [("true", true), ("false", false)] {
+            let params = [
+                ("eventservicegroup", "224.1.2.8:45703"),
+                ("controlportendpoint", "127.0.0.1:47000"),
+                ("eventserviceloopback", value),
+            ]
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    name.to_string(),
+                    ParamValues {
+                        values: vec![value.to_string()],
+                    },
+                )
+            })
+            .collect::<ParamMap>();
+            validate_platform_parameters(&params).unwrap();
+            let initial = params
+                .iter()
+                .map(|(name, values)| (name.clone(), values.values.clone()))
+                .collect::<Vec<_>>();
+            let parsed = parse_initial(&schema, &initial).unwrap();
+            assert!(parsed.contains(&(
+                "eventserviceloopback".to_string(),
+                vec![ConfigurationValue::Boolean(expected)],
+            )));
+            assert_eq!(
+                parse_bool_parameter(&params, "eventserviceloopback", false).unwrap(),
+                expected,
+            );
+        }
+        assert_eq!(
+            schema["eventserviceloopback"].defaults,
+            vec![ConfigurationValue::Boolean(false)],
+        );
     }
 }

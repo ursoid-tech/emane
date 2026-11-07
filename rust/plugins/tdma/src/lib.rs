@@ -1494,6 +1494,7 @@ fn schedule_next_tx(mac: &TdmaMac, first_after_schedule: bool) {
     }
 }
 
+#[cfg(test)]
 fn queue_index(state: &State, requested: u8, destination: u16) -> Option<usize> {
     let eligible = |index: usize| {
         state.queues[index]
@@ -1512,17 +1513,28 @@ fn queue_index(state: &State, requested: u8, destination: u16) -> Option<usize> 
 
 struct Transmission {
     info: FfiPacketInfo,
-    bytes: Vec<u8>,
-    sequence: u64,
-    offset: usize,
-    fragment_index: u16,
-    more: bool,
+    message: TdmaMessage,
     frequency: u64,
     rate: u64,
     category: u8,
     power: f64,
     bandwidth: u64,
     tx_time: i64,
+}
+
+impl Transmission {
+    fn more(&self) -> bool {
+        self.message
+            .fragment
+            .as_ref()
+            .is_some_and(|fragment| fragment.more)
+    }
+}
+
+fn component_wire_len(message: &TdmaMessage) -> usize {
+    let length = message.encoded_len();
+    // The repeated message field has a one-byte tag followed by its varint length.
+    1 + prost::length_delimiter_len(length) + length
 }
 
 fn tx_properties(
@@ -1549,12 +1561,20 @@ fn tx_properties(
     }
 }
 
-fn take_transmission(
+#[allow(clippy::too_many_arguments)]
+fn take_from_queue(
     mac: &TdmaMac,
     state: &mut State,
     absolute_slot: u64,
-    used: usize,
+    index: usize,
+    available: usize,
+    wire_available: usize,
+    drop_oversized: bool,
+    queue_had_component: bool,
 ) -> Option<Transmission> {
+    if available == 0 || wire_available == 0 {
+        return None;
+    }
     let schedule = state.schedule.clone()?;
     let Slot::Tx {
         frequency_hz,
@@ -1566,23 +1586,29 @@ fn take_transmission(
     else {
         return None;
     };
-    let usable_us = schedule
-        .slot_duration_us
-        .saturating_sub(schedule.overhead_us);
-    let capacity = (u128::from(data_rate_bps) * u128::from(usable_us) / 8_000_000)
-        .min(usize::MAX as u128) as usize;
-    let index = queue_index(state, service_class, destination)?;
-    let available = capacity.saturating_sub(used);
-    if available == 0 {
-        return None;
-    }
     let position = state.queues[index]
         .iter()
         .position(|queued| destination == 0 || queued.packet.info.destination == destination)?;
     let front = state.queues[index].get_mut(position)?;
     let remaining = front.packet.payload.len().saturating_sub(front.offset);
-    if remaining > available && !state.fragmentation_enable {
-        if used != 0 {
+    let take = remaining.min(available).min(wire_available);
+    let fragment = |more| TdmaFragment {
+        more,
+        index: u32::from(front.fragment_index),
+        offset: u32::try_from(front.offset).unwrap_or(u32::MAX),
+        sequence: front.sequence,
+    };
+    let mut message = TdmaMessage {
+        message_type: TdmaMessageType::Data as i32,
+        destination: u32::from(front.packet.info.destination),
+        priority: u32::from(front.packet.info.priority),
+        data: front.packet.payload[front.offset..front.offset + take].to_vec(),
+        fragment: (front.offset != 0 || take < remaining).then(|| fragment(take < remaining)),
+    };
+    if !state.fragmentation_enable
+        && (take < remaining || component_wire_len(&message) > wire_available)
+    {
+        if !drop_oversized || queue_had_component {
             return None;
         }
         let dropped = state.queues[index].remove(position)?;
@@ -1597,16 +1623,33 @@ fn take_transmission(
             PacketDropReason::TooBig,
         );
         publish_queue_tables(mac, state, index);
-        return take_transmission(mac, state, absolute_slot, used);
+        return take_from_queue(
+            mac,
+            state,
+            absolute_slot,
+            index,
+            available,
+            wire_available,
+            drop_oversized,
+            queue_had_component,
+        );
     }
-    let take = remaining.min(available);
-    let offset = front.offset;
-    let total_len = front.packet.payload.len();
-    let sequence = front.sequence;
+    if component_wire_len(&message) > wire_available {
+        // Check the complete packet first: fragmentation adds metadata which may
+        // make a fitting whole packet appear too large. Only shorten it after
+        // including the metadata required by the resulting fragment.
+        message.fragment = Some(fragment(true));
+        let excess = component_wire_len(&message) - wire_available;
+        let take = message.data.len().checked_sub(excess)?;
+        if take == 0 {
+            return None;
+        }
+        message.data.truncate(take);
+    }
+    let take = message.data.len();
     let fragment_index = front.fragment_index;
     let info = front.packet.info;
-    let bytes = front.packet.payload[offset..offset + take].to_vec();
-    let more = offset + take < total_len;
+    let more = take < remaining;
     if more {
         front.offset += take;
         front.fragment_index = front.fragment_index.saturating_add(1);
@@ -1622,11 +1665,7 @@ fn take_transmission(
     }
     let transmission = Transmission {
         info,
-        bytes,
-        sequence,
-        offset,
-        fragment_index,
-        more,
+        message,
         frequency: frequency_hz,
         rate: data_rate_bps,
         category: service_class,
@@ -1636,6 +1675,49 @@ fn take_transmission(
     };
     publish_queue_tables(mac, state, index);
     Some(transmission)
+}
+
+#[cfg(test)]
+fn take_transmission(
+    mac: &TdmaMac,
+    state: &mut State,
+    absolute_slot: u64,
+    used: usize,
+) -> Option<Transmission> {
+    let schedule = state.schedule.clone()?;
+    let Slot::Tx {
+        data_rate_bps,
+        service_class,
+        destination,
+        ..
+    } = schedule.slot(absolute_slot).clone()
+    else {
+        return None;
+    };
+    let usable_us = schedule
+        .slot_duration_us
+        .saturating_sub(schedule.overhead_us);
+    let capacity = (u128::from(data_rate_bps) * u128::from(usable_us) / 8_000_000)
+        .min(usize::MAX as u128) as usize;
+    let index = queue_index(state, service_class, destination)?;
+    let available = capacity.saturating_sub(used);
+    let header_len = TdmaBaseModelMessage {
+        absolute_slot_index: absolute_slot,
+        data_rate_bps,
+        messages: Vec::new(),
+    }
+    .encoded_len();
+    let primary_index = usize::from(service_class.min(4));
+    take_from_queue(
+        mac,
+        state,
+        absolute_slot,
+        index,
+        available,
+        usize::from(u16::MAX) - header_len,
+        index == primary_index,
+        used != 0,
+    )
 }
 
 fn transmit_slot(mac: &TdmaMac, absolute_slot: u64) {
@@ -1657,9 +1739,15 @@ fn transmit_slot(mac: &TdmaMac, absolute_slot: u64) {
         let Some(schedule) = state.schedule.as_ref() else {
             return;
         };
-        let Slot::Tx { data_rate_bps, .. } = schedule.slot(absolute_slot) else {
+        let Slot::Tx {
+            data_rate_bps,
+            service_class,
+            ..
+        } = schedule.slot(absolute_slot)
+        else {
             return;
         };
+        let primary_index = usize::from((*service_class).min(4));
         let capacity = (u128::from(*data_rate_bps)
             * u128::from(
                 schedule
@@ -1669,19 +1757,73 @@ fn transmit_slot(mac: &TdmaMac, absolute_slot: u64) {
             / 8_000_000)
             .min(usize::MAX as u128) as usize;
         let slot_duration_us = schedule.slot_duration_us;
+        let header_len = TdmaBaseModelMessage {
+            absolute_slot_index: absolute_slot,
+            data_rate_bps: *data_rate_bps,
+            messages: Vec::new(),
+        }
+        .encoded_len();
+        // Wire framing is limited separately from the slot's payload capacity.
+        let mut wire_available = usize::from(u16::MAX) - header_len;
         let aggregate = state.aggregation_enable;
         let threshold = state.aggregation_threshold;
+        let threshold_bytes = (capacity as f64 * threshold / 100.0) as usize;
         let mut used = 0usize;
         let mut items = Vec::new();
-        while let Some(item) = take_transmission(mac, &mut state, absolute_slot, used) {
-            used = used.saturating_add(item.bytes.len());
-            let stop = !aggregate
-                || item.more
-                || used >= capacity
-                || used as f64 / capacity.max(1) as f64 * 100.0 >= threshold;
+        let mut primary_had = false;
+        while used < capacity {
+            let Some(item) = take_from_queue(
+                mac,
+                &mut state,
+                absolute_slot,
+                primary_index,
+                capacity.saturating_sub(used),
+                wire_available,
+                true,
+                primary_had,
+            ) else {
+                break;
+            };
+            primary_had = true;
+            used = used.saturating_add(item.message.data.len());
+            wire_available -= component_wire_len(&item.message);
+            let stop = !aggregate || item.more() || used >= capacity;
             items.push(item);
             if stop {
                 break;
+            }
+        }
+        if !state.strict_dequeue {
+            for secondary_index in (0..5).rev() {
+                if !((used == 0 || aggregate) && used <= threshold_bytes) {
+                    break;
+                }
+                if secondary_index == primary_index {
+                    continue;
+                }
+                let mut secondary_had = false;
+                while used < capacity {
+                    let Some(item) = take_from_queue(
+                        mac,
+                        &mut state,
+                        absolute_slot,
+                        secondary_index,
+                        capacity.saturating_sub(used),
+                        wire_available,
+                        false,
+                        secondary_had,
+                    ) else {
+                        break;
+                    };
+                    secondary_had = true;
+                    used = used.saturating_add(item.message.data.len());
+                    wire_available -= component_wire_len(&item.message);
+                    let stop = !aggregate || item.more() || used >= capacity;
+                    items.push(item);
+                    if stop {
+                        break;
+                    }
+                }
             }
         }
         if !items.is_empty() {
@@ -1693,12 +1835,12 @@ fn transmit_slot(mac: &TdmaMac, absolute_slot: u64) {
                     priority_to_queue(item.info.priority),
                     mac.id,
                     item.info.destination,
-                    item.bytes.len(),
+                    item.message.data.len(),
                     false,
                 );
             }
         }
-        let completed = items.iter().filter(|item| !item.more).count() as u16;
+        let completed = items.iter().filter(|item| !item.more()).count() as u16;
         let flow_update = if state.flow_control_enable && completed != 0 {
             state.flow_manager.add_token(completed).2
         } else {
@@ -1717,26 +1859,11 @@ fn transmit_slot(mac: &TdmaMac, absolute_slot: u64) {
     let wire = TdmaBaseModelMessage {
         absolute_slot_index: absolute_slot,
         data_rate_bps: first.rate,
-        messages: items
-            .iter()
-            .map(|item| TdmaMessage {
-                message_type: TdmaMessageType::Data as i32,
-                destination: u32::from(item.info.destination),
-                priority: u32::from(item.info.priority),
-                data: item.bytes.clone(),
-                fragment: (item.offset != 0 || item.more).then(|| TdmaFragment {
-                    more: item.more,
-                    index: u32::from(item.fragment_index),
-                    offset: u32::try_from(item.offset).unwrap_or(u32::MAX),
-                    sequence: item.sequence,
-                }),
-            })
-            .collect(),
+        messages: items.iter().map(|item| item.message.clone()).collect(),
     };
     let serialization = wire.encode_to_vec();
-    let Ok(serialization_len) = u16::try_from(serialization.len()) else {
-        return;
-    };
+    let serialization_len =
+        u16::try_from(serialization.len()).expect("TDMA wire length was checked before dequeue");
     let mut payload = Vec::with_capacity(serialization.len() + 2);
     payload.extend_from_slice(&serialization_len.to_be_bytes());
     payload.extend_from_slice(&serialization);
@@ -1754,7 +1881,7 @@ fn transmit_slot(mac: &TdmaMac, absolute_slot: u64) {
         flags: 0,
     }
     .encode();
-    let component_bytes = items.iter().map(|item| item.bytes.len()).sum();
+    let component_bytes = items.iter().map(|item| item.message.data.len()).sum();
     let tx = tx_properties(first, component_bytes, slot_duration_us);
     let tx_data = tx.encode();
     let messages = [
@@ -1798,7 +1925,7 @@ fn transmit_slot(mac: &TdmaMac, absolute_slot: u64) {
     mac.increment(
         "TxComponentBytes",
         items.iter().fold(0u64, |total, item| {
-            total.saturating_add(u64::try_from(item.bytes.len()).unwrap_or(u64::MAX))
+            total.saturating_add(u64::try_from(item.message.data.len()).unwrap_or(u64::MAX))
         }),
     );
     mac.increment(
@@ -2591,11 +2718,7 @@ mod tests {
                 creation_time_sec: 0,
                 creation_time_usec: 0,
             },
-            bytes: Vec::new(),
-            sequence: 0,
-            offset: 0,
-            fragment_index: 0,
-            more: false,
+            message: TdmaMessage::default(),
             frequency: 1_200_000_000,
             rate: 9_000_000,
             category: 0,

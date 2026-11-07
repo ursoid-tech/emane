@@ -1155,6 +1155,14 @@
         <values minOccurs="1" maxOccurs="1" />
       </nonnumeric>
     </parameter>
+    <!-- Preserve the Rust platform's Event Service loopback option. -->
+    <parameter name="eventserviceloopback" default="yes" required="no" modifiable="no">
+      <numeric minValue="false" maxValue="true" type="bool">
+        <values minOccurs="1" maxOccurs="1">
+          <value>false</value>
+        </values>
+      </numeric>
+    </parameter>
     <parameter name="eventservicettl" default="yes" required="no" modifiable="no">
       <numeric minValue="0" maxValue="255" type="uint8">
         <values minOccurs="1" maxOccurs="1">
@@ -1278,6 +1286,27 @@
           <value>1</value>
         </values>
       </numeric>
+    </parameter>
+  </component>
+  <component name="eelgenerator">
+    <parameter name="inputfile" default="no" required="yes" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1024" />
+      </nonnumeric>
+    </parameter>
+    <parameter name="loader" default="no" required="yes" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1024" />
+      </nonnumeric>
+    </parameter>
+  </component>
+  <component name="gpsdlocationagent">
+    <parameter name="pseudoterminalfile" default="yes" required="no" modifiable="no">
+      <nonnumeric type="string">
+        <values minOccurs="1" maxOccurs="1">
+          <value>/tmp/gps.pty</value>
+        </values>
+      </nonnumeric>
     </parameter>
   </component>
 </components>

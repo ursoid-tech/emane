@@ -381,7 +381,7 @@ extern "C" fn timed(plugin: *mut c_void, _: u64, event_id: u32, _: *const u8, _:
             len: properties.len(),
         },
     }];
-    let segment_bytes = (!state.frequencies.is_empty())
+    let segment_bytes = (state.frequencies.len() > 1)
         .then(|| TxFrequencySegments {
             segments: state
                 .frequencies

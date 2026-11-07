@@ -181,6 +181,7 @@ fn test_mac() -> TdmaMac {
 struct Capture {
     timers: Vec<(u64, u32, Vec<u8>)>,
     upstream: Vec<OwnedPacket>,
+    downstream: Vec<(OwnedPacket, TxProperties)>,
     queries: Vec<FfiSpectrumQuery>,
     noise: Option<f64>,
 }
@@ -196,6 +197,30 @@ extern "C" fn capture_upstream(
 ) {
     if let Some(packet) = own_packet(packet) {
         capture(ctx).lock().unwrap().upstream.push(packet);
+    }
+}
+extern "C" fn capture_downstream(
+    ctx: *mut c_void,
+    _: u16,
+    packet: *const FfiPacket,
+    controls: *const FfiControlMessage,
+    count: usize,
+) {
+    let controls = unsafe { std::slice::from_raw_parts(controls, count) };
+    let properties = controls
+        .iter()
+        .find(|control| control.msg_type == CONTROL_TX_PROPERTIES)
+        .and_then(|control| {
+            TxProperties::decode(unsafe {
+                std::slice::from_raw_parts(control.payload.data, control.payload.len)
+            })
+        });
+    if let (Some(packet), Some(properties)) = (own_packet(packet), properties) {
+        capture(ctx)
+            .lock()
+            .unwrap()
+            .downstream
+            .push((packet, properties));
     }
 }
 extern "C" fn capture_schedule(
@@ -239,6 +264,7 @@ fn mac(capture: &Mutex<Capture>) -> TdmaMac {
     mac.framework.framework_ctx = capture as *const _ as *mut c_void;
     mac.framework.schedule_timed_event = capture_schedule;
     mac.framework.send_upstream_packet = capture_upstream;
+    mac.framework.send_downstream_packet = capture_downstream;
     mac.state.get_mut().unwrap().started = true;
     mac
 }
@@ -292,18 +318,213 @@ fn small_slots_use_component_capacity_and_airtime() {
         });
     }
     let first = take_transmission(&mac, &mut state, 0, 0).unwrap();
-    assert_eq!(first.bytes.len(), 100);
+    assert_eq!(first.message.data.len(), 100);
     // Original float-seconds conversion truncates 100 bytes at 1 Mbps to 799 us.
     assert_eq!(tx_properties(&first, 100, 1_000).duration_microseconds, 799);
     let second = take_transmission(&mac, &mut state, 0, 100).unwrap();
-    assert_eq!(second.bytes.len(), 12);
-    assert!(second.more);
+    assert_eq!(second.message.data.len(), 12);
+    assert!(second.more());
     assert_eq!(tx_properties(&first, 112, 1_000).duration_microseconds, 896);
     assert!(take_transmission(&mac, &mut state, 0, 112).is_none());
     assert_eq!(state.queues[0][0].offset, 12);
     // Preserve the C++ end-of-slot guard when overhead is zero.
     assert_eq!(tx_properties(&first, 125, 1_000).duration_microseconds, 999);
 }
+
+fn large_slot_mac(capture: &Mutex<Capture>, fragmentation: bool, lengths: &[usize]) -> TdmaMac {
+    let mac = mac(capture);
+    {
+        let mut state = mac.state.lock().unwrap();
+        let mut schedule = schedule(10_000_000, 0, true);
+        // A 70,000-byte payload capacity, with a long slot to avoid wall-clock
+        // boundary races while inspecting and transmitting queued packets.
+        if let Slot::Tx { data_rate_bps, .. } = &mut schedule.slots[0] {
+            *data_rate_bps = 56_000;
+        }
+        state.schedule = Some(schedule);
+        state.fragmentation_enable = fragmentation;
+        for (sequence, &length) in lengths.iter().enumerate() {
+            state.queues[0].push_back(QueuedPacket {
+                packet: OwnedPacket {
+                    info: info(1),
+                    payload: vec![sequence as u8; length],
+                },
+                sequence: sequence as u64,
+                offset: 0,
+                fragment_index: 0,
+            });
+        }
+    }
+    mac
+}
+
+fn transmit_current_slot(mac: &TdmaMac) {
+    let slot = mac
+        .state
+        .lock()
+        .unwrap()
+        .schedule
+        .as_ref()
+        .unwrap()
+        .absolute_slot(now_us());
+    transmit_slot(mac, slot);
+}
+
+fn transmitted_messages(capture: &Capture) -> Vec<TdmaBaseModelMessage> {
+    capture
+        .downstream
+        .iter()
+        .map(|(packet, properties)| {
+            let length = usize::from(u16::from_be_bytes(packet.payload[..2].try_into().unwrap()));
+            assert_eq!(length + 2, packet.payload.len());
+            let wire = TdmaBaseModelMessage::decode(&packet.payload[2..]).unwrap();
+            let component_bytes = wire
+                .messages
+                .iter()
+                .map(|message| message.data.len())
+                .sum::<usize>();
+            // Protobuf framing must not consume modeled payload capacity or airtime.
+            let airtime = (f64::from(component_bytes as f32 * 8.0 / wire.data_rate_bps as f32)
+                * 1_000_000.0) as u64;
+            assert_eq!(properties.duration_microseconds, airtime);
+            wire
+        })
+        .collect()
+}
+
+#[test]
+fn large_aggregates_fit_wire_framing_and_drain_without_loss() {
+    for fragmentation in [false, true] {
+        let capture = Mutex::new(Capture::default());
+        let mac = large_slot_mac(&capture, fragmentation, &[1500; 50]);
+        transmit_current_slot(&mac);
+        {
+            let state = mac.state.lock().unwrap();
+            assert!(!state.queues[0].is_empty());
+            assert_eq!(state.queue_statistics[0].too_big, 0);
+            let frames = transmitted_messages(&capture.lock().unwrap());
+            assert_eq!(frames.len(), 1);
+            assert!(
+                frames[0]
+                    .messages
+                    .iter()
+                    .map(|message| message.data.len())
+                    .sum::<usize>()
+                    > 63_000
+            );
+            assert_eq!(
+                frames[0].messages.last().unwrap().fragment.is_some(),
+                fragmentation
+            );
+        }
+        transmit_current_slot(&mac);
+        let state = mac.state.lock().unwrap();
+        assert!(state.queues[0].is_empty());
+        assert_eq!(state.queue_statistics[0].too_big, 0);
+        assert_eq!(state.queue_statistics[0].dequeued, 50);
+        let frames = transmitted_messages(&capture.lock().unwrap());
+        assert_eq!(frames.len(), 2);
+        let actual = frames
+            .iter()
+            .flat_map(|frame| &frame.messages)
+            .flat_map(|message| message.data.iter().copied())
+            .collect::<Vec<_>>();
+        let expected = (0..50u8)
+            .flat_map(|value| vec![value; 1500])
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        if fragmentation {
+            let first = frames[0].messages.last().unwrap();
+            let last = frames[1].messages.first().unwrap();
+            let first_fragment = first.fragment.as_ref().unwrap();
+            let last_fragment = last.fragment.as_ref().unwrap();
+            assert!(first_fragment.more);
+            assert!(!last_fragment.more);
+            assert_eq!(last_fragment.sequence, first_fragment.sequence);
+            assert_eq!(last_fragment.index, first_fragment.index + 1);
+            assert_eq!(last_fragment.offset as usize, first.data.len());
+            assert_eq!(first.data.len() + last.data.len(), 1500);
+        } else {
+            assert!(frames
+                .iter()
+                .flat_map(|frame| &frame.messages)
+                .all(|message| message.fragment.is_none()));
+        }
+    }
+}
+
+#[test]
+fn oversized_singleton_fragments_or_drops_before_the_next_packet() {
+    for fragmentation in [false, true] {
+        let capture = Mutex::new(Capture::default());
+        let mac = large_slot_mac(&capture, fragmentation, &[70_000, 1500]);
+        transmit_current_slot(&mac);
+        if fragmentation {
+            assert!(!mac.state.lock().unwrap().queues[0].is_empty());
+            transmit_current_slot(&mac);
+        }
+        let state = mac.state.lock().unwrap();
+        assert!(state.queues[0].is_empty());
+        assert_eq!(state.queue_statistics[0].too_big, u64::from(!fragmentation));
+        let frames = transmitted_messages(&capture.lock().unwrap());
+        let actual = frames
+            .iter()
+            .flat_map(|frame| &frame.messages)
+            .flat_map(|message| message.data.iter().copied())
+            .collect::<Vec<_>>();
+        let mut expected = if fragmentation {
+            vec![0; 70_000]
+        } else {
+            Vec::new()
+        };
+        expected.extend(vec![1; 1500]);
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn exact_wire_limit_whole_packet_does_not_gain_fragment_metadata() {
+    let capture = Mutex::new(Capture::default());
+    let mac = large_slot_mac(&capture, true, &[]);
+    let slot = mac
+        .state
+        .lock()
+        .unwrap()
+        .schedule
+        .as_ref()
+        .unwrap()
+        .absolute_slot(now_us());
+    let mut wire = TdmaBaseModelMessage {
+        absolute_slot_index: slot,
+        data_rate_bps: 56_000,
+        messages: vec![TdmaMessage {
+            message_type: TdmaMessageType::Data as i32,
+            destination: 1,
+            priority: 0,
+            data: vec![0; usize::from(u16::MAX)],
+            fragment: None,
+        }],
+    };
+    while wire.encoded_len() > usize::from(u16::MAX) {
+        wire.messages[0].data.pop();
+    }
+    mac.state.lock().unwrap().queues[0].push_back(QueuedPacket {
+        packet: OwnedPacket {
+            info: info(1),
+            payload: wire.messages[0].data.clone(),
+        },
+        sequence: 0,
+        offset: 0,
+        fragment_index: 0,
+    });
+    transmit_slot(&mac, slot);
+    assert!(mac.state.lock().unwrap().queues[0].is_empty());
+    let frames = transmitted_messages(&capture.lock().unwrap());
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0], wire);
+    assert_eq!(frames[0].encoded_len(), usize::from(u16::MAX));
+}
+
 fn receive(mac: &mut TdmaMac, source: u16, offset: u64, fragment: Option<TdmaFragment>) -> u64 {
     let (slot, tx_time) = {
         let state = mac.state.lock().unwrap();

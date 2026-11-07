@@ -60,8 +60,8 @@ impl LocationLoader {
                 return Err("LoaderLocation missing arguments".to_string());
             }
             let params: Vec<&str> = args[1].split(',').collect();
-            if params.len() != 4 {
-                return Err("LoaderLocation gps expected 4 params".to_string());
+            if params.len() < 3 || params.len() > 4 {
+                return Err("LoaderLocation gps expected 3 or 4 params".to_string());
             }
             let lat: f64 = params[0]
                 .parse_legacy()
@@ -72,9 +72,10 @@ impl LocationLoader {
             let alt: f64 = params[2]
                 .parse_legacy()
                 .map_err(|e| format!("EELEventGenerator: Parameter conversion error. {}", e))?;
-            let alt_type = params[3];
-            if alt_type != "msl" && alt_type != "agl" {
-                return Err("LoaderLocation gps unkown altitude type".to_string());
+            if let Some(&alt_type) = params.get(3) {
+                if alt_type != "msl" && alt_type != "agl" {
+                    return Err("LoaderLocation gps unkown altitude type".to_string());
+                }
             }
 
             let snapshot = {
@@ -91,8 +92,8 @@ impl LocationLoader {
                 return Err("EELLoaderLocation orientation missing arguments".to_string());
             }
             let params: Vec<&str> = args[0].split(',').collect();
-            if params.len() != 4 {
-                return Err("EELLoaderLocation orientation expects 4 params".to_string());
+            if params.len() < 3 {
+                return Err("EELLoaderLocation orientation expects at least 3 params".to_string());
             }
             let pitch: f64 = params[0]
                 .parse_legacy()
@@ -103,9 +104,10 @@ impl LocationLoader {
             let yaw: f64 = params[2]
                 .parse_legacy()
                 .map_err(|e| format!("EELEventGenerator: Parameter conversion error. {}", e))?;
-            let type_str = params[3];
-            if type_str != "degrees" && type_str != "relative" {
-                return Err("EELLoaderLocation orientation unkown or unsupported keyword. Only degrees and relative keywords supported.".to_string());
+            for &type_str in &params[3..] {
+                if type_str != "degrees" && type_str != "relative" {
+                    return Err("EELLoaderLocation orientation unkown or unsupported keyword. Only degrees and relative keywords supported.".to_string());
+                }
             }
 
             let snapshot = {
@@ -122,8 +124,8 @@ impl LocationLoader {
                 return Err("EELLoaderLocation velocity missing arguments".to_string());
             }
             let params: Vec<&str> = args[0].split(',').collect();
-            if params.len() != 4 {
-                return Err("EELLoaderLocation velocity expects 4 params".to_string());
+            if params.len() < 3 {
+                return Err("EELLoaderLocation velocity expects at least 3 params".to_string());
             }
             let azimuth: f64 = params[0]
                 .parse_legacy()
@@ -134,13 +136,14 @@ impl LocationLoader {
             let magnitude: f64 = params[2]
                 .parse_legacy()
                 .map_err(|e| format!("EELEventGenerator: Parameter conversion error. {}", e))?;
-            let type_str = params[3];
-            if type_str != "degrees"
-                && type_str != "mps"
-                && type_str != "azimuth"
-                && type_str != "relative"
-            {
-                return Err("EELLoaderLocation velocity unkown or unsupported keyword. Only degrees, relative, mps and azimuth keywords supported.".to_string());
+            for &type_str in &params[3..] {
+                if type_str != "degrees"
+                    && type_str != "mps"
+                    && type_str != "azimuth"
+                    && type_str != "relative"
+                {
+                    return Err("EELLoaderLocation velocity unkown or unsupported keyword. Only degrees, relative, mps and azimuth keywords supported.".to_string());
+                }
             }
 
             let snapshot = {

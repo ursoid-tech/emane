@@ -9,13 +9,13 @@ use emane_plugin_api::{
     MimoTxFrequencySegment, MimoTxProperties, ModelHeader, PluginApi, RxAntennaAdd,
     RxAntennaRemove, RxProperties, TxAntennaProfile, TxProperties, CONTROL_MIMO_RX_PROPERTIES,
     CONTROL_MIMO_TX_PROPERTIES, CONTROL_MODEL_HEADER, CONTROL_RX_ANTENNA_ADD,
-    CONTROL_RX_ANTENNA_REMOVE, CONTROL_RX_PROPERTIES, CONTROL_TX_PROPERTIES,
-    MAC_REGISTRATION_BENTPIPE, PLUGIN_ABI_VERSION, STATISTIC_VALUE_F64, STATISTIC_VALUE_I64,
-    STATISTIC_VALUE_STRING, STATISTIC_VALUE_U16, STATISTIC_VALUE_U64,
+    CONTROL_RX_ANTENNA_REMOVE, CONTROL_RX_ANTENNA_UPDATE, CONTROL_RX_PROPERTIES,
+    CONTROL_TX_PROPERTIES, MAC_REGISTRATION_BENTPIPE, PLUGIN_ABI_VERSION, STATISTIC_VALUE_F64,
+    STATISTIC_VALUE_I64, STATISTIC_VALUE_STRING, STATISTIC_VALUE_U16, STATISTIC_VALUE_U64,
 };
 use pcr_manager::PCRManager;
 use prost::Message;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{c_void, CStr};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -288,6 +288,8 @@ struct State {
     reassembly: HashMap<(u16, u16, u64), Reassembly>,
     last_fragment_check: HashMap<u16, i64>,
     receive_random: HashMap<u16, LegacyRandom>,
+    antenna_table_keys: BTreeSet<(u16, u64)>,
+    registered_rx_antennas: BTreeSet<u16>,
     started: bool,
 }
 
@@ -562,6 +564,8 @@ impl BentpipeMac {
                 reassembly: HashMap::new(),
                 last_fragment_check: HashMap::new(),
                 receive_random: HashMap::new(),
+                antenna_table_keys: BTreeSet::new(),
+                registered_rx_antennas: BTreeSet::new(),
                 started: false,
             }),
         }
@@ -576,6 +580,17 @@ impl BentpipeMac {
                 key.len(),
                 values.as_ptr(),
                 values.len(),
+            );
+        }
+    }
+
+    fn remove_table_row(&self, name: &str, key: &[u64]) {
+        if let Some(handle) = self.tables.get(name).copied() {
+            (self.framework.remove_table_row)(
+                self.framework.framework_ctx,
+                handle,
+                key.as_ptr(),
+                key.len(),
             );
         }
     }
@@ -628,7 +643,7 @@ fn stat_string(value: &CStr) -> FfiStatisticValue {
     }
 }
 
-fn publish_configuration_tables(mac: &BentpipeMac, state: &State) {
+fn publish_configuration_tables(mac: &BentpipeMac, state: &mut State) {
     for (index, transponder) in &state.transponders {
         let enabled_rx = if transponder.receive_enable {
             c"on"
@@ -676,6 +691,7 @@ fn publish_configuration_tables(mac: &BentpipeMac, state: &State) {
         );
     }
 
+    let mut active_antenna_keys = BTreeSet::new();
     for (antenna_index, antenna) in &state.antennas {
         for transponder in state
             .transponders
@@ -697,6 +713,7 @@ fn publish_configuration_tables(mac: &BentpipeMac, state: &State) {
                 ),
                 AntennaPattern::Default => continue,
             };
+            active_antenna_keys.insert((*antenna_index, transponder.receive_frequency_hz));
             mac.set_table_row(
                 "AntennaStatusTable",
                 &[u64::from(*antenna_index), transponder.receive_frequency_hz],
@@ -713,6 +730,12 @@ fn publish_configuration_tables(mac: &BentpipeMac, state: &State) {
             );
         }
     }
+    for (antenna_index, freq) in &state.antenna_table_keys {
+        if !active_antenna_keys.contains(&(*antenna_index, *freq)) {
+            mac.remove_table_row("AntennaStatusTable", &[u64::from(*antenna_index), *freq]);
+        }
+    }
+    state.antenna_table_keys = active_antenna_keys;
 }
 
 fn publish_queue_tables(mac: &BentpipeMac, state: &State, index: u16) {
@@ -2050,7 +2073,8 @@ extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
     };
     let mut state = mac.state.lock().unwrap();
     let mut pending = PendingConfiguration::from_state(&state);
-    let mut refresh_receive_antennas = false;
+    let mut updated_antennas = BTreeSet::new();
+    let mut modified_freq_antennas = BTreeSet::new();
     for (name, values) in items {
         pending
             .configuration_values
@@ -2104,9 +2128,11 @@ extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
                         return false;
                     }
                     antennas.insert(index, antenna);
+                    if state.started {
+                        updated_antennas.insert(index);
+                    }
                 }
                 pending.antennas = antennas;
-                refresh_receive_antennas = true;
                 continue;
             }
             "reassembly.fragmentcheckthreshold" => {
@@ -2133,10 +2159,16 @@ extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
                 return false;
             }
             let transponder = pending.transponders.entry(index).or_default();
+            let prev_freq = transponder.receive_frequency_hz;
             if !apply_transponder_value(transponder, &name, value) {
                 return false;
             }
-            refresh_receive_antennas |= name == "transponder.receive.frequency";
+            if state.started
+                && name == "transponder.receive.frequency"
+                && transponder.receive_frequency_hz != prev_freq
+            {
+                modified_freq_antennas.insert(transponder.receive_antenna_index);
+            }
         }
     }
     if state.started {
@@ -2174,67 +2206,103 @@ extern "C" fn configure(plugin: *mut c_void, request: *const c_void) -> bool {
             }
             receive.1.push(transponder.receive_frequency_hz);
         }
-        let definitions = if refresh_receive_antennas {
-            let definitions = receive_antennas
-                .into_iter()
-                .map(|(antenna_index, (bandwidth_hz, mut frequencies_hz))| {
-                    frequencies_hz.sort_unstable();
-                    frequencies_hz.dedup();
-                    let definition = *pending.antennas.get(&antenna_index)?;
-                    Some(RxAntennaAdd {
-                        antenna: MimoTxAntenna {
-                            frequency_group_index: 0,
-                            antenna_index,
-                            bandwidth_hz,
-                            spectral_mask_index: definition.spectral_mask_index,
-                            pattern: definition.pattern,
-                        },
-                        frequencies_hz,
-                    })
-                })
-                .collect::<Option<Vec<_>>>();
-            let Some(definitions) = definitions else {
-                return false;
-            };
-            Some(definitions)
-        } else {
-            None
-        };
-        pending.commit(&mut state);
-        publish_configuration_tables(mac, &state);
-        drop(state);
-        if let Some(definitions) = definitions {
-            for definition in definitions {
-                let remove = RxAntennaRemove {
-                    antenna_index: definition.antenna.antenna_index,
-                }
-                .encode();
-                let Some(add) = definition.encode() else {
+        let mut control_batches: Vec<Vec<(u32, Vec<u8>)>> = Vec::new();
+        for antenna_index in &updated_antennas {
+            if let Some((bandwidth_hz, mut frequencies_hz)) =
+                receive_antennas.get(antenna_index).cloned()
+            {
+                frequencies_hz.sort_unstable();
+                frequencies_hz.dedup();
+                let Some(old_def) = state.antennas.get(antenna_index).copied() else {
                     return false;
                 };
-                let messages = [
-                    FfiControlMessage {
-                        msg_type: CONTROL_RX_ANTENNA_REMOVE,
-                        payload: FfiSlice {
-                            data: remove.as_ptr(),
-                            len: remove.len(),
-                        },
+                let Some(new_def) = pending.antennas.get(antenna_index).copied() else {
+                    return false;
+                };
+                let add_msg = RxAntennaAdd {
+                    antenna: MimoTxAntenna {
+                        frequency_group_index: 0,
+                        antenna_index: *antenna_index,
+                        bandwidth_hz,
+                        spectral_mask_index: new_def.spectral_mask_index,
+                        pattern: new_def.pattern,
                     },
-                    FfiControlMessage {
-                        msg_type: CONTROL_RX_ANTENNA_ADD,
-                        payload: FfiSlice {
-                            data: add.as_ptr(),
-                            len: add.len(),
-                        },
-                    },
-                ];
-                (mac.framework.send_downstream_control)(
-                    mac.framework.framework_ctx,
-                    mac.id,
-                    messages.as_ptr(),
-                    messages.len(),
-                );
+                    frequencies_hz,
+                };
+                if matches!(old_def.pattern, AntennaPattern::Profile(_))
+                    && matches!(new_def.pattern, AntennaPattern::Profile(_))
+                {
+                    let Some(update) = add_msg.encode() else {
+                        return false;
+                    };
+                    control_batches.push(vec![(CONTROL_RX_ANTENNA_UPDATE, update)]);
+                } else {
+                    let remove = RxAntennaRemove {
+                        antenna_index: *antenna_index,
+                    }
+                    .encode();
+                    let Some(add) = add_msg.encode() else {
+                        return false;
+                    };
+                    control_batches.push(vec![
+                        (CONTROL_RX_ANTENNA_REMOVE, remove.to_vec()),
+                        (CONTROL_RX_ANTENNA_ADD, add),
+                    ]);
+                }
             }
+        }
+        for antenna_index in &modified_freq_antennas {
+            if let Some((bandwidth_hz, mut frequencies_hz)) =
+                receive_antennas.get(antenna_index).cloned()
+            {
+                frequencies_hz.sort_unstable();
+                frequencies_hz.dedup();
+                let Some(new_def) = pending.antennas.get(antenna_index).copied() else {
+                    return false;
+                };
+                let remove = RxAntennaRemove {
+                    antenna_index: *antenna_index,
+                }
+                .encode();
+                let Some(add) = (RxAntennaAdd {
+                    antenna: MimoTxAntenna {
+                        frequency_group_index: 0,
+                        antenna_index: *antenna_index,
+                        bandwidth_hz,
+                        spectral_mask_index: new_def.spectral_mask_index,
+                        pattern: new_def.pattern,
+                    },
+                    frequencies_hz,
+                })
+                .encode() else {
+                    return false;
+                };
+                control_batches.push(vec![
+                    (CONTROL_RX_ANTENNA_REMOVE, remove.to_vec()),
+                    (CONTROL_RX_ANTENNA_ADD, add),
+                ]);
+            }
+        }
+        pending.commit(&mut state);
+        publish_configuration_tables(mac, &mut state);
+        drop(state);
+        for batch in control_batches {
+            let messages = batch
+                .iter()
+                .map(|(msg_type, bytes)| FfiControlMessage {
+                    msg_type: *msg_type,
+                    payload: FfiSlice {
+                        data: bytes.as_ptr(),
+                        len: bytes.len(),
+                    },
+                })
+                .collect::<Vec<_>>();
+            (mac.framework.send_downstream_control)(
+                mac.framework.framework_ctx,
+                mac.id,
+                messages.as_ptr(),
+                messages.len(),
+            );
         }
     } else {
         pending.commit(&mut state);
@@ -2305,8 +2373,9 @@ extern "C" fn start(plugin: *mut c_void) -> bool {
             .protocol_slot_size
             .get_or_insert(transponder.transmit_slot_size_us);
     }
+    state.registered_rx_antennas = receive_antennas.keys().copied().collect();
     state.started = true;
-    publish_configuration_tables(mac, &state);
+    publish_configuration_tables(mac, &mut state);
     true
 }
 
@@ -2314,7 +2383,7 @@ extern "C" fn post_start(plugin: *mut c_void) {
     let Some(mac) = (unsafe { (plugin as *mut BentpipeMac).as_ref() }) else {
         return;
     };
-    let state = mac.state.lock().unwrap();
+    let mut state = mac.state.lock().unwrap();
     // Match the original postStart phase and one control call per antenna.
     let mut receive_antennas: BTreeMap<u16, (u64, Vec<u64>)> = BTreeMap::new();
     for transponder in state.transponders.values() {
@@ -2345,6 +2414,10 @@ extern "C" fn post_start(plugin: *mut c_void) {
     let Some(definitions) = definitions else {
         return;
     };
+    state.registered_rx_antennas = definitions
+        .iter()
+        .map(|definition| definition.antenna.antenna_index)
+        .collect();
     drop(state);
     for definition in definitions {
         let Some(payload) = definition.encode() else {
@@ -2387,7 +2460,7 @@ extern "C" fn stop(plugin: *mut c_void) {
     let Some(mac) = (unsafe { (plugin as *mut BentpipeMac).as_ref() }) else {
         return;
     };
-    let timers = {
+    let (timers, rx_antennas) = {
         let mut state = mac.state.lock().unwrap();
         state.started = false;
         state.queues.clear();
@@ -2399,10 +2472,25 @@ extern "C" fn stop(plugin: *mut c_void) {
         state.receive_end.clear();
         state.wakeups.clear();
         state.slot_schedules.clear();
-        state.timers.drain().collect::<Vec<_>>()
+        let timers = state.timers.drain().collect::<Vec<_>>();
+        let rx_antennas = std::mem::take(&mut state.registered_rx_antennas)
+            .into_iter()
+            .collect::<Vec<_>>();
+        (timers, rx_antennas)
     };
     for timer in timers {
         (mac.framework.cancel_timed_event)(mac.framework.framework_ctx, mac.id, timer);
+    }
+    for antenna_index in rx_antennas {
+        let payload = RxAntennaRemove { antenna_index }.encode();
+        let message = FfiControlMessage {
+            msg_type: CONTROL_RX_ANTENNA_REMOVE,
+            payload: FfiSlice {
+                data: payload.as_ptr(),
+                len: payload.len(),
+            },
+        };
+        (mac.framework.send_downstream_control)(mac.framework.framework_ctx, mac.id, &message, 1);
     }
 }
 

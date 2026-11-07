@@ -485,20 +485,6 @@ impl SpectrumMonitor {
         }
 
         for (segment, rx_power_mw) in segments.iter().zip(rx_powers_milli_watt.iter().copied()) {
-            let Some(offset) =
-                clamp_value(segment.offset_microsec, self.max_offset, self.b_max_clamp)
-            else {
-                self.last_update_clamp_error = true;
-                return (0, 0, 0, Vec::new(), false, 0.0);
-            };
-            let Some(duration) = clamp_value(
-                segment.duration_microsec,
-                self.max_duration,
-                self.b_max_clamp,
-            ) else {
-                self.last_update_clamp_error = true;
-                return (0, 0, 0, Vec::new(), false, 0.0);
-            };
             let shifted_frequency = apply_doppler(segment.frequency_hz, d_doppler_factor);
 
             if simple_mode {
@@ -519,6 +505,20 @@ impl SpectrumMonitor {
                     .as_ref()
                     .map_or(0.0, |value| overlap_power_mw(value, rx_power_mw));
                 if overlap_power >= self.d_receiver_sensitivity_milli_watt {
+                    let Some(offset) =
+                        clamp_value(segment.offset_microsec, self.max_offset, self.b_max_clamp)
+                    else {
+                        self.last_update_clamp_error = true;
+                        return (0, 0, 0, Vec::new(), false, 0.0);
+                    };
+                    let Some(duration) = clamp_value(
+                        segment.duration_microsec,
+                        self.max_duration,
+                        self.b_max_clamp,
+                    ) else {
+                        self.last_update_clamp_error = true;
+                        return (0, 0, 0, Vec::new(), false, 0.0);
+                    };
                     update_reception_bounds(
                         valid_tx_time,
                         offset,
@@ -536,6 +536,21 @@ impl SpectrumMonitor {
                 }
                 continue;
             }
+
+            let Some(offset) =
+                clamp_value(segment.offset_microsec, self.max_offset, self.b_max_clamp)
+            else {
+                self.last_update_clamp_error = true;
+                return (0, 0, 0, Vec::new(), false, 0.0);
+            };
+            let Some(duration) = clamp_value(
+                segment.duration_microsec,
+                self.max_duration,
+                self.b_max_clamp,
+            ) else {
+                self.last_update_clamp_error = true;
+                return (0, 0, 0, Vec::new(), false, 0.0);
+            };
 
             let cache_key = if spectral_mask_index == 0 {
                 u64_segment_bandwidth_hz

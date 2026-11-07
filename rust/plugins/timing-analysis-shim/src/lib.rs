@@ -251,8 +251,8 @@ extern "C" fn downstream(
     }
     let header = TimingAnalysisHeader {
         tx_time_microseconds: now_microseconds(),
-        source: state.id,
-        packet_id: state.packet_id,
+        source: state.packet_id,
+        packet_id: state.id,
     };
     state.packet_id = state.packet_id.wrapping_add(1);
     let packet_ref = unsafe { &*packet };

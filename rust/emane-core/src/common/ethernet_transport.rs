@@ -167,10 +167,7 @@ pub extern "C" fn emane_rs_ethernet_transport_parse_frame(
     let eth_protocol = u16::from_be_bytes([buf_slice[12], buf_slice[13]]);
 
     let resolve_nem = || -> u16 {
-        if broadcast_mode
-            || (eth_protocol == ETH_P_IPV4 && dest_mac[..3] == [0x01, 0x00, 0x5e])
-            || (eth_protocol == ETH_P_IPV6 && dest_mac[..2] == [0x33, 0x33])
-        {
+        if broadcast_mode {
             NEM_BROADCAST_MAC_ADDRESS
         } else if arp_cache_mode {
             if let Ok(cache) = state.mac_cache.lock() {
@@ -178,6 +175,12 @@ pub extern "C" fn emane_rs_ethernet_transport_parse_frame(
                     return *nem_id;
                 }
             }
+            NEM_BROADCAST_MAC_ADDRESS
+        } else if ((eth_protocol == ETH_P_IPV4 || eth_protocol == ETH_P_ARP)
+            && (dest_mac[..3] == [0x01, 0x00, 0x5e] || dest_mac == [0xff; 6]))
+            || (eth_protocol == ETH_P_IPV6
+                && (dest_mac[..2] == [0x33, 0x33] || dest_mac == [0xff; 6]))
+        {
             NEM_BROADCAST_MAC_ADDRESS
         } else {
             u16::from_be_bytes([dest_mac[4], dest_mac[5]])

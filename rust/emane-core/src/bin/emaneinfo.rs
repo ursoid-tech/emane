@@ -283,6 +283,12 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
+    if !configuration && matches!(target.as_str(), "eelgenerator" | "gpsdlocationagent") {
+        if manifest {
+            print_manifest(&target, None);
+        }
+        return Ok(());
+    }
 
     let (plugin, declared_type, config) = if configuration {
         let content = emane_plugin_api::xml_document::read(&target)
